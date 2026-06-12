@@ -207,7 +207,6 @@ static int do_connect(struct consumer_state *s)
         total = MAX_COLLECT_BUFS;
 
     api.setBufferCount(win, total);
-    api.setUsage(win, 0x00000033ULL); /* SW_READ_OFTEN | SW_WRITE_OFTEN */
 
     s->buf_count = total;
     if (collect_dmabufs(s) < 0)
