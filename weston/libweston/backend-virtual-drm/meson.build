@@ -8,6 +8,8 @@ vdrm_root = join_paths(meson.project_source_root(), '..')
 
 srcs_vdrm = [
 	'virtual-drm.c',
+	join_paths(vdrm_root, 'libdisplay_producer', 'display_producer.c'),
+	join_paths(vdrm_root, 'common', 'socket_utils.c'),
 	presentation_time_server_protocol_h,
 ]
 
@@ -18,12 +20,10 @@ plugin_vdrm = shared_library(
 	c_args: [
 		'-I' + join_paths(vdrm_root, 'libdisplay_producer'),
 		'-I' + join_paths(vdrm_root, 'common'),
+		'-O3',
+		'-flto',
 	],
-	link_args: [
-		'-L' + join_paths(vdrm_root, get_option('vdrm-lib-dir')),
-		'-ldisplay_producer',
-		'-lsocket_utils',
-	],
+	link_args: ['-flto'],
 	dependencies: [
 		dep_libweston_private,
 		dep_libdrm_headers,

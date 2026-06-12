@@ -4,7 +4,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="/opt/weston-vdrm"
 BUILD_DIR="$SCRIPT_DIR/weston/builddir"
-LIB_BUILD_DIR="$SCRIPT_DIR/build"
 
 echo "=== Installing build dependencies ==="
 apt-get update -qq
@@ -22,23 +21,6 @@ apt-get install -y -qq \
     libpng-dev libfontconfig-dev libfreetype-dev \
     hwdata
 
-echo "=== Building libdisplay_producer + libsocket_utils ==="
-mkdir -p "$LIB_BUILD_DIR"
-
-cc -c -fPIC -O2 -Wall \
-    -I"$SCRIPT_DIR/common" \
-    "$SCRIPT_DIR/common/socket_utils.c" \
-    -o "$LIB_BUILD_DIR/socket_utils.o"
-
-ar rcs "$LIB_BUILD_DIR/libsocket_utils.a" "$LIB_BUILD_DIR/socket_utils.o"
-
-cc -shared -fPIC -O2 -Wall \
-    -I"$SCRIPT_DIR/common" \
-    -I"$SCRIPT_DIR/libdisplay_producer" \
-    "$SCRIPT_DIR/libdisplay_producer/display_producer.c" \
-    -L"$LIB_BUILD_DIR" -lsocket_utils -lpthread \
-    -o "$LIB_BUILD_DIR/libdisplay_producer.so"
-
 echo "=== Patching wayland-protocols ==="
 cp -v "$SCRIPT_DIR/wayland-protocols-override/staging/color-representation/color-representation-v1.xml" \
     /usr/share/wayland-protocols/staging/color-representation/color-representation-v1.xml
@@ -55,7 +37,7 @@ MESON_OPTS=(
     -Dbackend-x11=false
     -Dbackend-virtual-drm=true
     -Dbackend-default=auto
-    -Dvdrm-lib-dir=build
+
     -Drenderer-gl=true
     -Drenderer-vulkan=true
     -Dxwayland=true
@@ -89,7 +71,6 @@ ninja -C "$BUILD_DIR" -j$(nproc)
 echo "=== Installing to $PREFIX ==="
 ninja -C "$BUILD_DIR" install
 
-cp "$LIB_BUILD_DIR/libdisplay_producer.so" "$PREFIX/lib/aarch64-linux-gnu/"
 ldconfig "$PREFIX/lib/aarch64-linux-gnu"
 
 LIBDIR="$PREFIX/lib/aarch64-linux-gnu"

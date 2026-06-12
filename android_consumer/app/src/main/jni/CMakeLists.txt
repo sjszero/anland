@@ -14,6 +14,9 @@ target_include_directories(virtual_drm_consumer PRIVATE
     ${LIBDISPLAY_DIR}/common
 )
 
+target_compile_options(virtual_drm_consumer PRIVATE -O3 -flto)
+target_link_options(virtual_drm_consumer PRIVATE -flto -fuse-ld=lld)
+
 target_link_libraries(virtual_drm_consumer
     android
     log
