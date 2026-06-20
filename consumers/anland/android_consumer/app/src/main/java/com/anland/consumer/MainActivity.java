@@ -2,8 +2,10 @@ package com.anland.consumer;
 
 import android.app.Activity;
 import android.content.pm.ActivityInfo;
+import android.hardware.display.DisplayManager;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.Display;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -34,6 +36,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private native void nativeSendMouseMotion(float x, float y, float dx, float dy);
     private native void nativeSendMouseButton(int button, boolean pressed);
     private native void nativeSendMouseScroll(int axis, float value);
+    private native void nativeSetRefreshRate(float hz);
+
+    // Forwards the current display refresh rate to the daemon so KWin can repace
+    // its RenderLoop. Re-fires on every onDisplayChanged (e.g. 60/90/120 switch).
+    private final DisplayManager.DisplayListener displayListener =
+        new DisplayManager.DisplayListener() {
+            @Override public void onDisplayAdded(int displayId) {}
+            @Override public void onDisplayRemoved(int displayId) {}
+            @Override public void onDisplayChanged(int displayId) {
+                Display d = getDisplay();
+                if (d != null && d.getDisplayId() == displayId)
+                    pushRefreshRate();
+            }
+        };
+
+    private void pushRefreshRate() {
+        Display d = getDisplay();
+        if (d != null)
+            nativeSetRefreshRate(d.getRefreshRate());
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -81,15 +103,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onResume();
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         setupFullscreen();
+        DisplayManager dm = getSystemService(DisplayManager.class);
+        if (dm != null)
+            dm.registerDisplayListener(displayListener, null);
         if (surfaceReady) {
             nativeStop();
             nativeStart(surfaceView.getHolder().getSurface());
+            pushRefreshRate();
         }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        DisplayManager dm = getSystemService(DisplayManager.class);
+        if (dm != null)
+            dm.unregisterDisplayListener(displayListener);
         nativeStop();
     }
 
@@ -103,6 +132,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceReady = true;
         nativeStop();
         nativeStart(holder.getSurface());
+        pushRefreshRate();
     }
 
     @Override

@@ -49,6 +49,12 @@ struct buf_info {
 #define INPUT_TYPE_POINTER_BUTTON 4
 #define INPUT_TYPE_POINTER_AXIS   5
 #define INPUT_TYPE_TOUCH_FRAME    6
+/* Not really input: the consumer reports its current display refresh rate over
+ * the same data channel so the producer can repace its RenderLoop at runtime.
+ * Deliberately reuses the InputEvent framing (DATA_MSG_INPUT_EVENT) so the
+ * producer's poll_input_event() drains it like any other event instead of
+ * stalling the stream on an unknown DATA_MSG_* header. */
+#define INPUT_TYPE_DISPLAY_REFRESH 7
 
 #define INPUT_ACTION_DOWN    0
 #define INPUT_ACTION_UP      1
@@ -82,6 +88,9 @@ struct InputEvent {
             float    value;
             int32_t  discrete;
         } pointer_axis;
+        struct {
+            uint32_t refresh_mhz; // current display refresh rate, milli-Hz
+        } display;
     };
 } __attribute__((packed));
 

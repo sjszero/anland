@@ -41,6 +41,10 @@ struct consumer_state {
 
     int screen_w;
     int screen_h;
+
+    // Latest display refresh rate (milli-Hz) reported from Java. Read on
+    // (re)connect to seed the producer; updated live by nativeSetRefreshRate.
+    volatile uint32_t refresh_mhz;
 };
 
 static struct consumer_state g_state = {
@@ -187,6 +191,20 @@ static void cleanup_dmabufs(struct consumer_state *s)
     s->buf_count = 0;
 }
 
+/* Report the current display refresh rate to the producer over the data
+ * channel, reusing the InputEvent framing (see INPUT_TYPE_DISPLAY_REFRESH).
+ * No-op when disconnected or rate unknown. */
+static void send_refresh_rate(struct consumer_state *s)
+{
+    if (!s->ctx || s->refresh_mhz == 0)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_DISPLAY_REFRESH,
+        .display = { .refresh_mhz = s->refresh_mhz },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
 static int do_connect(struct consumer_state *s)
 {
     const char *sock = "/data/local/tmp/display_daemon.sock";
@@ -225,8 +243,12 @@ static int do_connect(struct consumer_state *s)
     }
 
     set_screen_info(s->ctx, s->screen_w, s->screen_h,
-                    PIXEL_FORMAT_RGBA_8888, 0);
+                    PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
+
+    // screen_info.refresh is only the initial seed; re-send over the data
+    // channel too so a rate learned before this (re)connect is applied.
+    send_refresh_rate(s);
 
     s->need_reconnect = false;
     LOGI("connected");
@@ -368,6 +390,17 @@ Java_com_anland_consumer_MainActivity_nativeStop(
     }
 
     pthread_mutex_unlock(&g_state.lock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_MainActivity_nativeSetRefreshRate(
+    JNIEnv *env, jobject thiz, jfloat hz)
+{
+    if (hz <= 0.0f)
+        return;
+    g_state.refresh_mhz = (uint32_t)(hz * 1000.0f + 0.5f);
+    // Apply live if already connected; otherwise do_connect() seeds it.
+    send_refresh_rate(&g_state);
 }
 
 JNIEXPORT void JNICALL
