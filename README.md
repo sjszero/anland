@@ -353,20 +353,20 @@ code path for "bring the consumer up", whether it is the first time or the hundr
 
 ---
 
-## 10. Porting guide · 移植指南
+## 10. Producer porting guide · 生产端移植指南
 
-This section is the **contribution spec** for porting a new compositor onto the
-protocol. A port lives under `producers/<compositor>/…` and must build, install and
-run.
+This section is the **contribution spec** for porting a new compositor (producer) onto
+the protocol. A port lives under `producers/<compositor>/…` and must build, install and
+run. For the display side, see §11 (consumer porting guide).
 
-本节是把新合成器接入本协议的**提交规范**。每个移植放在 `producers/<合成器>/…` 下，
-且必须能够编译、安装并运行。
+本节是把新合成器（生产端）接入本协议的**提交规范**。每个移植放在 `producers/<合成器>/…`
+下，且必须能够编译、安装并运行。显示端请参见 §11（消费端移植指南）。
 
 ### 10.1 Library‑sharing policy · 库共享策略
 
 | Port 移植 | Library wiring 库的接入方式 |
 |-----------|------------------------------|
-| **Weston** — the reference, and the **only** one allowed to symlink 唯一允许软链接的参考实现 | symlink the in‑repo library directly 直接软链接仓库内的库 |
+| **Weston** — the producer reference, the **only** producer port allowed to symlink 唯一允许软链接的生产端参考实现 | symlink the in‑repo library directly 直接软链接仓库内的库 |
 | **Every other compositor** 其它任何合成器 | **vendor (copy) the library** into the port's own tree **必须拷贝一份库**到移植自己的目录 |
 
 Weston symlinks the shared sources so the reference port always tracks the canonical
@@ -450,8 +450,8 @@ flowchart TD
 ### 10.4 Submission checklist · 提交规范清单
 
 - [ ] Lives under `producers/<compositor>/…`. 位于 `producers/<合成器>/…` 下。
-- [ ] Weston is the **only** symlink port; any new port **vendors a copy** of the library.
-      仅 Weston 使用软链接；新移植**拷贝一份库**。
+- [ ] Weston is the **only** symlink producer port; any new producer port **vendors a copy**
+      of the library. 仅 Weston 生产端使用软链接；新生产端移植**拷贝一份库**。
 - [ ] Declares the compositor name and one of structures **A / B / C** (with the commit
       hash / distro version as required). 标注合成器名称及 **A / B / C** 之一（按需附 commit
       hash / 发行版版本号）。
@@ -466,7 +466,133 @@ flowchart TD
 
 ---
 
-## 11. Source map · 源码索引
+## 11. Consumer porting guide · 消费端移植指南
+
+This section is the **contribution spec** for porting a new *consumer* (the display /
+presentation side) onto the protocol. A consumer lives under `consumers/<name>/…` and
+must build and run.
+
+本节是把新**消费端**（显示/呈现侧）接入本协议的**提交规范**。每个消费端放在
+`consumers/<名称>/…` 下，且必须能够编译并运行。
+
+The consumer is the **resource owner**: it allocates the dmabufs and creates the eventfds,
+the shm index page and the data‑channel socketpair (see §2–§3). Porting one is mostly
+wiring the library's calls to your platform's buffer allocator and presentation path.
+
+消费端是**资源拥有者**：它分配 dmabuf 并创建 eventfd、shm 索引页与数据通道 socketpair
+（见 §2–§3）。移植主要是把库的调用接到所在平台的缓冲区分配器与呈现路径。
+
+### 11.1 Library‑sharing policy · 库共享策略
+
+Symmetric to the producer side (§10.1):
+
+与生产端（§10.1）对称：
+
+| Port 移植 | Library wiring 库的接入方式 |
+|-----------|------------------------------|
+| **`anland`** — the consumer reference, the **only** consumer port allowed to symlink 唯一允许软链接的消费端参考实现 | symlink the in‑repo library directly 直接软链接仓库内的库 |
+| **Every other consumer** 其它任何消费端 | **vendor (copy)** `common/` + `libdisplay_consumer/` into the port's own tree 把库**拷贝**进自己的目录 |
+
+The reference consumer symlinks the shared sources:
+
+参考消费端通过软链接共享源码：
+
+```
+consumers/anland/common              -> ../../common
+consumers/anland/libdisplay_consumer -> ../../libdisplay_consumer
+```
+
+Every other consumer copies `protocol.h`, `socket_utils.{c,h}` and
+`display_consumer.{c,h}` into its own tree —
+[consumers/anland_virtual_keyboard](consumers/anland_virtual_keyboard) is the worked
+example. Copying insulates a shipped consumer from later API changes, and the §10.2 ABI
+promise keeps the copy interoperable with newer producers.
+
+其它消费端把 `protocol.h`、`socket_utils.{c,h}`、`display_consumer.{c,h}` 拷贝进自己的
+源码树——[consumers/anland_virtual_keyboard](consumers/anland_virtual_keyboard) 即范例。
+拷贝使已发布的消费端不受后续 API 变化影响，而 §10.2 的 ABI 承诺保证拷贝与更新的生产端
+仍可互通。
+
+### 11.2 Consumer integration contract · 消费端集成约定
+
+Bring‑up is a fixed sequence built on the consumer API
+([libdisplay_consumer/display_consumer.h](libdisplay_consumer/display_consumer.h)):
+
+接入流程是基于消费端 API 的固定顺序
+（[libdisplay_consumer/display_consumer.h](libdisplay_consumer/display_consumer.h)）：
+
+```mermaid
+flowchart TD
+    A["allocate dmabuf(s) 分配缓冲区<br/>GBM (desktop) / AHardwareBuffer (Android)"] --> B["connect_to_deamon()<br/>create eventfds + shm + socketpair,<br/>deposit 4 fds 寄存四个 fd"]
+    B --> C["set_screen_info(w, h, format, refresh)"]
+    C --> D["push_dmabufs(fds, infos, count)"]
+    D --> E{"per frame 每帧"}
+    E --> F["select_dmabuf(idx)<br/>lazily exits fallback 惰性退出 fallback"]
+    F --> G["refresh_done()<br/>wait up to 5s for producer 等待生产端"]
+    G --> H["present buffer 呈现缓冲区<br/>EGLImage→GL blit / SurfaceFlinger"]
+    H --> E
+    E -. "input 输入" .-> I["push_input_event(ev)"]
+```
+
+| Step 步骤 | Call 调用 | Consumer must provide 消费端需提供 |
+|-----------|-----------|-------------------------------------|
+| 1. Allocate 分配 | platform allocator 平台分配器 | a dmabuf fd + `buf_info` (stride, format, DRM modifier, offset) dmabuf fd 与 `buf_info` |
+| 2. Connect 连接 | `connect_to_deamon()` | nothing — the lib creates and deposits the resources 无需额外操作，库自动创建并寄存资源 |
+| 3. Geometry 几何 | `set_screen_info()` | width, height, agreed `format`, refresh 宽、高、约定的 `format`、刷新率 |
+| 4. Publish buffers 发布缓冲 | `push_dmabufs()` | the dmabuf fd(s) + their `buf_info`(s) 缓冲区 fd 与对应 `buf_info` |
+| 5. Drive frames 驱动帧 | `select_dmabuf()` → `refresh_done()` | pick a buffer, wait for render, then present 选缓冲、等渲染、再呈现 |
+| 6. Input 输入 | `push_input_event()` | translate platform input → `struct InputEvent` 将平台输入转换为 `struct InputEvent` |
+| 7. Fallback 回退 | `set_fallback_callback()` (optional 可选) | react when the producer is lost 生产端丢失时作出反应 |
+
+State machine: the consumer starts in fallback and leaves it **lazily** — each
+`select_dmabuf()` first probes for the producer (see §7.2). On producer loss the library
+rebuilds its resources and re‑deposits automatically; the stored dmabufs are re‑pushed on
+the next exit. You do **not** re‑allocate buffers on every reconnect.
+
+状态机：消费端以 fallback 启动并**惰性**退出——每次 `select_dmabuf()` 先探测生产端
+（见 §7.2）。生产端丢失时，库会自动重建资源并重新寄存；已保存的 dmabuf 在下次退出
+fallback 时重新推送。你**无需**在每次重连时重新分配缓冲区。
+
+> [!NOTE]
+> `format` is an opaque enum agreed between consumer and producer (the SDL reference maps
+> its `PIXEL_FORMAT_RGBA_8888` to a DRM fourcc for the EGL import). `buf_info.modifier`
+> carries the DRM format modifier so the producer imports with the exact tiling.
+> `format` 是消费端与生产端约定的不透明枚举（SDL 参考把 `PIXEL_FORMAT_RGBA_8888` 映射为
+> DRM fourcc 以供 EGL 导入）。`buf_info.modifier` 携带 DRM 格式修饰符，使生产端能以确切的
+> 平铺方式导入。
+
+### 11.3 Accepted port structures · 可接受的移植结构
+
+The three structures of §10.3 apply, with "compositor" read as "the host app or platform"
+the consumer builds on. A **self‑contained** consumer (the common case — e.g. the Android
+reference app) is carried as its own source tree under `consumers/<name>/` (structure
+**C**). A consumer that *patches* an existing upstream app uses **A** / **B** as for
+producers.
+
+§10.3 的三类结构同样适用，只需把“合成器”理解为消费端所基于的“宿主应用或平台”。
+**自包含**的消费端（常见情形——如 Android 参考应用）以自身源码树形式放在
+`consumers/<名称>/` 下（结构 **C**）。若消费端是对既有上游应用**打补丁**，则按生产端的
+**A** / **B** 处理。
+
+### 11.4 Submission checklist · 提交规范清单
+
+- [ ] Lives under `consumers/<name>/…`. 位于 `consumers/<名称>/…` 下。
+- [ ] `anland` is the **only** symlink consumer port; any new consumer **vendors a copy**
+      of `common/` + `libdisplay_consumer/`. 仅 `anland` 使用软链接；新消费端**拷贝一份**
+      `common/` 与 `libdisplay_consumer/`。
+- [ ] Declares the consumer name and one of structures **A / B / C** (§10.3). 标注消费端
+      名称及 **A / B / C** 之一（§10.3）。
+- [ ] **Builds and runs** via a committed build script. 附带可执行构建脚本，能**编译运行**。
+- [ ] Owns its buffers: allocates the dmabufs and follows the §11.2 sequence; presents on
+      `refresh_done()`. 自行分配 dmabuf 并遵循 §11.2 流程；在 `refresh_done()` 后呈现。
+- [ ] Integrates the consumer state machine of §7.2 (lazy fallback exit; rebuild on loss).
+      接入 §7.2 的消费端状态机（惰性退出 fallback；丢失时重建）。
+- [ ] Only additive protocol use; relies on the §10.2 ABI promise. 仅做加法式扩展；依赖
+      §10.2 的 ABI 承诺。
+
+---
+
+## 12. Source map · 源码索引
 
 | Area 区域 | File 文件 |
 |-----------|-----------|
@@ -476,10 +602,13 @@ flowchart TD
 | Consumer library 消费端库 | [libdisplay_consumer/display_consumer.c](libdisplay_consumer/display_consumer.c) |
 | Producer library 生产端库 | [libdisplay_producer/display_producer.c](libdisplay_producer/display_producer.c) |
 | Producer state machine in a real backend 真实 backend 中的状态机 | [producers/weston/weston/libweston/backend-anland/anland.c](producers/weston/weston/libweston/backend-anland/anland.c) |
+| Reference consumer 参考消费端 (Android) | [consumers/anland/](consumers/anland/) |
+| Reference SDL consumer 参考 SDL 消费端 | [tests/test_sdl_consumer.c](tests/test_sdl_consumer.c) |
+| Consumer that vendors the lib 拷贝库的消费端示例 | [consumers/anland_virtual_keyboard/](consumers/anland_virtual_keyboard/) |
 
 ---
 
-## 12. License · 许可
+## 13. License · 许可
 
 This project's own code is **MIT**‑licensed. Each non‑reference compositor backend
 carries **its own upstream license** instead.
@@ -490,7 +619,7 @@ carries **its own upstream license** instead.
 
 | Component 组成部分 | Path 路径 |
 |--------------------|-----------|
-| Android consumer Android 消费端 | [android_consumer/](android_consumer/) |
+| Reference consumer 参考消费端 (Android) | [consumers/anland/](consumers/anland/) |
 | Shared protocol & utils 共享协议与工具 | [common/](common/) |
 | Broker daemon 中介守护进程 | [daemon/](daemon/) |
 | Reference C libraries 参考 C 库 | [libdisplay_consumer/](libdisplay_consumer/), [libdisplay_producer/](libdisplay_producer/) |
