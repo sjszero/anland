@@ -460,3 +460,22 @@ int get_dmabuf_info_at(display_ctx *ctx, int idx, struct buf_info *info)
     *info = ctx->dmabuf_infos[idx];
     return 0;
 }
+//用于处理未处理的变长payload事件
+void handle_unhandled_event(display_ctx *ctx, const struct InputEvent *event)
+{
+    switch (event->type)
+    {
+    case INPUT_TYPE_CLIPBOARD:
+        //客户端发送了一个剪贴板事件，后续会有变长数据跟随，但是库调用者没有处理这个事件，所以我们需要把后续的变长数据读掉，避免阻塞
+        if (event->clipboard.size > 0) {
+            void* payload = malloc(event->clipboard.size);
+            if (payload) {
+                poll_input_event_extend_data(ctx, payload, event->clipboard.size, 1000);
+                free(payload);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}

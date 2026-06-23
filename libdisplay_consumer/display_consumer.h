@@ -19,5 +19,6 @@ int  poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_
 int  poll_output_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms);
 int  set_exit_fallback_callback(display_ctx *ctx, void (*on_exit_fallback)(void *), void *userdata);
 int  get_data_fd(display_ctx *ctx);
+void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event);
 
 #endif

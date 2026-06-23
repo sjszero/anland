@@ -70,5 +70,6 @@ int  get_dmabuf_fd(display_ctx *ctx);
 int  get_dmabuf_fd_at(display_ctx *ctx, int idx);
 int  get_dmabuf_info(display_ctx *ctx, struct buf_info *info);
 int  get_dmabuf_info_at(display_ctx *ctx, int idx, struct buf_info *info);
+void handle_unhandled_event(display_ctx *ctx, const struct InputEvent *event);
 
 #endif
