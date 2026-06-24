@@ -12,6 +12,8 @@
 
 #include "core/drmdevice.h"
 #include "core/renderloop.h"
+#include "inputmethod.h"
+#include "main.h"
 #include "opengl/egldisplay.h"
 #include "utils/filedescriptor.h"
 #include "wayland/abstract_data_source.h"
@@ -256,6 +258,15 @@ QPointF AnlandBackend::mapInputToLogical(const QPointF &devicePoint) const
     return logical / output->scale();
 }
 
+QPointF AnlandBackend::mapInputDeltaToLogical(const QPointF &deviceDelta) const
+{
+    AnlandOutput *output = m_outputs[0];
+    const OutputTransform transform = output->transform().inverted();
+    const QSizeF bounds = QSizeF(output->modeSize());
+    const QPointF mappedDelta = transform.map(deviceDelta, bounds) - transform.map(QPointF(0, 0), bounds);
+    return mappedDelta / output->scale();
+}
+
 void AnlandBackend::processInputEvent(const InputEvent &ev)
 {
     if (!m_inputDevice) {
@@ -263,9 +274,12 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
     }
 
     switch (ev.type) {
-    case INPUT_TYPE_POINTER_MOTION:
-        m_inputDevice->pointerMotionAbsolute(mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y)));
+    case INPUT_TYPE_POINTER_MOTION: {
+        const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
+        const QPointF delta = mapInputDeltaToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
+        m_inputDevice->pointerMotion(pos, delta, delta);
         break;
+    }
     case INPUT_TYPE_POINTER_BUTTON:
         m_inputDevice->pointerButton(ev.pointer_button.button, ev.pointer_button.pressed != 0);
         break;
@@ -309,6 +323,17 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
         QByteArray text(static_cast<int>(size), Qt::Uninitialized);
         if (size == 0 || poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
             sendClipboardToKWin(text);
+        }
+        break;
+    }
+    case INPUT_TYPE_TEXT_INPUT: {
+        const uint32_t size = ev.text_input.size;
+        if (size == 0) {
+            break;
+        }
+        QByteArray text(static_cast<int>(size), Qt::Uninitialized);
+        if (poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
+            sendTextInputToKWin(text);
         }
         break;
     }
@@ -589,6 +614,22 @@ void AnlandBackend::sendClipboardToKWin(const QByteArray &text)
     m_clipboardSource = std::make_unique<AnlandClipboardSource>(std::move(mimeData));
     seat->setSelection(m_clipboardSource.get(), waylandServer()->display()->nextSerial());
     oldSource.reset();
+}
+
+void AnlandBackend::sendTextInputToKWin(const QByteArray &text)
+{
+    if (m_inFallback) {
+        return;
+    }
+
+    const QString string = QString::fromUtf8(text);
+    if (string.isEmpty()) {
+        return;
+    }
+
+    if (InputMethod *inputMethod = kwinApp()->inputMethod()) {
+        inputMethod->commitText(string);
+    }
 }
 
 } // namespace KWin

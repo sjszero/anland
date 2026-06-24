@@ -100,12 +100,14 @@ private:
     void onBufferReady();
     void processInputEvent(const InputEvent &ev);
     QPointF mapInputToLogical(const QPointF &devicePoint) const;
+    QPointF mapInputDeltaToLogical(const QPointF &deviceDelta) const;
     void onReconnectTimer();
     void enterFallback();
 
     void onClipboardChanged();
     void sendClipboardToConsumer(const QByteArray &text);
     void sendClipboardToKWin(const QByteArray &text);
+    void sendTextInputToKWin(const QByteArray &text);
 
     static void fallbackTrampoline(void *data);
 

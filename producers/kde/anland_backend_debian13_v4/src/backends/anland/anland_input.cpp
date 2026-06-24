@@ -98,6 +98,13 @@ void AnlandInputDevice::pointerMotionAbsolute(const QPointF &position)
     Q_EMIT InputDevice::pointerFrame(this);
 }
 
+void AnlandInputDevice::pointerMotion(const QPointF &position, const QPointF &delta, const QPointF &deltaNonAccelerated)
+{
+    Q_EMIT InputDevice::pointerMotionAbsolute(position, now(), this);
+    Q_EMIT InputDevice::pointerMotion(delta, deltaNonAccelerated, now(), this);
+    Q_EMIT InputDevice::pointerFrame(this);
+}
+
 void AnlandInputDevice::pointerButton(quint32 button, bool pressed)
 {
     Q_EMIT pointerButtonChanged(button,
