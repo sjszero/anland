@@ -1,4 +1,0 @@
-[wrap-git]
-directory = neatvnc
-url = https://github.com/any1/neatvnc.git
-revision = v1.0.0
