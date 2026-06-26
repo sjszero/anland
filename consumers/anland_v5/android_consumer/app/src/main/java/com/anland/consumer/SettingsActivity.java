@@ -70,10 +70,12 @@ public class SettingsActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.WHITE);
+        
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(24), dp(24), dp(24), dp(24));
-        root.setBackgroundColor(Color.WHITE);
 
         // Title
         TextView title = new TextView(this);
@@ -107,7 +109,8 @@ public class SettingsActivity extends Activity {
 
         addResolutionSection(root);
 
-        setContentView(root);
+        scroll.addView(root);
+        setContentView(scroll);
 
         updateStatus();
     }
