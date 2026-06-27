@@ -593,7 +593,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // focused window relayouts into the upper region instead of hiding behind
     // the keyboard. Reset when the IME goes away.
     private void applyImeInset(WindowInsets insets) {
-        mImeBottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
+        int newImeBottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
+        boolean imeVisible = newImeBottom > 0;
+        boolean wasImeVisible = mImeBottom > 0;
+    
+        mImeBottom = newImeBottom;
+    
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(KEY_EXTRA_KEYS_ENABLED, false)
+                && prefs.getBoolean("auto_show_extra_keys", true)) {
+            if (imeVisible && !wasImeVisible) {
+                setExtraKeysBarVisible(true);
+            } else if (!imeVisible && wasImeVisible) {
+                setExtraKeysBarVisible(false);
+            }
+        }
+    
         relayout();
     }
 
