@@ -29,6 +29,9 @@
 #define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
 
+static int cfg_custom_width = 0;
+static int cfg_custom_height = 0;
+
 /* Saved JVM / activity reference for event-thread JNI callbacks. */
 static JavaVM *g_jvm = NULL;
 static jobject g_activity_obj = NULL;
@@ -369,8 +372,18 @@ static int do_connect(struct consumer_state *s)
     cleanup_dmabufs(s);
 
     ANativeWindow *win = s->window;
-    s->screen_w = ANativeWindow_getWidth(win);
-    s->screen_h = ANativeWindow_getHeight(win);
+    pthread_mutex_lock(&cfg_lock);
+    int cw = cfg_custom_width;
+    int ch = cfg_custom_height;
+    pthread_mutex_unlock(&cfg_lock);
+
+    if (cw > 0 && ch > 0) {
+        s->screen_w = cw;
+        s->screen_h = ch;
+    } else {
+       s->screen_w = ANativeWindow_getWidth(win);
+       s->screen_h = ANativeWindow_getHeight(win);
+    }
 
     /* dequeueBuffer needs the window connected to an API first (ANativeWindow_lock
      * did this internally). Disconnect first so reconnect is idempotent. */
@@ -580,6 +593,17 @@ Java_com_anland_consumer_MainActivity_nativeConfigure(
 
     LOGI("configured: socket=%s root=%d helper=%s bridge=%s",
          cfg_socket_path, cfg_use_root, cfg_helper_path, cfg_bridge_path);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_MainActivity_nativeSetCustomResolution(
+    JNIEnv* env, jobject thiz, jint width, jint height)
+{
+    pthread_mutex_lock(&cfg_lock);
+    cfg_custom_width = width;
+    cfg_custom_height = height;
+    pthread_mutex_unlock(&cfg_lock);
+    LOGI("custom resolution: %dx%d", width, height);
 }
 
 JNIEXPORT void JNICALL
