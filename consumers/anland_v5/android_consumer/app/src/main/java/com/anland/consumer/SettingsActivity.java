@@ -312,7 +312,7 @@ public class SettingsActivity extends Activity {
         TextView layoutHint = new TextView(this);
         layoutHint.setText("Define the extra-keys bar as JSON: \"rows\" is an array of "
             + "rows, each an array of keys. A key has a \"label\" and a \"type\" "
-            + "(key/text/modifier/keyboard/settings). \"key\"/\"modifier\" take an evdev "
+            + "(key/text/modifier/keyboard/vkeyboard/settings). \"key\"/\"modifier\" take an evdev "
             + "\"code\"; \"text\" takes \"text\"; any key may add \"repeat\":true or a "
             + "nested \"popup\". Invalid JSON falls back to the default. Takes effect on "
             + "next return to the desktop.");

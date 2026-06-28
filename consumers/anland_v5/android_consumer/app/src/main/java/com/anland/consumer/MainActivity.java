@@ -847,8 +847,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override public void text(String s) {
                 if (!s.isEmpty()) nativeSendTextInput(s.getBytes(StandardCharsets.UTF_8));
             }
-            @Override public void toggleKeyboard() {
-                // CHANGED: Now toggles the floating virtual keyboard instead of system IME
+            // Tapping the ⌨ key keeps the original behaviour: toggle the system IME.
+            @Override public void toggleKeyboard() { toggleSystemKeyboard(); }
+            // Pulling up on the ⌨ key toggles the floating virtual keyboard.
+            @Override public void toggleVirtualKeyboard() {
                 if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
                     virtualKeyboardView.setVisibility(View.GONE);
                 } else {
@@ -856,7 +858,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     virtualKeyboardView.bringToFront();
                     // Re-position it (in case screen size changed)
                     positionVirtualKeyboard();
-                    // Optionally hide system IME to avoid overlap
+                    // Hide the system IME to avoid overlap with the floating keyboard.
                     InputMethodManager imm = getSystemService(InputMethodManager.class);
                     if (imm != null && getCurrentFocus() != null) {
                         imm.hideSoftInputFromWindow(getCurrentFocus().getWindowToken(), 0);
@@ -910,7 +912,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hiddenInput.setEnabled(false);
     }
 
-    // Original toggleKeyboard for system IME – kept for potential other uses
+    // Toggle the system IME (soft keyboard). Driven by the ⌨ bar key tap and the
+    // user-bound hardware keycode.
     private void toggleSystemKeyboard() {
         if (imm == null) imm = getSystemService(InputMethodManager.class);
         if (imm == null) return;
