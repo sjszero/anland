@@ -217,7 +217,7 @@ static void enter_fallback(display_ctx *ctx)
         ctx->fallback_cb(ctx->fallback_userdata);
 }
 int connect_to_deamon(display_ctx **out, const char *socket_path){
-    connect_to_deamon_with_fd(out, connect_unix(socket_path));
+    return connect_to_deamon_with_fd(out, connect_unix(socket_path));
 }
 int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
 {
