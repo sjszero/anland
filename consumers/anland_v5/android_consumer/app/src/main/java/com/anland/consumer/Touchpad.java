@@ -477,19 +477,14 @@ public final class Touchpad {
         // 三指及以上手势被禁用时，吞掉整个流，直到手指减到一根（此时落回
         // ACTION_POINTER_UP 的正常处理恢复单指控制）。
         if (multiFingerIgnored) {
-            if (action == MotionEvent.ACTION_POINTER_UP
-                    && (event.getPointerCount() - 1) <= 1) {
-                multiFingerIgnored = false;
-                // fall through to the ACTION_POINTER_UP branch below
-            } else if (action == MotionEvent.ACTION_UP
+            if (action == MotionEvent.ACTION_UP
                     || action == MotionEvent.ACTION_CANCEL) {
                 multiFingerIgnored = false;
+                isMultiFinger = false;
                 resetTouchpadState();
                 resetSmoothing();
-                return true;
-            } else {
-                return true; // swallow
             }
+            return true; // swallow the entire multi-finger stream
         }
 
         switch (action) {
@@ -528,11 +523,15 @@ public final class Touchpad {
                     twoFingerMode = TWO_FINGER_UNDECIDED;
                 } else if (pointerCount >= 3) {
                     if (multiFingerGesturesDisabled) {
-                        // 三指及以上手势被禁用，吞掉。
+                        // Disabled explicitly: swallow the complete stream so a
+                        // remaining finger can never become mouse movement.
                         multiFingerIgnored = true;
                         isMultiFinger = true;
+                        gestureUnhandled = false;
+                        resetSmoothing();
                     } else {
-                        // Three or more fingers is never one of ours.
+                        // Preserve the existing forwarding behavior when the
+                        // optional multi-finger gesture setting is enabled.
                         return declineGesture();
                     }
                 }

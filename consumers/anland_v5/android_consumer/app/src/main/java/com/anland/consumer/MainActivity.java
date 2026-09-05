@@ -2498,16 +2498,53 @@ public class MainActivity extends Activity
         return false;
     }
     
-    private float[] convertToNativeCoords(float x, float y) {
-        if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                           (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                           (float)customScreenHeight / viewHeight : 1.0f;
-            return new float[]{x * scaleX, y * scaleY};
-        } else {
-            return new float[]{(x - surfaceOffsetX) / surfaceScale, (y - surfaceOffsetY) / surfaceScale};
+    /**
+     * Convert view coordinates to the producer's current logical output space.
+     * Android may keep MotionEvent coordinates in the panel's portrait frame while
+     * the surface/output has already rotated; applying the transform here keeps
+     * input and the displayed DMA-BUF in the same coordinate space.
+     */
+    private static float[] rotateNormalizedCoords(float u, float v, int rotation) {
+        switch (rotation) {
+            case Surface.ROTATION_90:  return new float[]{v, 1f - u};
+            case Surface.ROTATION_180: return new float[]{1f - u, 1f - v};
+            case Surface.ROTATION_270: return new float[]{1f - v, u};
+            default:                   return new float[]{u, v};
         }
+    }
+
+    private float[] convertToNativeCoords(float x, float y) {
+        final float nx;
+        final float ny;
+        if (autoStretch) {
+            float scaleX = (customScreenWidth > 0 && viewWidth > 0)
+                    ? (float) customScreenWidth / viewWidth : 1.0f;
+            float scaleY = (customScreenHeight > 0 && viewHeight > 0)
+                    ? (float) customScreenHeight / viewHeight : 1.0f;
+            nx = x * scaleX;
+            ny = y * scaleY;
+        } else {
+            nx = (x - surfaceOffsetX) / surfaceScale;
+            ny = (y - surfaceOffsetY) / surfaceScale;
+        }
+
+        float logicalW = customScreenWidth > 0 ? customScreenWidth : viewWidth;
+        float logicalH = customScreenHeight > 0 ? customScreenHeight : viewHeight;
+        if (logicalW <= 0 || logicalH <= 0)
+            return new float[]{nx, ny};
+
+        float u = Math.max(0f, Math.min(1f, nx / logicalW));
+        float v = Math.max(0f, Math.min(1f, ny / logicalH));
+        float[] rotated = rotateNormalizedCoords(u, v, displayRotation);
+        float outX = rotated[0];
+        float outY = rotated[1];
+
+        // The rotated output has exchanged its logical dimensions for 90/270.
+        boolean quarterTurn = displayRotation == Surface.ROTATION_90
+                || displayRotation == Surface.ROTATION_270;
+        float targetW = quarterTurn ? logicalH : logicalW;
+        float targetH = quarterTurn ? logicalW : logicalH;
+        return new float[]{outX * targetW, outY * targetH};
     }
     
     private float[] convertMouseToNative(float x, float y) {
