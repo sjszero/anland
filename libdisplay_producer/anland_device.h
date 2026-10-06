@@ -158,6 +158,8 @@ typedef void (*anland_device_pre_release_cb)(void *userdata);
  * A non-empty path is tried first and only then falls back to those. Returns NULL
  * when no candidate answered. */
 anland_device *anland_device_open(const char *socket_path);
+/* Connector may be absent; geometry remains unknown until connect succeeds. */
+anland_device *anland_device_open_deferred(const char *socket_path);
 
 /* The daemon socket the device actually connected to ("" when unknown). Callers
  * that pass a hint should log this instead of the path they requested. */
@@ -242,6 +244,11 @@ int anland_device_fb_count(anland_device *dev);
  * fd; caller owns and must close it). Returns 0 / -1. */
 int anland_device_get_fb(anland_device *dev, int index, anland_device_fb_t *fb);
 
+/* Additive native-import view: format is DRM fourcc, not the legacy protocol
+ * value in get_fb(). Owned fd is always CLOEXEC. Other fields/ownership match
+ * get_fb(). Existing consumers retain their original format semantics. */
+int anland_device_get_drm_fb(anland_device *dev, int index, anland_device_fb_t *fb);
+
 /* Index the consumer selected for the current frame (shm page). Clamped into
  * [0, fb_count) so a backend can index its framebuffer array directly. */
 int anland_device_current_fb(anland_device *dev);
@@ -311,6 +318,15 @@ int anland_device_set_consumer_var(anland_device *dev, uint32_t var,
                                    uint32_t value);
 /* Foreground-scheduling switch (SCHEDULING_FLAG_*). */
 int anland_device_scheduling(anland_device *dev, pid_t pid, uint8_t flags);
+/* Additive, non-blocking clipboard enqueue. 0 = accepted (NOT delivered), -1
+ * rejected (ENOBUFS is recoverable and leaves the queue/session unchanged).
+ * Copies <= ANLAND_DEVICE_MAX_PAYLOAD_SIZE; total queue bound is 2MiB.
+ * Drive flush_output while pending: 0 drained, 1 pending, -1 session lost.
+ * data_fd is borrowed for event readiness only, never independent writes. */
+int anland_device_queue_clipboard(anland_device *dev, const void *text, size_t size);
+int anland_device_flush_output(anland_device *dev);
+size_t anland_device_pending_output(const anland_device *dev);
+
 /* Push clipboard text (raw UTF-8) to the consumer. */
 int anland_device_set_clipboard(anland_device *dev, const void *text,
                                 size_t size);

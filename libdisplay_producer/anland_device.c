@@ -27,6 +27,8 @@
 #include "display_producer.h"
 #include "protocol.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +41,7 @@ _Static_assert(sizeof(anland_device_input_t) == sizeof(struct InputEvent),
 
 struct anland_device {
     display_ctx *ctx;        /* owned transport context */
+    bool deferred;
     uint32_t     format;     /* screen_info.format (1 = ABGR8888) */
     int          pending_fb; /* committed fb index for the next pageflip */
     char         socket_path[108]; /* resolved daemon socket (for diagnostics) */
@@ -60,17 +63,17 @@ static const char *const s_socket_candidates[] = {
 };
 
 /* Try one candidate; on success the connection is live and its path is recorded. */
-static display_ctx *try_socket(const char *path)
+static display_ctx *try_socket_mode(const char *path, bool deferred)
 {
     if (!path || !*path)
         return NULL;
     display_ctx *ctx = NULL;
-    if (connect_to_deamon(&ctx, path) == 0 && ctx)
+    if ((deferred ? connect_to_deamon_deferred(&ctx, path) : connect_to_deamon(&ctx, path)) == 0 && ctx)
         return ctx;
     return NULL;
 }
 
-anland_device *anland_device_open(const char *socket_path)
+static anland_device *device_open(const char *socket_path, bool deferred)
 {
     const char *hint = (socket_path && *socket_path) ? socket_path : NULL;
     const char *env = getenv("ANLAND_SOCKET");
@@ -80,9 +83,9 @@ anland_device *anland_device_open(const char *socket_path)
     const char *used = NULL;
     display_ctx *ctx = NULL;
 
-    if (hint && (ctx = try_socket(hint)))
+    if (hint && (ctx = try_socket_mode(hint, deferred)))
         used = hint;
-    else if (env && (!hint || strcmp(env, hint) != 0) && (ctx = try_socket(env)))
+    else if (env && (!hint || strcmp(env, hint) != 0) && (ctx = try_socket_mode(env, deferred)))
         used = env;
     else {
         for (size_t i = 0; i < sizeof(s_socket_candidates) / sizeof(s_socket_candidates[0]); i++) {
@@ -91,7 +94,7 @@ anland_device *anland_device_open(const char *socket_path)
                 continue;
             if (env && strcmp(path, env) == 0)
                 continue;
-            if ((ctx = try_socket(path))) {
+            if ((ctx = try_socket_mode(path, deferred))) {
                 used = path;
                 break;
             }
@@ -106,6 +109,7 @@ anland_device *anland_device_open(const char *socket_path)
         return NULL;
     }
     dev->ctx = ctx;
+    dev->deferred = deferred;
     dev->pending_fb = -1;
     /* Record which candidate answered so callers can log the real path. */
     snprintf(dev->socket_path, sizeof(dev->socket_path), "%s", used ? used : "");
@@ -116,6 +120,9 @@ anland_device *anland_device_open(const char *socket_path)
 
     return dev;
 }
+
+anland_device *anland_device_open(const char *path) { return device_open(path, false); }
+anland_device *anland_device_open_deferred(const char *path) { return device_open(path, true); }
 
 /* The daemon socket this device actually connected to ("" when unknown). Lets the
  * backend report the resolved path instead of the one it merely requested. */
@@ -178,7 +185,7 @@ int anland_device_reopen(anland_device *dev, const char *socket_path)
         return -1;
 
     const char *path = (socket_path && *socket_path) ? socket_path : dev->socket_path;
-    display_ctx *ctx = try_socket(path);
+    display_ctx *ctx = try_socket_mode(path, dev->deferred);
     if (!ctx)
         return -1;
 
@@ -301,7 +308,7 @@ int anland_device_get_fb(anland_device *dev, int index, anland_device_fb_t *fb)
     if (fd < 0)
         return -1;
 
-    int dupfd = dup(fd);
+    int dupfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (dupfd < 0)
         return -1;
 
@@ -475,4 +482,34 @@ int anland_device_set_clipboard(anland_device *dev, const void *text,
     };
     return push_output_event_with_length(dev->ctx, &ev,
                                          (void *)text, size);
+}
+int anland_device_queue_clipboard(anland_device *dev, const void *text, size_t size)
+{
+    if (!dev || size > ANLAND_DEVICE_MAX_PAYLOAD_SIZE || (size && !text)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return queue_clipboard(dev->ctx, text, size);
+}
+
+int anland_device_flush_output(anland_device *dev)
+{
+    return dev ? flush_queued_output(dev->ctx) : -1;
+}
+
+size_t anland_device_pending_output(const anland_device *dev)
+{
+    return dev ? pending_output_bytes(dev->ctx) : 0;
+}
+
+int anland_device_get_drm_fb(anland_device *dev, int index, anland_device_fb_t *fb)
+{
+    if (anland_device_get_fb(dev, index, fb) != 0) return -1;
+    /* Preserve the established native import mapping. DRM_FORMAT_ABGR8888 for
+     * Android RGBA8888 (1), DRM_FORMAT_XRGB8888 for legacy other formats.
+     * Numeric fourcc encoding avoids a public dependency on libdrm headers. */
+    fb->format = fb->format == 1
+        ? ((uint32_t)'A' | ((uint32_t)'B' << 8) | ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24))
+        : ((uint32_t)'X' | ((uint32_t)'R' << 8) | ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24));
+    return 0;
 }

@@ -19,6 +19,17 @@
  * caller's reconnect loop stays responsive when no consumer is present yet. */
 #define HANDSHAKE_TIMEOUT_MS 100
 
+#define OUTPUT_QUEUE_MAX (2U * 1024U * 1024U)
+#define OUTPUT_PAYLOAD_MAX (1024U * 1024U)
+
+/* One writer/order per data channel. A queued frame remains accounted until its
+ * last byte is sent; on session teardown no suffix can survive into a new one. */
+struct output_message {
+    struct output_message *next;
+    size_t size, offset;
+    unsigned char bytes[];
+};
+
 struct display_ctx {
     int      ctrl_fd;
     int      data_fd;
@@ -32,6 +43,9 @@ struct display_ctx {
     uint32_t pixel_format;
     uint32_t refresh;
     bool     fallback;
+    bool     have_screen_info, pickup_requested;
+    unsigned char screen_bytes[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
+    size_t screen_used;
 
     int      dmabuf_fds[MAX_BUFS];
     struct buf_info dmabuf_infos[MAX_BUFS];
@@ -42,6 +56,8 @@ struct display_ctx {
     int input_kind;
     int input_fds[64], input_fd_count;
     int64_t input_deadline;
+    struct output_message *output_head, *output_tail;
+    size_t output_bytes;
 
 
     void (*pre_release_cb)(void *);
@@ -55,8 +71,20 @@ struct display_ctx {
  * shm mapping), leaving the context holding only the daemon ctrl_fd. Does NOT touch
  * the fallback flag or fire the fallback callback — callers decide that. Idempotent.
  */
+static void clear_output_queue(display_ctx *ctx)
+{
+    while (ctx->output_head) {
+        struct output_message *message = ctx->output_head;
+        ctx->output_head = message->next;
+        free(message);
+    }
+    ctx->output_tail = NULL;
+    ctx->output_bytes = 0;
+}
+
 static void release_consumer_resources(display_ctx *ctx)
 {
+    clear_output_queue(ctx);
     for (int i = 0; i < ctx->buf_count; i++) {
         if (ctx->dmabuf_fds[i] >= 0) {
             close(ctx->dmabuf_fds[i]);
@@ -102,9 +130,11 @@ static void enter_fallback(display_ctx *ctx)
  */
 static int pickup_fds(display_ctx *ctx)
 {
-    struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
-    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
-        return -1;
+    if (!ctx->pickup_requested) {
+        struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
+        if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0) return -1;
+        ctx->pickup_requested = true;
+    }
 
     struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
     if (poll(&pfd, 1, HANDSHAKE_TIMEOUT_MS) <= 0)
@@ -121,6 +151,7 @@ static int pickup_fds(display_ctx *ctx)
         return -1;
     }
 
+    ctx->pickup_requested = false;
     /* Slot order matches the consumer's send_hello_fds(): { buf_ready, fence, data, shm, audio }.
      * fence_fd is the write end of the dedicated producer->consumer render-done channel;
      * audio_fd is the full-duplex PCM socket (producer writes playback, reads mic). */
@@ -202,7 +233,36 @@ static int receive_dmabufs(display_ctx *ctx)
     return 0;
 }
 
-int connect_to_deamon(display_ctx **out, const char *socket_path)
+/* Keep the daemon HELLO live while its display connector is absent. Partial
+ * screen-info bytes are owned here, never discarded/reinterpreted by a WM. */
+static int receive_screen_info(display_ctx *ctx, int timeout_ms)
+{
+    if (ctx->have_screen_info) return 1;
+    struct pollfd pfd = {.fd=ctx->ctrl_fd, .events=POLLIN};
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc < 0) return errno == EINTR ? 0 : -1;
+    if (rc == 0) return 0;
+    while (ctx->screen_used < sizeof(ctx->screen_bytes)) {
+        ssize_t n = recv(ctx->ctrl_fd, ctx->screen_bytes + ctx->screen_used,
+            sizeof(ctx->screen_bytes) - ctx->screen_used, MSG_DONTWAIT);
+        if (n > 0) { ctx->screen_used += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    struct ctrl_msg hdr;
+    struct screen_info si;
+    memcpy(&hdr, ctx->screen_bytes, sizeof(hdr));
+    memcpy(&si, ctx->screen_bytes + sizeof(hdr), sizeof(si));
+    if (hdr.type != CTRL_MSG_SCREEN_INFO || hdr.size != sizeof(si) ||
+        !si.width || !si.height) { errno=EPROTO; return -1; }
+    ctx->screen_w=si.width; ctx->screen_h=si.height;
+    ctx->pixel_format=si.format; ctx->refresh=si.refresh;
+    ctx->have_screen_info=true;
+    return 1;
+}
+
+static int connect_daemon(display_ctx **out, const char *socket_path, bool deferred)
 {
     display_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
@@ -233,23 +293,20 @@ int connect_to_deamon(display_ctx **out, const char *socket_path)
     if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
         goto fail;
 
-    uint8_t buf[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
-    if (recv_all(ctx->ctrl_fd, buf, sizeof(buf)) < 0)
-        goto fail;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t deadline = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + HANDSHAKE_TIMEOUT_MS;
+    int ready;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int remaining = (int)(deadline - ((int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000));
+        if (remaining < 0) remaining = 0;
+        ready = receive_screen_info(ctx, deferred ? 0 : remaining);
+        if (deferred || ready != 0 || remaining == 0) break;
+    } while (true);
+    if (ready < 0 || (!deferred && ready != 1)) goto fail;
 
-    struct ctrl_msg resp;
-    memcpy(&resp, buf, sizeof(resp));
-    if (resp.type != CTRL_MSG_SCREEN_INFO || resp.size != sizeof(struct screen_info))
-        goto fail;
-
-    struct screen_info si;
-    memcpy(&si, buf + sizeof(struct ctrl_msg), sizeof(si));
-    ctx->screen_w = si.width;
-    ctx->screen_h = si.height;
-    ctx->pixel_format = si.format;
-    ctx->refresh = si.refresh;
-
-    // Daemon handshake only: screen info is in hand, but the consumer fds and
+    // Daemon handshake only: geometry may be deferred; consumer fds and
     // dmabufs are deliberately left for try_exit_fallback() so the backend brings
     // the consumer up through the single reconnect path. Stay in fallback.
     *out = ctx;
@@ -260,6 +317,15 @@ fail:
         close(ctx->ctrl_fd);
     free(ctx);
     return -1;
+}
+
+int connect_to_deamon(display_ctx **out, const char *socket_path)
+{
+    return connect_daemon(out, socket_path, false);
+}
+int connect_to_deamon_deferred(display_ctx **out, const char *socket_path)
+{
+    return connect_daemon(out, socket_path, true);
 }
 
 void disconnect(display_ctx *ctx)
@@ -456,12 +522,100 @@ int poll_input_event_extend_fds(display_ctx *ctx, int *fds, int max_fds,
     ctx->input_fd_count=0; return 1;
 }
 
+size_t pending_output_bytes(const display_ctx *ctx)
+{
+    return ctx && !ctx->fallback ? ctx->output_bytes : 0;
+}
+
+/* A work budget keeps even a constantly draining consumer from monopolising a
+ * compositor callback. Pending does not mean failure and never drops a session. */
+int flush_queued_output(display_ctx *ctx)
+{
+    if (!ctx || ctx->fallback) { errno = ENOTCONN; return -1; }
+    for (unsigned budget = 0; budget < 16 && ctx->output_head; ++budget) {
+        struct output_message *message = ctx->output_head;
+        ssize_t n = send(ctx->data_fd, message->bytes + message->offset,
+                         message->size - message->offset,
+                         MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0) {
+            message->offset += (size_t)n;
+            if (message->offset != message->size) continue;
+            ctx->output_bytes -= message->size;
+            ctx->output_head = message->next;
+            if (!ctx->output_head) ctx->output_tail = NULL;
+            free(message);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        enter_fallback(ctx);
+        return -1;
+    }
+    return ctx->output_head ? 1 : 0;
+}
+
+int queue_output_event_with_length(display_ctx *ctx,
+                                  const struct OutputEvent *event,
+                                  const void *payload, size_t size)
+{
+    if (!ctx || ctx->fallback) { errno = ENOTCONN; return -1; }
+    if (!event || size > OUTPUT_PAYLOAD_MAX || (size && !payload) ||
+        (event->type == OUTPUT_TYPE_CLIPBOARD && event->clipboard.size != size) ||
+        (event->type != OUTPUT_TYPE_CLIPBOARD && size != 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const size_t total = sizeof(struct data_msg) + sizeof(*event) + size;
+    if (total > OUTPUT_QUEUE_MAX - ctx->output_bytes) {
+        errno = ENOBUFS; /* Reject atomically: the existing queue remains valid. */
+        return -1;
+    }
+    struct output_message *message = malloc(sizeof(*message) + total);
+    if (!message) return -1;
+    message->next = NULL;
+    message->size = total;
+    message->offset = 0;
+    struct data_msg header = {.type = DATA_MSG_OUTPUT_EVENT, .size = sizeof(*event)};
+    memcpy(message->bytes, &header, sizeof(header));
+    memcpy(message->bytes + sizeof(header), event, sizeof(*event));
+    if (size) memcpy(message->bytes + sizeof(header) + sizeof(*event), payload, size);
+    if (ctx->output_tail) ctx->output_tail->next = message;
+    else ctx->output_head = message;
+    ctx->output_tail = message;
+    ctx->output_bytes += total;
+    return 0;
+}
+
+int queue_clipboard(display_ctx *ctx, const void *text, size_t size)
+{
+    if (size > OUTPUT_PAYLOAD_MAX || (size && !text)) { errno = EINVAL; return -1; }
+    struct OutputEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = OUTPUT_TYPE_CLIPBOARD;
+    event.clipboard.size = (uint32_t)size;
+    return queue_output_event_with_length(ctx, &event, text, size);
+}
+
 // A bounded synchronous send preserves the existing API's completed-write
 // contract. On partial failure, detach: continuing would corrupt stream framing.
 static int output_send(display_ctx *ctx, const void *bytes, size_t size)
 {
     size_t offset=0;
     int64_t deadline=monotonic_ms()+10;
+    /* Existing complete-write APIs must not overtake an async message's prefix.
+     * Preserve their old deadline/error contract; async users drive flush alone. */
+    while (ctx->output_head) {
+        int rc = flush_queued_output(ctx);
+        if (rc < 0) return -1;
+        if (rc == 0) break;
+        int remaining = (int)(deadline - monotonic_ms());
+        struct pollfd pfd = {.fd = ctx->data_fd, .events = POLLOUT};
+        if (remaining <= 0 || poll(&pfd, 1, remaining) <= 0 ||
+            !(pfd.revents & POLLOUT)) {
+            enter_fallback(ctx);
+            return -1;
+        }
+    }
     while (offset < size) {
         if (monotonic_ms() >= deadline) { enter_fallback(ctx); return -1; }
         ssize_t n=send(ctx->data_fd,(const char *)bytes+offset,size-offset,MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -590,6 +744,7 @@ int try_exit_fallback(display_ctx *ctx)
     if (!ctx->fallback)
         return 0;
 
+    if (receive_screen_info(ctx, 0) != 1) return -1;
     // Step 1: ask the daemon to hand over the consumer-side fds.
     if (pickup_fds(ctx) < 0) {
         release_consumer_resources(ctx);

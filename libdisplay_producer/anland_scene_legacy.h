@@ -64,6 +64,7 @@ typedef struct anland_scene_legacy anland_scene_legacy;
 /* Open the daemon connection (socket_path is a hint; NULL/"" probes the
  * well-known locations) and create the bound scene. Returns NULL on failure. */
 anland_scene_legacy *anland_scene_legacy_create(const char *socket_path);
+anland_scene_legacy *anland_scene_legacy_create_deferred(const char *socket_path);
 
 void anland_scene_legacy_destroy(anland_scene_legacy *b);
 
@@ -79,6 +80,9 @@ anland_device *anland_scene_legacy_device(anland_scene_legacy *b);
 bool anland_scene_legacy_connected(anland_scene_legacy *b);
 /* False while a consumed ACK still owes slot retirement. Session may stay up. */
 bool anland_scene_legacy_target_available(anland_scene_legacy *b);
+/* Stronger additive query: current slot is writable NOW, with no pending/inflight
+ * handoff. The previous query's meaning stays unchanged for existing WMs. */
+bool anland_scene_legacy_renderable(anland_scene_legacy *b);
 
 /* Attempt to leave fallback; returns 0 when connected. Safe to call repeatedly
  * (this is what a DE reconnect timer drives). On a successful transition any

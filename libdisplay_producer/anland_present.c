@@ -15,7 +15,9 @@ anland_present *anland_present_create(const anland_present_config_t *config)
     anland_present *present = calloc(1, sizeof(*present));
     if (!present)
         return NULL;
-    present->transport = anland_scene_legacy_create(config->endpoint);
+    present->transport = config->defer_connector
+        ? anland_scene_legacy_create_deferred(config->endpoint)
+        : anland_scene_legacy_create(config->endpoint);
     if (!present->transport) {
         free(present);
         return NULL;
@@ -75,4 +77,8 @@ int anland_present_present(anland_present *present)
 int anland_present_pump(anland_present *present, int timeout_ms)
 {
     return present ? anland_scene_legacy_pump(present->transport, timeout_ms) : -1;
+}
+bool anland_present_renderable(const anland_present *present)
+{
+    return present && anland_scene_legacy_renderable(present->transport);
 }

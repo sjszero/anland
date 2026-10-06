@@ -303,7 +303,7 @@ static void drop_session(struct anland_scene_legacy *b)
 
 /* ---- lifecycle ---- */
 
-anland_scene_legacy *anland_scene_legacy_create(const char *socket_path)
+static anland_scene_legacy *legacy_create(const char *socket_path, bool deferred)
 {
     struct anland_scene_legacy *b = calloc(1, sizeof(*b));
     if (!b)
@@ -313,7 +313,7 @@ anland_scene_legacy *anland_scene_legacy_create(const char *socket_path)
      * this adapter must start as -1 or a drop path would close someone else's fd. */
     b->pending_fence = -1;
 
-    b->dev = anland_device_open(socket_path);
+    b->dev = deferred ? anland_device_open_deferred(socket_path) : anland_device_open(socket_path);
     if (!b->dev) {
         free(b);
         return NULL;
@@ -331,6 +331,9 @@ anland_scene_legacy *anland_scene_legacy_create(const char *socket_path)
     }
     return b;
 }
+
+anland_scene_legacy *anland_scene_legacy_create(const char *path) { return legacy_create(path, false); }
+anland_scene_legacy *anland_scene_legacy_create_deferred(const char *path) { return legacy_create(path, true); }
 
 void anland_scene_legacy_destroy(anland_scene_legacy *b)
 {
@@ -363,6 +366,15 @@ bool anland_scene_legacy_target_available(anland_scene_legacy *b)
 {
     return b && b->session_valid && !b->ready_pending &&
            !b->retirement_pending && anland_device_is_connected(b->dev);
+}
+
+bool anland_scene_legacy_renderable(anland_scene_legacy *b)
+{
+    if (!anland_scene_legacy_target_available(b) ||
+        b->pending_commit || b->inflight_commit) return false;
+    const int slot = anland_device_current_fb_raw(b->dev);
+    return slot >= 0 && slot < anland_device_fb_count(b->dev) &&
+           slot < ANLAND_DEVICE_MAX_BUFS && b->retained_count[slot] == 0;
 }
 
 int anland_scene_legacy_reconnect(anland_scene_legacy *b)

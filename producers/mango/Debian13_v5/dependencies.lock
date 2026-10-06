@@ -1,0 +1,9 @@
+# kind name revision-or-sha256 url patch-sha256-or-meson-options
+git mango 3b119a23b785db47d0f2b2aa2ed36787ad5ae167 https://github.com/DreamMaoMao/mango.git 5ddd1eed5d382b00bd3a848a89b3858745644a774f8432df00710316714c978a
+git wlroots d783533489e1f75d6886c2ab5c5960090ef268f8 https://gitlab.freedesktop.org/wlroots/wlroots.git aa6779bac078b448a31bd34dc1914aa99c7635cbfccc4ecd9a7d66543911c239
+git scenefx dc3cddc3d40def29ed7a5ac16d3a48d348a8d75a https://github.com/wlrfx/scenefx.git 212c2a0972d6275180268869a6a7c2747d0f884b0831376eb9ef36b39743322c
+tar wayland 64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3 https://deb.debian.org/debian/pool/main/w/wayland/wayland_1.26.0.orig.tar.xz -Dtests=false -Ddocumentation=false
+tar libdrm ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95 https://deb.debian.org/debian/pool/main/libd/libdrm/libdrm_2.4.134.orig.tar.xz -Dauto_features=disabled -Dfreedreno=enabled -Damdgpu=enabled -Dnouveau=enabled -Dradeon=enabled -Dtests=false
+tar wayland-protocols 5fd4349bcbc9bab9a46f8cf77d1f434296a7a052c87440a094f63fcf62a58e20 https://deb.debian.org/debian/pool/main/w/wayland-protocols/wayland-protocols_1.47.orig.tar.xz -Dtests=false
+tar libxkbcommon 6802621c81b674e468d2346a8f6d9a48ba5c154b72434a1c9e1a3eaa29f36fb5 https://deb.debian.org/debian/pool/main/libx/libxkbcommon/libxkbcommon_1.13.1.orig.tar.gz -Denable-wayland=false -Denable-x11=false -Denable-tools=false -Denable-docs=false -Denable-xkbregistry=false -Dxkb-config-root=/usr/share/X11/xkb -Dxkb-config-extra-path=/etc/xkb -Dx-locale-root=/usr/share/X11/locale
+tar pixman d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c https://deb.debian.org/debian/pool/main/p/pixman/pixman_0.46.4.orig.tar.gz -Dtests=disabled -Ddemos=disabled -Dgtk=disabled

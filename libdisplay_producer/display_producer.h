@@ -26,6 +26,10 @@ int  connect_to_deamon(display_ctx **ctx, const char *socket_path);
 /* Tear down everything and disconnect from the daemon. */
 void disconnect(display_ctx *ctx);
 
+/* Opt-in deferred connector discovery: returns after HELLO; screen geometry
+ * may be zero until try_exit_fallback observes the consumer. No fake mode. */
+int connect_to_deamon_deferred(display_ctx **out, const char *socket_path);
+
 int  get_screen_info(display_ctx *ctx, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *refresh);
 
 /* Stash the render-done fence (created in doEndFrame) for the current frame. The
@@ -74,6 +78,19 @@ int push_output_event(display_ctx *ctx, const struct OutputEvent *event);
  * field, and must then recv() the payload manually over the socket (with a timeout,
  * in case the peer dies). */
 int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event, void* payload, size_t size);
+/* Additive asynchronous API: copies a complete event/payload into a bounded
+ * 2MiB session-owned queue (payload <= 1MiB). 0 = accepted, -1 = rejected;
+ * ENOBUFS does not detach or alter the queue. Acceptance is not delivery.
+ * flush: 0 drained, 1 pending, -1 lost. Never blocks. The event loop retries
+ * after POLLOUT or on a timer, including after a work-budget-limited flush.
+ * All writes through this context share queue order, including synchronous APIs.
+ * Caller serializes the context. Never write to its data fd independently. */
+int queue_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event,
+                                  const void *payload, size_t size);
+int queue_clipboard(display_ctx *ctx, const void *text, size_t size);
+int flush_queued_output(display_ctx *ctx);
+size_t pending_output_bytes(const display_ctx *ctx);
+
 /* Register a callback invoked after fallback is set but before consumer-owned fds
  * are closed. It must not re-enter display_producer. */
 int  set_pre_release_callback(display_ctx *ctx, void (*on_pre_release)(void *), void *userdata);
