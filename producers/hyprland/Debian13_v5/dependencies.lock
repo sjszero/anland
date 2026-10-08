@@ -1,0 +1,99 @@
+{
+  "suite": "trixie-backports",
+  "anland_revision": "f9b529e2cc370fd7dc77a7a6ce8bbf14f935adfa",
+  "reference_revision": "9231ecf0ae49cc0477aafa22a35b923b71c27b34",
+  "sources": {
+    "hyprutils": {
+      "version": "0.13.1-2~bpo13+1",
+      "directory": "hyprutils-0.13.1",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprutils/",
+      "files": {
+        "hyprutils_0.13.1-2~bpo13+1.dsc": "5f3f09aa838c5cae1304979d753bdc03c85787adb14e77999715599d0884e548",
+        "hyprutils_0.13.1.orig.tar.gz": "a096db4e34a9104d2e115352f90aba01a2b784ae2063671a9845d153b096de19",
+        "hyprutils_0.13.1-2~bpo13+1.debian.tar.xz": "9519fd5f5906d702ab6ff529dc42b3e7cc011773260075b09705af8239d74793"
+      }
+    },
+    "hyprlang": {
+      "version": "0.6.8-4~bpo13+1",
+      "directory": "hyprlang-0.6.8",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprlang/",
+      "files": {
+        "hyprlang_0.6.8-4~bpo13+1.dsc": "f9c998b254871924d9889bc93532dfbfb95c38330074f2ead2f9718368213ffc",
+        "hyprlang_0.6.8.orig.tar.gz": "d10a0778b646e04d83e8b90cc0f764fb96958c01a15c3c0678d95a40fc647ed5",
+        "hyprlang_0.6.8-4~bpo13+1.debian.tar.xz": "dd1b664ccbf521c7da0d52cd6dbc668fddabf2ae88324637b27d65c0fe7cfc47"
+      }
+    },
+    "hyprgraphics": {
+      "version": "0.5.1-2~bpo13+1",
+      "directory": "hyprgraphics-0.5.1",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprgraphics/",
+      "files": {
+        "hyprgraphics_0.5.1-2~bpo13+1.dsc": "83c5885ace42dd8d8eeafe7814d1292067f2993b3e8380fb46e5da0e962423cc",
+        "hyprgraphics_0.5.1.orig.tar.gz": "57268fb39108c161ff83a0d8cab7e5222764794b99f071b28efd809ba85f9ad9",
+        "hyprgraphics_0.5.1-2~bpo13+1.debian.tar.xz": "1d59f09cd6bdd0288a0a494839a1f26056fec0905ffe0235b49c1ba3dfa5b6f6"
+      }
+    },
+    "aquamarine": {
+      "version": "0.15.1-1~bpo13+1",
+      "directory": "aquamarine-0.15.1",
+      "url": "https://deb.debian.org/debian/pool/main/a/aquamarine/",
+      "files": {
+        "aquamarine_0.15.1-1~bpo13+1.dsc": "5e839cf48d627ff3a9408b03fb3a892ab9c5e019d885ad7a81aa227d405aadcc",
+        "aquamarine_0.15.1.orig.tar.gz": "5de0842f2ccb8b242baa801f553e8cdc7689ef7b882675d1b671f77928225857",
+        "aquamarine_0.15.1-1~bpo13+1.debian.tar.xz": "46c03da6d68aa81743dbe00f2e506a0df9d77fd8819486b33ded215fd2f5a9f9"
+      }
+    },
+    "hyprland": {
+      "version": "0.55.2+ds-1~bpo13+1",
+      "directory": "hyprland-0.55.2+ds",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprland/",
+      "files": {
+        "hyprland_0.55.2+ds-1~bpo13+1.dsc": "79cf25d2a1bfb4f376e0cf1dc001b2cbe10f0f6b32cb9842cc9cf931b6533b75",
+        "hyprland_0.55.2+ds.orig.tar.xz": "61f150f337923bd690c75a6c51adeceb8ac72103f78f516aa017eee3225fc338",
+        "hyprland_0.55.2+ds-1~bpo13+1.debian.tar.xz": "0353f25d0d5e7fc94603cbb0dc77bd0cf88ea1b93e8dc87153126cfd04796a4b"
+      }
+    }
+  },
+  "patches": {
+    "aquamarine.patch": "403728ba5fe47189e952d4260803c4d0591db493bb5861b17677c8419e6f550f",
+    "hyprland.patch": "a813cb0365e5412ce83215d4e447dd18d34dcbe9b66e179b00f03042f9849658",
+    "hyprgrass.patch": "24c05fef279dff8dcc7fa6b2bd2a20487c41abc56a995c042fa56ca59c7289cf",
+    "xwayland.patch": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+  },
+  "lua": "lua5.4",
+  "public_linkage": "built-in-once-in-aquamarine",
+  "runtime_packages": {
+    "hyprutils": "libhyprutils12",
+    "hyprlang": "libhyprlang2",
+    "hyprgraphics": "libhyprgraphics4",
+    "aquamarine": "libaquamarine14",
+    "hyprland": "hyprland"
+  },
+  "abi_policy": {
+    "hyprutils_soname": 12,
+    "transitive_other_hyprutils": "reject"
+  },
+  "plugins": {
+    "hyprgrass": {
+      "revision": "0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "url": "https://codeload.github.com/horriblename/hyprgrass/tar.gz/0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "archive": "hyprgrass-0e8e3c09b805e5f8f7cedde7546e58c504682c31.tar.gz",
+      "sha256": "4ea3018cab0e6a4d3b6d265af52c58df7de98733eec2d2921785bf9500863bc3"
+    },
+    "wf-touch": {
+      "revision": "8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "url": "https://codeload.github.com/WayfireWM/wf-touch/tar.gz/8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "archive": "wf-touch-8974eb0f6a65464b63dd03b842795cb441fb6403.tar.gz",
+      "sha256": "09061c8a4d3d964e8dcfd1a7b97f7dc43d0fc30743b0993585439c6923ce422f"
+    },
+    "hyprland_revision": "39d7e209c79d451efab1b21151d5938289da838d"
+  },
+  "xwayland": {
+    "version": "2:24.1.6-1",
+    "files": {
+      "xwayland_24.1.6-1.dsc": "25f96591e3c3fe674ab830ef0557141658fb14cf91f56defb33ac3420435e368",
+      "xwayland_24.1.6.orig.tar.xz": "737e612ca36bbdf415a911644eb7592cf9389846847b47fa46dc705bd754d2d7",
+      "xwayland_24.1.6-1.debian.tar.xz": "fcfc0c634b7aaaa059c2e9337da2330c6b5c20b084009494d144c34bac9715ef"
+    }
+  }
+}

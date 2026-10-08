@@ -505,11 +505,19 @@ size_t anland_device_pending_output(const anland_device *dev)
 int anland_device_get_drm_fb(anland_device *dev, int index, anland_device_fb_t *fb)
 {
     if (anland_device_get_fb(dev, index, fb) != 0) return -1;
-    /* Preserve the established native import mapping. DRM_FORMAT_ABGR8888 for
-     * Android RGBA8888 (1), DRM_FORMAT_XRGB8888 for legacy other formats.
-     * Numeric fourcc encoding avoids a public dependency on libdrm headers. */
-    fb->format = fb->format == 1
-        ? ((uint32_t)'A' | ((uint32_t)'B' << 8) | ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24))
-        : ((uint32_t)'X' | ((uint32_t)'R' << 8) | ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24));
+    /* HAL pixel format -> DRM fourcc. Do not guess layouts for unknown formats.
+     * Numeric encoding keeps libdrm headers out of the public implementation. */
+    const uint32_t tail = ((uint32_t)'2' << 16) | ((uint32_t)'4' << 24);
+    switch (fb->format) {
+    case 1: /* RGBA8888 */ fb->format = (uint32_t)'A' | ((uint32_t)'B' << 8) | tail; break;
+    case 2: /* RGBX8888 */ fb->format = (uint32_t)'X' | ((uint32_t)'B' << 8) | tail; break;
+    case 5: /* BGRA8888 */ fb->format = (uint32_t)'A' | ((uint32_t)'R' << 8) | tail; break;
+    default:
+        close(fb->fd);
+        memset(fb, 0, sizeof(*fb));
+        fb->fd = -1;
+        errno = ENOTSUP;
+        return -1;
+    }
     return 0;
 }
