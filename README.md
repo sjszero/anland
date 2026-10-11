@@ -1,801 +1,598 @@
-# Anland Display Protocol V3
+# Anland v5
 
 <p align="left">
   <img src="doc/logo.png" width="140" alt="Anland logo" />
   <img src="https://stone.professorlee.work/api/stone/superturtlee/anland" alt="Stone Badge" />
 </p>
 
-> A buffer‑sharing protocol that lets a Linux compositor (KWin / Weston) render its
-> desktop into GPU buffers that an Android surface presents, brokered by a small
-> daemon over a Unix domain socket.
->
-> **V3** adds **bidirectional clipboard exchange** — the producer (compositor) and
-> consumer (Android display) can push clipboard content to each other over the data
-> channel. Clipboard data uses a **variable‑length** two‑packet protocol (header +
-> payload), which introduces **ABI and API incompatibilities** with V2: callers must
-> handle all event types or explicitly drain unhandled variable‑length payloads.
+**Run a Linux Wayland desktop on an Android display using shared GPU buffers.**
+The Linux compositor still manages windows, composes the complete desktop and handles its native seat and session. The Android consumer owns the display buffers and presents the rendered output; a small Unix-socket daemon brokers the connection and passes file descriptors.
 
-> **[中文版](README_zh.md)**
+[中文](README_zh.md) · [User guide](doc/UserManual/anland_guide.md) · [Android settings](doc/UserManual/anland_settings_guide.md) · [V3 archive](doc/History/v3.md)
 
----
+This README describes the current v5 source tree, including Denial. Directory presence means a port recipe exists, **not** that every distribution, GPU or feature has passed build and graphical validation. Public headers, source locks and executable script behavior take precedence over examples and historical documentation.
 
-## User documentation
+## Contents
 
-- [Anland User Guide](doc/UserManual/anland_guide.md) - install Anland and connect a supported Wayland desktop through chroot or Droidspaces.
-- [Anland Settings Guide](doc/UserManual/anland_settings_guide.md) - configure input, display, connection, audio, and window behavior in the Android app.
+- [1. Repository map](#section-1)
+- [2. Architecture and ownership](#section-2)
+- [3. Compositor and distribution index](#section-3)
+- [4. Public API and frame contract](#section-4)
+- [5. Transport, input and media](#section-5)
+- [6. Building and packaging](#section-6)
+- [7. Porting a compositor](#section-7)
+- [8. Startup and validation](#section-8)
+- [9. Wire protocol reference](#section-9)
+- [10. Variable payloads, queues and service resources](#section-10)
+- [11. Handshake and recovery state machines](#section-11)
+- [12. Per-frame transport versus scene feedback](#section-12)
+- [13. API map and return contracts](#section-13)
+- [14. Audio engine details](#section-14)
+- [15. Migration, reproducibility and diagnosis](#section-15)
+- [16. History and license](#section-16)
 
----
+<a id="section-1"></a>
 
-## 1. Roles
+## 1. Repository map
 
-| Role | Binary | Responsibility |
-|------|--------|----------------|
-| **Daemon** | `daemon` | Rendezvous broker. Holds **at most one** consumer and **one** producer, stores the screen info, and passes file descriptors between them with `SCM_RIGHTS`. **Unchanged from V2.** |
-| **Consumer** | Android app / `test_sdl_consumer` | **Owns the resources.** Allocates the dmabufs, the buffer‑ready eventfd, the shm index page, and **two** socketpairs (`data` + `fence`), and *presents* the rendered frames. In V3 also **receives clipboard data** from the producer. |
-| **Producer** | KWin / Weston `backend‑anland` | The compositor. *Renders* desktop content into the consumer's shared buffers. In V3 also **receives clipboard data** from the consumer and **sends clipboard data** to the consumer. |
+| Area | Purpose |
+|---|---|
+| [consumers/anland_v5/](consumers/anland_v5/) | Android v5 consumer and application |
+| [daemon/](daemon/), [libdisplay_daemon/](libdisplay_daemon/) | Connection broker and daemon implementation |
+| [common/](common/) | Wire structures, framing and descriptor passing |
+| [libdisplay_consumer/](libdisplay_consumer/) | Consumer-side C transport library |
+| [libdisplay_producer/](libdisplay_producer/) | Single public producer implementation: device, scene, presentation, desktop facade and media helpers |
+| [producers/](producers/) | One backend per compositor, with distribution-specific integration and packaging |
+| [magisk_module/](magisk_module/) | Android daemon deployment materials |
+| [doc/UserManual/](doc/UserManual/) | Installation and application settings guides |
+| [.github/workflows/build.yml](.github/workflows/build.yml) | Android plain/Tracy APK and daemon build workflow |
 
-> [!NOTE]
-> **Naming**: the *producer* produces pixel content; the *consumer* consumes
-> (displays) it. The consumer is the resource owner because it is the side that
-> physically scans the buffers out to the panel.
+The root CMake build produces the daemon and C libraries; it does **not** build all compositor ports or the Android APK. APK builds use Gradle under `consumers/anland_v5/android_consumer/`.
 
----
+<a id="section-2"></a>
 
-## 2. V3 changes at a glance
+## 2. Architecture and ownership
 
-| Aspect | V2 | V3 | Impact |
-|--------|----|----|--------|
-| Clipboard | Consumer → Producer only | **Bidirectional** | New `DATA_MSG_OUTPUT_EVENT`(103) P→C direction |
-| Variable‑length events | Not used | `clipboard.size` + trailing payload | ❌ **ABI incompatible**: old `poll_input_event()` cannot drain variable payload, corrupts stream |
-| `handle_unhandled_event()` | Not required | **Mandatory** | ❌ **API incompatible**: unhandled variable events must be drained explicitly |
-| `push_input_event_with_length()` / `push_output_event_with_length()` | Not required | **Mandatory for clipboard** | Signature unchanged, but variable events **must not** use `push_input_event()` / `push_output_event()` |
-| Daemon | — | **Unchanged** | Zero changes |
-
-> [!CAUTION]
-> **ABI incompatibility**: a V3 consumer may send `INPUT_TYPE_CLIPBOARD`
-> events whose trailing payload bytes exceed `sizeof(struct InputEvent)`. A V2
-> producer that only calls `poll_input_event()` (which reads exactly one fixed‑size
-> `InputEvent`) will **leave the trailing bytes in the socket buffer**, corrupting
-> all subsequent messages. The same applies in the reverse direction for
-> `DATA_MSG_OUTPUT_EVENT` with clipboard payloads.
-
----
-
-## 3. Transport & Channels
-
-There are **four** communication paths — same as V2, with the fence channel using
-a **socketpair** and the data channel now carrying **variable‑length output events**.
-
-| Channel | Kind | Created by | Carries |
-|---------|------|------------|---------|
-| **Control** | `AF_UNIX` `SOCK_STREAM` to daemon | each peer | `ctrl_msg` handshake messages |
-| **Data** | `socketpair()` | Consumer | `data_msg`: dmabuf set + input events + **output events** |
-| **buf_ready** | `eventfd` | Consumer | Consumer → Producer: "a buffer is selected, render it" |
-| **fence** | `socketpair()` | Consumer | Producer → Consumer: render‑done message + optional `SCM_RIGHTS` fence fd |
-| **shm index** | 4‑byte `memfd` | Consumer | selected buffer index |
-
-Default daemon socket path:
-`/data/local/tmp/display_daemon.sock`
-
-All control/data framing uses a fixed 8‑byte header followed by an optional payload
-(`common/protocol.h`):
-
-```c
-struct ctrl_msg { uint32_t type; uint32_t size; uint8_t payload[]; } __attribute__((packed));
-struct data_msg { uint32_t type; uint32_t size; uint8_t payload[]; } __attribute__((packed));
+```text
+Linux compositor: native windows, renderer, frame clock, seat and desktop
+  -> thin Anland backend: native image imports, events and frame feedback
+  -> anland_de_backend
+       -> anland_scene / anland_present
+       -> anland_scene_legacy (internal existing full-screen transport adapter)
+       -> anland_device / display_producer / common protocol
+  -> existing daemon -> Android consumer -> Android presentation
 ```
 
-`size` is the payload length in bytes (header excluded). Reliable framing helpers
-`send_all` / `recv_all` and the ancillary‑fd helpers `send_fds` / `recv_fds` live in
-`common/socket_utils.c`.
+- **Producer:** renders the complete desktop into consumer-provided targets. It is not an Android per-window forwarding service.
+- **Consumer:** owns shared display resources and presentation. Consumer ACKs are not proof of physical scanout or hardware VSync.
+- **Daemon:** brokers control connections and resource FD transfer. Steady-state image handoff does not require a daemon round trip per frame.
+- **Public producer:** owns transport encoding, commit transactions, feedback, buffer release, backpressure and session invalidation. Backends translate native compositor objects, not duplicate these mechanisms.
 
----
+One compositor has one backend. Distribution/version differences belong in patches, dependency locks, package recipes and startup configuration. `anland_scene_legacy` is an internal implementation name, **not** a second selectable WM protocol. Producer-local layers do not imply Android per-window Surfaces. A port must not replace the consumer, introduce another wire protocol or maintain its own transport state machine.
 
-## 4. The four deposited descriptors
+<a id="section-3"></a>
 
-When the consumer says hello it attaches **four** fds (via `SCM_RIGHTS`), in this exact
-order — see `send_hello_fds()` in `display_consumer.c`:
+## 3. Compositor and distribution index
 
-| Index | Direction | Purpose |
-|:-----:|-----------|---------|
-| `fds[0]` | C → P | `buf_ready_efd`: consumer signals a selected buffer |
-| `fds[1]` | P → C | `fence_fd` socketpair write end: render‑done message + optional fence fd via `SCM_RIGHTS` |
-| `fds[2]` | C ↔ P | data‑channel end: the producer's end of the socketpair |
-| `fds[3]` | C → P | `shm_fd`: the 4‑byte selected‑index page |
+Paths below are relative to `producers/<name>/`; directory names are case-sensitive.
 
-> **V3 unchanged**: fd slots are identical to V2
+| Compositor | Backend | Distribution entries in this tree |
+|---|---|---|
+| [Gamescope](producers/gamescope/) | `anland_backend/` (C session wrapper, C++/Vulkan) | `SteamOS_v5` |
+| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/` (GObject/Cogl/Clutter) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
+| [KDE / KWin](producers/kde/) | `anland_backend/` (Qt output/EGL/input) | `Arch_v5`, `Debian13_v5`, `Fedora43_v5`, `SteamOS_v5`, `ubuntu2604_v5` |
+| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5` |
+| [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Debian13_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Debian13_v5` |
+| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5` |
 
-The consumer keeps `sv[0]` as its own `data_fd` and deposits `sv[1]`. The daemon stores
-these as **deposited fds** and hands them to the producer on request. **The daemon is
-opaque to the fd semantics — no daemon update needed.**
+[producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) contains an additional Xwayland recipe, not a WM backend. Building Mutter or KWin alone does not deliver the complete GNOME or Plasma session; native shells, portals, agents and session data remain necessary. Niri's X11 integration also requires checking xwayland-satellite and its startup relationship.
 
----
+<a id="section-4"></a>
 
-## 5. Message reference
+## 4. Public API and frame contract
 
-### 5.1 Control messages (control channel)
+Start with [anland_de_backend.h](libdisplay_producer/anland_de_backend.h), [anland_present.h](libdisplay_producer/anland_present.h), [anland_scene.h](libdisplay_producer/anland_scene.h) and [anland_device.h](libdisplay_producer/anland_device.h).
 
-| Message | Value | Direction | Payload / FDs | Meaning |
-|---------|:-----:|-----------|---------------|---------|
-| `CTRL_MSG_CONSUMER_HELLO` | 1 | C → D | + 4 fds | register as consumer & deposit fds |
-| `CTRL_MSG_PRODUCER_HELLO` | 2 | P → D | — | register as producer |
-| `CTRL_MSG_SCREEN_INFO`    | 7 | C → D, D → P | `screen_info` | publish / forward screen geometry |
-| `CTRL_MSG_REJECT`         | 8 | D → C | — | screen‑info mismatch, connection refused |
-| `CTRL_MSG_PICKUP_FDS`     | 9 | P → D | — | producer asks for the deposited fds |
-| `CTRL_MSG_FDS_READY`      | 10 | D → P (+4 fds), D → C (notify) | + 4 fds to producer | fds handed over |
+1. Create one `anland_de_backend` owner and add a layer describing the complete composed output with `anland_de_backend_add_window_desc()`.
+2. Connect the native event loop to device readiness and scene events. Drive `pump()` and `dispatch()`; creation or connection alone does not mean a render target is available.
+3. Query the live output and `anland_de_backend_get_writable_target()`. `get_target()` only describes a published target; it does not prove that rendering into it is safe.
+4. Import targets through the native renderer. Track **session generation and slot**, use the actual buffer count, and validate dimensions, strides, offsets, format and modifier. `anland_device_get_drm_fb()` returns DRM fourcc metadata and a caller-owned duplicate FD; do not treat raw protocol/HAL formats as DRM fourcc.
+5. Render into the recorded target, export an acquire fence or explicitly wait for GPU completion, then revalidate generation/slot before committing.
+6. Call `anland_de_backend_commit(..., &commit_id)`, record its native-frame association, then `present()`. Continue `pump()`/`dispatch()` to finish or drop that frame and process release.
 
-### 5.2 Data messages (data channel)
+| Scene event | Meaning for the native compositor |
+|---|---|
+| `RENDER_TARGET_READY` | Re-query and validate a target; schedule rendering only when writable. Not previous-frame completion. |
+| `PRESENTED` | Finish the matching commit's native frame using the available consumer feedback, not invented hardware timing. |
+| `BUFFER_RELEASED` | Process the release fence and allow safe reuse. Do not destroy an imported image every frame. |
+| `COMMIT_DROPPED` | End the matching frame's wait through its drop/cancel path. |
+| `OUTPUT_CHANGED` | Refresh output mode and imports/damage history as needed. |
 
-| Message | Value | Direction | Payload / FDs | Meaning |
-|---------|:-----:|-----------|---------------|---------|
-| `DATA_MSG_BUFS_READY` | 200 | C → P | `N × buf_info` + `N` dmabuf fds | the shared dmabuf set |
-| `DATA_MSG_INPUT_EVENT`| 102 | C → P | `InputEvent` | touch / key / pointer / clipboard / display refresh |
-| `DATA_MSG_OUTPUT_EVENT`| **103** | **P → C** | `OutputEvent` | **clipboard** from producer (**V3 bidirectional**) |
-| `DATA_MSG_BUF_READY`  | 100 | — | *reserved* | superseded by `buf_ready_efd` |
-| `DATA_MSG_REFRESH_DONE`| 101 | — | *reserved* | superseded by **fence channel** |
+**Ownership and safety:** acquire fences passed to commit are borrowed; release fences returned by dispatch and duplicated buffer FDs are caller-owned. Device data, buffer-ready and audio FDs are borrowed. Explicitly initialize an absent acquire fence to `-1`, not zero. Failed release synchronization must not permit buffer reuse. Keep frame-path operations serialized in the compositor event loop.
 
-### 5.3 Structures
+Backpressure retains repaint/damage requests until a writable target appears. On consumer loss use `reconnect()`; on daemon/control loss use `reopen()`; invalid imports or bad session data require `drop_session()` and local cleanup. Generation changes invalidate old targets, callbacks and imports. Watcher identity includes owner and event mask, not just the FD number. Stop media engines using session resources before destroying their owner.
+
+Use full-frame redraw as the initial baseline. Buffer-age/damage optimizations require correct real-slot history across rotation, resize and reconnect.
+
+<a id="section-5"></a>
+
+## 5. Transport, input and media
+
+The wire source of truth is [common/protocol.h](common/protocol.h), with framing/FD helpers in [common/socket_utils.c](common/socket_utils.c). The device's built-in default socket is `/data/local/tmp/display_daemon.sock`; `ANLAND_SOCKET`, explicit endpoint configuration and discovery locations can alter it. Read the selected startup script rather than assuming all ports use the same endpoint.
+
+| Path | Responsibility |
+|---|---|
+| Control Unix socket | Daemon registration, output information and resource pickup |
+| Data channel | Buffer-set transfer, input/output events, variable-length clipboard/text and service resource messages |
+| Buffer-ready eventfd + shared index page | Consumer selects the target for producer rendering |
+| Fence channel | Render handoff with optional synchronization FD |
+| Dedicated audio channel | Desktop playback and microphone capture without placing PCM on the input channel |
+
+Current protocol definitions extend beyond v3: text input, actions, resource FDs, consumer runtime variables, foreground scheduling, and audio format/PCM/shared-memory messages. The audio endpoint uses hello FD slot 4 in the current protocol; the old README's four-FD-only description is historical, not today's integration contract.
+
+- Feed keyboard, pointer and touch through native seat APIs; clear pressed state on disconnect.
+- Handle or fully consume variable-length payloads and ancillary FDs, including unsupported services. Apply limits and read deadlines; leaving bytes or descriptors pending breaks framing.
+- Clipboard export should use `anland_device_queue_clipboard()`, `pending_output()` and `flush_output()` with writable readiness. Queue acceptance is not delivery. Avoid echo loops and stale asynchronous selection results.
+- Prefer native text-input/IME submission. Any fallback must validate complete UTF-8 and target only the focused client, without activating global WM shortcuts.
+- Reuse [anland_audio.h](libdisplay_producer/anland_audio.h) and [anland_camera.h](libdisplay_producer/anland_camera.h), but claim a feature only when that WM actually wires it.
+- Pointer capture and foreground scheduling use public device controls with reconnect state restoration. Touch gestures require actual touch contacts, not fabricated finger metadata from wheel events.
+
+Historical v1/v2/v3 compatibility claims do not establish v5 interoperability. Build and deploy matching consumer, protocol, producer/bridge and backend inputs; a `5.0.0` pkg-config version alone does not prove a particular API exists.
+
+<a id="section-6"></a>
+
+## 6. Building and packaging
+
+Use the `build.sh` and package recipe in the selected distribution entry. Read its accepted parameters first: there is no universal stage CLI or dependency-install switch. Prefer ordinary-user builds, persistent caches outside the repository, locked source revisions and native packages.
+
+**Build, installation and graphical startup are separate operations.** Build entries generally gate final installation with `ANLAND_INSTALL=1` (some also support `INSTALL`), but dependency preparation may still use sudo. Review the actual script before running it. Installation can replace distribution WM/Xwayland packages; it is not permission to restart a running desktop or audio service.
+
+Examples, run from the repository root in the matching Linux environment:
+
+```sh
+# Arch Linux ARM; KWin recipe pins its supported upstream version.
+JOBS=4 ANLAND_INSTALL=0 bash producers/kde/Arch_v5/build.sh --noconfirm
+
+# Debian 13 ARM64; environment variables, not historical stage arguments.
+JOBS=4 ANLAND_INSTALL=0 bash producers/hyprland/Debian13_v5/build.sh
+JOBS=2 ANLAND_INSTALL=0 bash producers/mango/Debian13_v5/build.sh
+
+# Arch Linux ARM; ordinary user, dependencies may be installed explicitly.
+JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
+  bash producers/denial/Arch_v5/build.sh --noconfirm
+```
+
+### Public-library linkage
+
+Use one public implementation per product: dynamic `display-producer` through pkg-config, canonical public sources built into the compositor, or a narrow C bridge used from Rust. `producer.cmake` centralizes sources and dependencies; `presentation.cmake` supplies presentation objects; `display-producer.pc.in` supplies discovery metadata. Do not both embed and dynamically link duplicate implementations. Generate self-contained overlays from the canonical tree, resolving repository symlinks for packaging; do not maintain copied transport forks. Verify the actual APIs by compile/link tests, not version strings alone.
+
+### Current build-chain notes
+
+- **Hyprland / Debian 13:** lockfile covers the dependency stack and plugin ABI; public producer is built into Aquamarine. Build artifacts go to `producers/hyprland/Debian13_v5/artifacts/`. Default `JOBS=4`; `nocheck nodwz` means package success is **not** proof of tests passing.
+- **Mango / Debian 13:** private-prefix shared producer, wlroots and SceneFX; artifacts go to `producers/mango/Debian13_v5/artifacts/`. Default `JOBS=2`.
+- **Denial / Arch:** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) pins Denial `0.5.0-anland5` and Flutter `3.47.5` revisions; Cargo/pub locks cover transitive dependencies. Cache defaults to `$XDG_CACHE_HOME/denial-anland` or `$HOME/.cache/denial-anland`; output defaults to `$WORKDIR/packages`, overridable with `ARTIFACTS_DIR`. `ANLAND_ENGINE_MODE=auto|build|prepared`, `ANLAND_OFFLINE=1` and `ANLAND_WITH_DE=0` select engine/cache/desktop behavior. Outputs include the engine, `denial`, optional `denial-desktop`, patched Xwayland, local signatures, `packages.list`, `manifest.env` and `SHA256SUMS`. Review/trust the local signing key before installation; it is not an upstream release key.
+
+### Xwayland
+
+Denial's Arch entry now uses the same Xwayland `24.1.13` recipe/patch as KDE Arch, with `XWAYLAND_TARBALL` for a local archive and `XWAYLAND_PATCH` for an override. Its output participates in Denial's package list, signatures, checksums and optional installation. Debian Hyprland/Mango use their own locked Xwayland source recipes; do not apply one distribution's patch to arbitrary versions.
+
+The kgsl/Turnip compatibility patch permits implicit-modifier dma-bufs, avoids waiting for v4 feedback on a v3-only compositor, and allows a render-device fallback (`XWAYLAND_GBM_DEVICE`). The `1274 -> LINEAR` workaround is specific to a known freedreno/kgsl path, not permission to guess any unknown modifier. New build designs should isolate Xwayland from WM-private library/toolchain variables. Installing a new package does not restart a live Xwayland process.
+
+<a id="section-7"></a>
+
+## 7. Porting a compositor
+
+Choose the closest native integration: Mutter for C/GObject, KWin for C++/Qt, Gamescope for Vulkan, Niri/Denial for Rust plus C bridge, Mango for wlroots, or Hyprland for Aquamarine. Read the actual current code before copying a historical pattern.
+
+1. Record upstream revision, renderer/import support, event loop, frame lifecycle, seat/text/clipboard interfaces, GPU/fence capabilities, target architecture and full-session dependencies.
+2. Keep the backend separate; version patches register it and expose the minimum native hooks. Public mechanisms stay in `libdisplay_producer/`.
+3. Establish the writable-target -> render -> commit/present -> feedback/release loop before adding desktop services.
+4. Lock source archives/commits, submodules, dependency revisions and compatible patches. Verify expected hashes before extraction where possible; never ignore patch failures.
+5. Build dependencies in dependency order, then the public library/bridge as required, the WM and native packages. A distribution with no WM package still supplies tools and libraries; create a PKGBUILD, Debian package or RPM spec rather than falling back to global `sudo make install`.
+6. Separate prepare, compile, packaging, validation, optional install and authorized graphical tests. Keep one backend and one public implementation; do not change the Android consumer to make a WM port work.
+
+<a id="section-8"></a>
+
+## 8. Startup and validation
+
+Use the chosen `startup.sh` or installed session entry only after reviewing its environment and configuration. Device-specific GPU variables belong in that entry, not global defaults. Do not overwrite user configuration, seize another producer session, or automatically terminate/restart the WM, PipeWire, daemon or consumer. A `--check` preflight, where provided, is not a consumer handshake or graphical smoke test.
+
+A complete validation record distinguishes:
+
+- **Contract tests:** first target versus presentation; accepted/ACK/released states; backpressure; failed commits and fences; old generations; FD ownership; resize/reconnect and watcher reuse; bounded clipboard/text/resource handling.
+- **Build/package checks:** real compiler/linker exit status, explicit log conclusion, architecture, contents, dependencies, symbols and RPATH. Compare hashes with previous artifacts to catch stale incremental objects; timestamps alone are insufficient.
+- **Authorized graphical tests:** first frame and sustained redraw, windows/cursor/effects, input and declared media, consumer/daemon recovery, rotation/resize, Wayland and X11 clients.
+
+The Android workflow contains native input-grab and JVM unit-test steps; that is not coverage for all producer ports.
+
+<a id="section-9"></a>
+
+## 9. Wire protocol reference
+
+This section documents the checked-in C transport, not a new portable network protocol. Its packed structures are exchanged on local Unix sockets with `SCM_RIGHTS`. There is no version-negotiation field in `ctrl_msg`/`data_msg`, and no endian conversion in their declarations. Do not use structure sizes or an unchanged message number to infer cross-version compatibility.
+
+### 9.1 Headers and buffer metadata
 
 ```c
-struct screen_info { uint32_t width, height, format, refresh; };
+/* common/protocol.h: both headers are 8 bytes, payload excluded. */
+struct ctrl_msg {
+    uint32_t type;
+    uint32_t size;
+    uint8_t payload[];
+} __attribute__((packed));
+struct data_msg {
+    uint32_t type;
+    uint32_t size;
+    uint8_t payload[];
+} __attribute__((packed));
+
+struct screen_info {
+    uint32_t width, height, format, refresh;
+} __attribute__((packed));
 
 struct buf_info {
-    uint32_t stride;
+    uint32_t stride;    /* bytes */
     uint32_t width;
     uint32_t height;
-    uint32_t format;
+    uint32_t format;    /* transport/HAL convention, NOT automatically DRM fourcc */
     uint64_t modifier;
     uint32_t offset;
-};
-
-struct InputEvent {
-    uint32_t type;
-    union {
-        struct { int32_t action; float x, y; int32_t pointer_id; } touch;
-        struct { int32_t action; int32_t keycode; } key;
-        struct { float x, y, dx, dy; } pointer_motion;
-        struct { uint32_t button; int32_t pressed; } pointer_button;
-        struct { uint32_t axis; float value; int32_t discrete; } pointer_axis;
-        struct { uint32_t refresh_mhz; } display;
-        struct { uint32_t size; } clipboard;
-        struct { uint32_t padding[4]; };
-    };
-} __attribute__((packed));
-
-struct OutputEvent{
-    uint32_t type;
-    union {
-        struct { uint32_t size; } clipboard;
-        struct { uint32_t padding[4]; };
-    };
 } __attribute__((packed));
 ```
 
-#### InputEvent types
+`screen_info` is 16 bytes and `buf_info` is 28 bytes in this packed definition. The public output view names the refresh field `refresh_mhz`; `60000` represents 60 Hz. `MAX_BUFS` is 8, an upper bound rather than a fixed swapchain length. A `BUFS_READY` payload contains `N` metadata records and exactly `N` dma-buf FDs. The producer validates that the byte count is nonzero, divisible by `sizeof(buf_info)`, within the maximum, and consistent with the received descriptor count.
 
-| Type | Value | V1 | V2 | V3 | Payload | Variable? |
-|------|:-----:|:--:|:--:|:--:|---------|:---------:|
-| `INPUT_TYPE_TOUCH` | 1 | ✅ | ✅ | ✅ | `touch { action, x, y, pointer_id }` | No |
-| `INPUT_TYPE_KEY` | 2 | ✅ | ✅ | ✅ | `key { action, keycode }` | No |
-| `INPUT_TYPE_POINTER_MOTION` | 3 | ✅ | ✅ | ✅ | `pointer_motion { x, y, dx, dy }` | No |
-| `INPUT_TYPE_POINTER_BUTTON` | 4 | ✅ | ✅ | ✅ | `pointer_button { button, pressed }` | No |
-| `INPUT_TYPE_POINTER_AXIS` | 5 | ✅ | ✅ | ✅ | `pointer_axis { axis, value, discrete }` | No |
-| `INPUT_TYPE_TOUCH_FRAME` | 6 | — | ✅ | ✅ | — (frame boundary) | No |
-| `INPUT_TYPE_DISPLAY_REFRESH` | 7 | — | ✅ | ✅ | `display { refresh_mhz }` | No |
-| `INPUT_TYPE_CLIPBOARD` | 8 | — | — | **✅ V3 new** | `clipboard { size }` + variable‑length data | **Yes** |
+### 9.2 Control messages
 
-#### OutputEvent types
+`C` = consumer, `P` = producer, `D` = daemon.
 
-| Type | Value | V2 | V3 | Payload | Variable? |
-|------|:-----:|:--:|:--:|---------|:---------:|
-| `OUTPUT_TYPE_CLIPBOARD` | 1 | — | **✅ V3 new** | `clipboard { size }` + variable‑length data | **Yes** |
+| Constant | Value | Direction | Body / descriptors | Current purpose |
+|---|---:|---|---|---|
+| `CTRL_MSG_CONSUMER_HELLO` | 1 | C -> D | zero payload, five deposited FDs | Register/redeposit consumer resources |
+| `CTRL_MSG_PRODUCER_HELLO` | 2 | P -> D | zero payload | Register producer |
+| `CTRL_MSG_SCREEN_INFO` | 7 | C -> D -> P | `screen_info` | Store geometry/format/refresh; deliver to a waiting producer |
+| `CTRL_MSG_REJECT` | 8 | defined | — | Defined constant; not the current daemon's geometry-change policy |
+| `CTRL_MSG_PICKUP_FDS` | 9 | P -> D | zero payload | Request the deposited session resources |
+| `CTRL_MSG_FDS_READY` | 10 | D -> P, D -> C | five FDs to P; notification to C | Finish resource handoff |
 
-> [!IMPORTANT]
-> Per‑frame buffer hand‑off does **not** use data messages. The selected index travels
-> through the `shm` page, `buf_ready_efd` (select) and the **fence channel**
-> (render‑done + optional fence). — see §7.
+The daemon currently keeps at most one consumer and one producer. A new client claiming a role replaces the previous client; startup/session locks should prevent unintentional takeover. On consumer loss it clears stale deposits. Unlike the archived v3 description, `libdisplay_daemon/display_daemon.c` **accepts updated screen information**, stores it and forwards it to a waiting producer; it does not reject a different geometry using a permanent first-mode lock. This is not a guarantee of live native mode changes without session/import updates.
 
----
+### 9.3 Deposited descriptor layout
 
-## 6. Variable‑length event protocol (V3 key change)
+`libdisplay_consumer/display_consumer.c::send_hello_fds()` deposits five descriptors, and the current producer pickup requires **exactly five**:
 
-V3 introduces **variable‑length events** on the data channel. Previously all
-`InputEvent` and `OutputEvent` messages had a fixed size. In V3, clipboard events
-carry a **header** packet (the fixed‑size event struct with `clipboard.size` set)
-immediately followed by `clipboard.size` bytes of raw payload.
+| Slot | Resource | Direction / semantics |
+|---:|---|---|
+| 0 | `buf_ready_efd` | C -> P pacing/target selection eventfd |
+| 1 | producer end of fence socketpair | P -> C frame-done message plus optional acquire fence FD |
+| 2 | producer end of data socketpair | Bidirectional event/resource transport; initial buffer-set transfer |
+| 3 | `shm_fd` | Shared `uint32_t` selected-buffer index; P maps it read-only |
+| 4 | producer end of audio socketpair | Full-duplex playback and microphone stream |
 
-### 6.1 Wire format
+The consumer retains its own socketpair ends and closes the deposited local copies after sending. `SCM_RIGHTS` produces descriptors in the receiving process; it does not transmit numeric FD identity. The daemon closes its copies after delivery. Device accessors expose borrowed session descriptors; native renderer imports use separately owned duplicates. A legacy four-FD consumer is **not** accepted by the current producer just because the first four slots match.
 
+### 9.4 Data message types
+
+| Constant | Value | Direction | Payload |
+|---|---:|---|---|
+| `DATA_MSG_BUF_READY` | 100 | reserved in the current frame path | Selection uses eventfd + shared page instead |
+| `DATA_MSG_REFRESH_DONE` | 101 | reserved in the current frame path | Completion handoff uses the fence socketpair instead |
+| `DATA_MSG_INPUT_EVENT` | 102 | C -> P | Packed `InputEvent`, possibly followed by raw bytes |
+| `DATA_MSG_OUTPUT_EVENT` | 103 | P -> C | Packed `OutputEvent`, possibly followed by raw bytes |
+| `DATA_MSG_INPUT_EXTEND_FDS` | 104 | C -> P | Follow-up resource descriptor message using `SCM_RIGHTS` |
+| `DATA_MSG_BUFS_READY` | 200 | C -> P | `N * buf_info` plus `N` dma-buf FDs |
+
+The packed input/output event records currently each occupy 20 bytes: a 4-byte type and a 16-byte union. The unions include float coordinates and native `pid_t` in the declared output layout; treat them as the current local ABI, not an architecture-independent serialization promise.
+
+### 9.5 Input events
+
+| Type constant suffix (`INPUT_TYPE_`) | Value | Fields / following data |
+|---|---:|---|
+| `TOUCH` | 1 | `action, x, y, pointer_id` |
+| `KEY` | 2 | `action, keycode` |
+| `POINTER_MOTION` | 3 | `x, y, dx, dy` |
+| `POINTER_BUTTON` | 4 | `button, pressed` |
+| `POINTER_AXIS` | 5 | `axis, value, discrete` |
+| `TOUCH_FRAME` | 6 | Touch batch boundary |
+| `DISPLAY_REFRESH` | 7 | `refresh_mhz` |
+| `CLIPBOARD` | 8 | `clipboard.size`, then that many bytes |
+| `TEXT_INPUT` | 9 | `text_input.size`, then that many UTF-8 bytes |
+| `ACTION` | 10 | `input_action.action, value` |
+| `RESOURCE` | 11 | `resource.type, fdnum`, then an extended-FD message |
+| `RESOURCE_INVALID` | 12 | Same resource fields; report invalid/unusable service resources |
+
+Touch/key action constants are `DOWN=0`, `UP=1`, `MOVE=2`; conversion to native keycodes and coordinate spaces belongs in the WM adapter. Resource handling must follow the declared descriptor count, not blindly assume no FDs on an error notification. Unsupported events with a known extension still need that extension consumed and owned FDs closed.
+
+### 9.6 Output events
+
+| Type constant (`OUTPUT_TYPE_`) | Value | Fields / effect |
+|---|---:|---|
+| `CLIPBOARD` | 1 | `clipboard.size`, then raw bytes |
+| `RESOURCES_REQUEST` | 2 | service `type` and up to three `uint32_t args` |
+| `SET_CONSUMER_VAR` | 3 | `var, value`; transient runtime request |
+| `SCHEDULING` | 4 | producer-namespace `pid` and flags |
+
+`SERVICE_TYPE_CAMERA=1`. `CONSUMER_VAR_CAPTURE_MOUSE=1` requests pointer capture; value zero releases the request. Scheduling flags are `SETTREE=0x01` and `ON=0x02`: report the previous focused subtree off before the new one on, with the consumer/root helper resolving the producer PID namespace. These controls do not grant a WM permission to manipulate Android processes directly. Consumer fallback resets transient variables; resend current state after reconnect.
+
+<a id="section-10"></a>
+
+## 10. Variable payloads, queues and service resources
+
+### 10.1 Clipboard/text framing
+
+```text
+fixed event:
+  [ data header: type, size=20 ][ event: type + union ]
+
+clipboard/text event:
+  [ data header: type, size=20 ][ event: type + *.size=L ][ L raw bytes ]
+
+service response:
+  [ DATA_MSG_INPUT_EVENT ][ resource: type, fdnum ]
+  [ DATA_MSG_INPUT_EXTEND_FDS + ancillary SCM_RIGHTS descriptors ]
 ```
-Standard event (fixed size):
-┌──────────────────┬────────────────────┐
-│ data_msg header  │ InputEvent/OutputEvent │
-│ type + size(=20) │ type + union        │
-└──────────────────┴────────────────────┘
 
-Variable‑length event (V3 clipboard):
-┌──────────────────┬────────────────────┬─────────────────────┐
-│ data_msg header  │ InputEvent/OutputEvent │ payload bytes      │
-│ type + size(=20) │ type + clipboard.size  │ (clipboard.size)   │
-└──────────────────┴────────────────────┴─────────────────────┘
-                        ▲ header ▲          ▲ trailing data ▲
-```
+For event messages, `data_msg.size` describes the **event struct only**, not the trailing clipboard/text length. For `BUFS_READY` it describes the metadata array. Do not generalize either rule to all messages. `clipboard.size`/`text_input.size` must match the actual trailing bytes; never send a variable event through the fixed-only sender.
 
-> [!CAUTION]
-> **The `data_msg.size` field always equals `sizeof(InputEvent)` or
-> `sizeof(OutputEvent)` (20 bytes)** — it does NOT include the trailing payload.
-> The trailing payload size is carried inside `clipboard.size`. Receivers must
-> **additionally** read `clipboard.size` bytes after consuming the event struct.
+A Unix stream may split a header, payload or ancillary data across reads. One `recv()` is not one message. The current producer input parser retains partial data/FDs, supports nonblocking `timeout_ms=0`, and expires incomplete input frames after 5 seconds. Its caller must serialize the context, retry the **same pending operation and size**, and not poll the next event header while its extension remains incomplete. This is the producer implementation's contract; do not assume the consumer or every helper has identical timeout behavior.
 
-### 6.2 Sending rules
+### 10.2 Bounded clipboard export
 
-- **Clipboard events MUST use `push_*_with_length()`** — the `_with_length` variant
-  appends the payload bytes in the same `send_all()` call.
-- **Non‑clipboard events use `push_*()`** — fixed‑size, no trailing data.
+The device facade accepts payloads up to **1 MiB** (`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`); the asynchronous output queue is bounded to **2 MiB** in total. These are implementation limits, not negotiated wire features.
 
 ```c
-// ✅ Correct: clipboard with variable‑length payload
-struct InputEvent ev = { .type = INPUT_TYPE_CLIPBOARD, .clipboard.size = len };
-push_input_event_with_length(ctx, &ev, text, len);
-
-// ❌ WRONG: sending clipboard without trailing data
-push_input_event(ctx, &ev);  // consumer receives event but NO payload → stream corruption
+/* Illustrative event-loop pattern; not a standalone compositor. */
+int rc = anland_device_queue_clipboard(dev, text, size);
+if (rc < 0) {
+    /* ENOBUFS: leave session intact; retry the latest selection later.
+       Other errors: follow the adapter's session/error policy. */
+}
+/* On writable readiness, and after a budget-limited flush: */
+rc = anland_device_flush_output(dev); /* 0 drained, 1 pending, -1 lost */
+/* Keep POLLOUT installed iff pending_output(dev) remains nonzero.
+   Never write independently to anland_device_data_fd(dev). */
 ```
 
-### 6.3 Receiving rules
+All producer writes share queue order, including synchronous APIs. `ENOBUFS` enqueue failure does not change the queue or detach the session. The synchronous `push_output_event*()` path instead has a 10 ms complete-write deadline; backpressure/partial failure detaches the session to preserve framing. That is bounded synchronous I/O, not the asynchronous queue. Selection epochs and strong owners must prevent a delayed offer from overwriting a newer clipboard.
 
-When `poll_input_event()` or `poll_output_event()` returns an event with
-`type == INPUT_TYPE_CLIPBOARD` or `type == OUTPUT_TYPE_CLIPBOARD`, the receiver
-**MUST** drain the trailing payload by calling `poll_input_event_extend_data()` or
-`poll_output_event_extend_data()`, even if it intends to discard the data.
+### 10.3 Camera resource lifecycle
 
-**Producer side:**
-
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_CLIPBOARD:
-        // Option A: use the data
-        poll_input_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setSystemClipboard(buf, ev.clipboard.size);
-        break;
-    case INPUT_TYPE_DISPLAY_REFRESH:
-        output->setRefreshRate(ev.display.refresh_mhz);
-        break;
-    // ... other fixed‑size events ...
-    default:
-        handle_unhandled_event(ctx, &ev);  // MUST drain unknown variable‑length events
-        break;
-    }
-}
+```text
+WM -> request_resources(CAMERA, args)
+consumer -> allocate service -> RESOURCE(type, fdnum)
+consumer -> INPUT_EXTEND_FDS(ctrl_fd, stream_fd[...])
+WM -> validate counts/layout -> anland_camera_set_resources(...)
+Linux app opens virtual camera -> recording starts
+app stops / session lost -> stop recording and release resources
 ```
 
-**Consumer side:**
+The consumer library registers `service_info` allocation/free callbacks through `allocate_services()` and handles `OUTPUT_TYPE_RESOURCES_REQUEST` through `handle_resource_request()`. `service_info.userdata` identifies the owning connection rather than requiring global state.
 
-```c
-struct OutputEvent ev;
-if (poll_output_event(ctx, &ev, 100) > 0) {
-    switch (ev.type) {
-    case OUTPUT_TYPE_CLIPBOARD:
-        poll_output_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setAndroidClipboard(buf, ev.clipboard.size);
-        break;
-    default:
-        handle_unhandled_event(ctx, &ev);  // MUST drain unknown variable‑length events
-        break;
-    }
-}
-```
+`anland_camera_start()` starts the engine; `set_resources()` **takes ownership** of the control and stream FDs. The control socket is first, followed by one stream socket per camera. Nodes are dynamic: `clear()` stops capture, removes nodes and closes adopted FDs; `stop()` also shuts down the engine. The current camera header describes I420 frames and demand-driven recording. This differs from persistent audio nodes and is only usable where the WM actually wires the bridge.
 
-### 6.4 `handle_unhandled_event()`
+<a id="section-11"></a>
 
-Both libraries provide `handle_unhandled_event()` which drains the trailing payload
-of known variable‑length event types that the caller did not process. **This function
-is mandatory** — failing to call it (or `*_extend_data()`) for unprocessed clipboard
-events leaves bytes in the socket buffer and corrupts the stream.
+## 11. Handshake and recovery state machines
 
-```c
-// Producer: drain unhandled consumer events
-void handle_unhandled_event(display_ctx *ctx, const struct InputEvent *event) {
-    switch (event->type) {
-    case INPUT_TYPE_CLIPBOARD:
-        if (event->clipboard.size > 0) {
-            void *payload = malloc(event->clipboard.size);
-            if (payload) {
-                poll_input_event_extend_data(ctx, payload, event->clipboard.size, 1000);
-                free(payload);
-            }
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-// Consumer: drain unhandled producer events
-void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event) {
-    switch (event->type) {
-    case OUTPUT_TYPE_CLIPBOARD:
-        if (event->clipboard.size > 0) {
-            void *payload = malloc(event->clipboard.size);
-            if (payload) {
-                poll_output_event_extend_data(ctx, payload, event->clipboard.size, 1000);
-                free(payload);
-            }
-        }
-        break;
-    default:
-        break;
-    }
-}
-```
-
----
-
-## 7. Steady‑state frame loop
-
-Once both sides have left fallback, every frame is exchanged **without touching the
-daemon** — over the shared `shm` page, `buf_ready_efd` and the **dedicated fence
-channel** (`socketpair`). V3 adds clipboard exchanges on the data channel, but these
-are **asynchronous and do not affect the frame cadence**.
+### 11.1 Staged producer connection
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant C as Consumer
-    participant SHM as shm index
-    participant P as Producer
-
-    Note over C,P: one‑time, right after handshake
-    C->>P: BUFS_READY + dmabuf fds (data channel)
-    P-->>P: import dmabufs
-
-    loop per frame
-        C->>SHM: write selected index (select_dmabuf)
-        C-->>P: eventfd_write(buf_ready_efd)
-        P->>SHM: read index (get_selected_idx)
-        P-->>P: render into dmabuf[idx]
-        P-->>C: sendmsg(fence_fd, 1 byte ± fence fd via SCM_RIGHTS) (trigger_refresh)
-        C-->>C: recvmsg(fence_fd) → get fence fd (refresh_done)
-        C->>C: queueBuffer(fence_fd) → SurfaceFlinger waits GPU-side
-    end
-
-    Note over C,P: input flows the other way
-    C->>P: INPUT_EVENT (data channel, poll_input_event)
-
-    Note over C,P: (V3) clipboard flows bidirectionally
-    C-->>P: INPUT_EVENT(INPUT_TYPE_CLIPBOARD) + payload
-    P-->>C: OUTPUT_EVENT(OUTPUT_TYPE_CLIPBOARD) + payload
-
-    Note over C,P: (V2) consumer reports display refresh rate
-    C-->>P: INPUT_EVENT(INPUT_TYPE_DISPLAY_REFRESH, mHz)
-    P-->>P: update RenderLoop pacing
-```
-
-- `select_dmabuf(idx)` → writes `idx` to shm, signals `buf_ready_efd`.
-- producer wakes on `buf_ready_efd`, reads idx from shm, renders, may call
-  `set_render_fence(fence_fd)` to stash a render-done fence, then calls
-  `trigger_refresh()`.
-- `trigger_refresh()` sends 1 byte (+ optionally fence fd via `SCM_RIGHTS`)
-  on the fence socketpair.
-- `refresh_done()` waits on fence channel with a **5 s** timeout, reads the message,
-  returns the fence fd (or `-1` if none).
-
-### 7.1 Clipboard exchange (V3)
-
-Clipboard data is exchanged **bidirectionally** over the data channel using a
-two‑packet protocol: a **header** packet (`InputEvent` / `OutputEvent` with
-`clipboard.size`) followed by the **payload** bytes.
-
-**Consumer → Producer** (via `push_input_event_with_length`):
-
-| Step | What happens |
-|------|-------------|
-| 1 | Consumer calls `push_input_event_with_length(ctx, &clipboard_event, data, len)` |
-| 2 | Library sends `DATA_MSG_INPUT_EVENT` with `type=INPUT_TYPE_CLIPBOARD`, `size=len` |
-| 3 | Immediately sends `len` bytes of raw clipboard payload (same `send_all()` call) |
-| 4 | Producer receives via `poll_input_event()` → sees `INPUT_TYPE_CLIPBOARD` → `poll_input_event_extend_data()` |
-
-**Producer → Consumer** (via `push_output_event_with_length`):
-
-| Step | What happens |
-|------|-------------|
-| 1 | Producer calls `push_output_event_with_length(ctx, &clipboard_event, data, len)` |
-| 2 | Library sends `DATA_MSG_OUTPUT_EVENT` with `type=OUTPUT_TYPE_CLIPBOARD`, `size=len` |
-| 3 | Immediately sends `len` bytes of raw clipboard payload (same `send_all()` call) |
-| 4 | Consumer's event thread receives via `poll_output_event()` → sees `OUTPUT_TYPE_CLIPBOARD` → `poll_output_event_extend_data()` |
-
-> [!NOTE]
-> **Echo guard**: to prevent clipboard echo loops, the consumer tracks the
-> last sent clipboard text and does not re‑send text it received from the producer.
-
----
-
-## 8. Handshake flow
-
-The daemon **decouples ordering**: consumer and producer may connect in either order.
-Whoever arrives first is parked until the other appears. **The handshake wire protocol
-is unchanged from V2.**
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Consumer
+    participant C as Android consumer
     participant D as Daemon
-    participant P as Producer
-
-    Note over C,D: Consumer registers & deposits resources
-    C->>D: CONSUMER_HELLO  + [buf_ready, fence, data_end, shm]
-    D-->>D: store deposited fds
-    C->>D: SCREEN_INFO (w,h,format,refresh)
-    D-->>D: store screen_info
-
-    Note over P,D: Producer registers (any time)
+    participant P as Public producer
+    participant W as WM adapter
+    C->>D: CONSUMER_HELLO + 5 FDs
+    C->>D: SCREEN_INFO
     P->>D: PRODUCER_HELLO
-    alt screen_info already known
-        D->>P: SCREEN_INFO
-    else not yet
-        D-->>D: producer_waiting_screen = true
-        Note over D,P: forwarded as soon as the consumer sends it
-    end
-
-    Note over C,P: Reconnect loop discovers the peer (see §10)
-    loop every RECONNECT_INTERVAL_MS (200ms)
-        P->>D: PICKUP_FDS
-        alt deposited fds present (≥4)
-            D->>P: FDS_READY + [buf_ready, fence, data_end, shm]
-            D->>C: FDS_READY (notify)
-            C->>P: BUFS_READY + dmabuf fds (over data channel)
-            Note over C,P: both leave fallback
-        else none yet
-            D--xP: timeout → retry next tick
-        end
-    end
+    D-->>P: SCREEN_INFO (when available)
+    W->>P: reconnect/pump driven by readiness or bounded retry
+    P->>D: PICKUP_FDS
+    D-->>P: FDS_READY + 5 FDs
+    D-->>C: FDS_READY notification
+    C->>P: BUFS_READY + metadata + dma-buf FDs
+    C->>P: select index and signal buffer-ready
+    P-->>W: OUTPUT_CHANGED / RENDER_TARGET_READY
+    W->>W: validate and import current generation
 ```
 
-### Screen‑info lock
+Registration order is not fixed; the diagram shows one ordering only. Strict `connect_to_deamon()` waits for screen information without a consumer-arrival deadline. `connect_to_deamon_deferred()`/`defer_connector=true` allow absent-connector startup without inventing a fake mode. Native callbacks should use the deferred/event-driven path when waiting would stall the WM.
 
-The daemon stores the **first** `screen_info` it sees. A later consumer presenting a
-*different* geometry is sent `CTRL_MSG_REJECT` and dropped — the session is locked to a
-single display mode (`daemon.c`, `handle_client_data`).
+`try_exit_fallback()` is now a **nonblocking staged handshake**, not the old repeated blocking 100 ms pickup/read sequence. Partial screen, pickup and buffer records survive retries. The public header specifies a **3-second total deadline for pickup through metadata**, not a separate deadline per read and not a blanket three-second deadline for consumer arrival. `EAGAIN` means pending; EOF/protocol/deadline failure releases partial resources. An ambiguous control reply also closes the daemon connection. Successful pool pickup still does not prove a writable selected target.
 
----
-
-## 9. State machine
-
-Both peers boot **in `fallback`** and *discover each other only by repeatedly attempting
-the handshake through the daemon*. There is no direct peer connection and no "peer is
-online" notification — discovery **is** a successful reconnect attempt. **The state
-machine is unchanged from V2.**
-
-### 9.1 Producer state machine
-
-`connect_to_deamon()` performs **only** the daemon handshake (it fetches `screen_info`)
-and deliberately leaves the context in fallback. The backend then runs a timer
-(`RECONNECT_INTERVAL_MS = 200 ms`) that polls `try_exit_fallback()`.
+### 11.2 Producer lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Disconnected
-
-    Disconnected --> Fallback: connect_to_deamon() OK<br/>got screen_info
-    Disconnected --> [*]: connect failed
-
-    Fallback --> Fallback: try_exit_fallback() == -1<br/>no consumer yet<br/>wait 200ms then retry
-    Fallback --> Connected: try_exit_fallback() == 0<br/>fds + dmabufs in hand
-
-    Connected --> Connected: render frames
-    Connected --> Fallback: consumer lost<br/>POLLHUP / send fail → enter_fallback()
-
-    note right of Fallback
-        timer polls every 200ms
-    end note
+    [*] --> ControlConnecting
+    ControlConnecting --> WaitingConsumer: HELLO accepted
+    ControlConnecting --> RetryControl: daemon unavailable
+    RetryControl --> ControlConnecting: bounded reopen retry
+    WaitingConsumer --> WaitingConsumer: screen/pickup/pool pending
+    WaitingConsumer --> Importing: complete live buffer pool
+    Importing --> Active: valid imports and writable target
+    Importing --> WaitingConsumer: drop invalid session
+    Active --> Active: render, commit, feedback, release
+    Active --> WaitingConsumer: consumer loss / session drop
+    Active --> RetryControl: daemon control lost
+    WaitingConsumer --> RetryControl: daemon control lost
+    Active --> Stopped: explicit teardown
+    Stopped --> [*]
 ```
 
-`try_exit_fallback()` is **two‑step and atomic** — fallback clears only when *both*
-succeed (`display_producer.c`):
+`anland_device_connect_result()` distinguishes `READY`, `NO_CONSUMER`, and `DAEMON_LOST`; polling consumer pickup forever cannot recover a dead daemon connection. `reopen()` preserves public device/scene ownership while replacing the control connection; `reconnect()` picks up a consumer on the existing control connection. Layer identity survives scene invalidation; target/import generation does not.
 
-1. **`pickup_fds()`** — send `PICKUP_FDS`, poll `ctrl_fd` (100 ms) for `FDS_READY`,
-   receive **4** fds, `mmap` the shm.
-2. **`receive_dmabufs()`** — poll `data_fd` (100 ms) for `BUFS_READY`, store the dmabuf
-   set.
-
-Any failure → `release_consumer_resources()` and stay in fallback, safe to retry next
-tick.
-
-### 9.2 Consumer state machine
-
-The consumer creates its resources and deposits them at `connect_to_deamon()`, starting
-in fallback. It leaves fallback **lazily**: each `select_dmabuf()` first calls
-`try_exit_fallback()`.
+### 11.3 Consumer lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fallback: connect_to_deamon()<br/>create resources + deposit fds
-
-    Fallback --> Fallback: no FDS_READY yet<br/>(select_dmabuf is a no‑op)
-    Fallback --> Connected: FDS_READY seen<br/>→ push_dmabufs()
-
-    Connected --> Connected: select / refresh frames
-    Connected --> Fallback: send fail<br/>refresh timeout 5s<br/>→ enter_fallback()
-
-    note right of Fallback
-        enter_fallback() rebuilds eventfd/socketpair/shm
-        and re‑sends CONSUMER_HELLO (re‑deposits)
-    end note
+    [*] --> Fallback: connect and deposit resources
+    Fallback --> Fallback: no FDS_READY yet
+    Fallback --> Connected: select_dmabuf sees pickup / sends buffer set
+    Connected --> Connected: select target / await frame message
+    Connected --> Fallback: channel failure / frame wait timeout
+    Fallback --> [*]: explicit disconnect
 ```
 
-> [!NOTE]
-> **V3 addition**: the consumer exposes a `set_exit_fallback_callback()` to let the
-> host app react when the producer reconnects (e.g. start the event thread, sync
-> clipboard). This is **optional** and does not change the state machine.
+The consumer lazily tries to leave fallback from `select_dmabuf()`. While connected, `push_dmabufs()` changes the stored pool and triggers fallback/redeposit rather than silently replacing a live producer's imports. Fallback rebuilds eventfd, index page and socketpairs and frees service resources; callbacks let the application stop/restart its associated workers.
 
----
+`refresh_done()` waits up to **5 seconds** for a fence-channel frame message. A received fence FD is owned by its caller and may be handed to Android's queue operation under that API's ownership rules. `-1` can mean a valid handoff with no fence, no pending frame, or an error/fallback; it is **not** a universal Boolean success flag. A daemon restart additionally requires the application's control reconnection; recreating only the consumer's local socketpairs does not revive a dead control FD.
 
-## 10. Disconnection & recovery
+<a id="section-12"></a>
 
-| Event | Detected by | Reaction |
-|-------|-------------|----------|
-| Producer drops consumer | `POLLHUP`/`POLLERR` on `data_fd`, or send failure | `enter_fallback()`: release consumer resources, fire callback, resume 200 ms reconnect timer. |
-| Consumer loses producer | send failure or 5 s `refresh_done` timeout | `enter_fallback()`: tear down + rebuild eventfd/socketpair/shm, re‑send `CONSUMER_HELLO` (re‑deposit). |
-| Consumer reconnects mid‑session | daemon `CONSUMER_HELLO` with ≥3 fds | replaces deposited fds; if a producer is waiting, delivers immediately. |
-| Either peer reconnects | new `*_HELLO` | the daemon frees the previous client of that role and installs the new one. |
+## 12. Per-frame transport versus scene feedback
 
----
-
-## 11. Design notes
-
-- **Single reconnect path** — both startup and recovery funnel through
-  `try_exit_fallback()`; there is no separate "first connect" logic.
-- **Atomic exit** — the producer leaves fallback only with *both* the fds and the
-  dmabufs in hand, so the backend can import and render immediately.
-- **Daemon is off the hot path** — it only brokers the handshake; every
-  frame afterwards is shm + eventfd + fence channel, zero daemon round‑trips.
-- **Non‑blocking handshake** — handshake polls use a short `100 ms` timeout so
-  the producer's reconnect loop stays responsive when no consumer is present.
-- **Display‑mode lock** — the first `screen_info` wins; mismatching consumers are
-  rejected.
-- **GPU‑side fence** — the producer sends a real dma-buf sync-file fence via
-  `SCM_RIGHTS`; the consumer hands it to SurfaceFlinger, eliminating CPU‑side
-  `glFinish()` stalls.
-- **Bidirectional clipboard (V3)** — clipboard data flows both ways over the
-  data channel using a header + payload two‑packet protocol. An echo guard prevents
-  loops. Variable‑length events require all receivers to drain trailing payloads.
-- **Must‑drain protocol** — any event type with a variable‑length payload
-  (currently clipboard) **must** be drained via `handle_unhandled_event()` or
-  `*_extend_data()`, even if the caller does not care about the data. Failure to do
-  so corrupts the data channel stream.
-
----
-
-## 12. API Changes from V2
-
-### 12.1 Producer library (`libdisplay_producer`) — **API and ABI incompatible**
-
-| Function | V2 | V3 | Compatibility |
-|----------|----|----|---------------|
-| `connect_to_deamon()` | Same signature | Same signature | ✅ Unchanged |
-| `disconnect()` | Same signature | Same signature | ✅ Unchanged |
-| `get_screen_info()` | Same signature | Same signature | ✅ Unchanged |
-| `trigger_refresh()` | Same signature | Same signature | ✅ Unchanged |
-| `set_render_fence()` | Same signature | Same signature | ✅ Unchanged |
-| `push_output_event()` | Same signature | Same signature | ⚠️ **Not for clipboard** (use `push_output_event_with_length()`) |
-| `is_fallback()` / `try_exit_fallback()` / `set_fallback_callback()` | Same signature | Same signature | ✅ Unchanged |
-| `poll_input_event()` | Same signature | Same signature | ⚠️ **Behavior change**: may return `INPUT_TYPE_CLIPBOARD`, caller must drain |
-| `get_data_fd()` / `get_buffer_ready_fd()` / `get_buf_count()` / `get_selected_idx()` / `get_dmabuf_fd()` / `get_dmabuf_fd_at()` / `get_dmabuf_info()` / `get_dmabuf_info_at()` | Same signature | Same signature | ✅ Unchanged |
-| `poll_input_event_extend_data()` | — | **V3 new**: drain variable-length input payload | ❌ **Required**: must call when handling `INPUT_TYPE_CLIPBOARD` |
-| `push_output_event_with_length()` | — | **V3 new**: send variable-length output event (clipboard) | ✅ New API |
-| `handle_unhandled_event()` | — | **V3 new**: drain unhandled variable-length events | ❌ **Required**: must call to keep stream clean |
-
-> **Producer incompatibility**: V2 producer's `poll_input_event()` signature is unchanged, but its **behavior changed**. A V3 consumer may send `INPUT_TYPE_CLIPBOARD` variable-length events. A V2 producer that does not drain the trailing payload will corrupt the data channel stream.
-
-### 12.2 Consumer library (`libdisplay_consumer`) — **API and ABI incompatible**
-
-| Function | V2 | V3 | Compatibility |
-|----------|----|----|---------------|
-| `connect_to_deamon()` | Same signature | Same signature | ✅ Unchanged |
-| `refresh_done()` | Returns fence fd (>=0 or -1) | Same signature | ✅ Unchanged |
-| `push_dmabufs()` | Same signature | Same signature | ✅ Unchanged |
-| `select_dmabuf()` | Same signature | Same signature | ✅ Unchanged |
-| `set_screen_info()` | Same signature | Same signature | ✅ Unchanged |
-| `set_fallback_callback()` | Same signature | Same signature | ✅ Unchanged |
-| `disconnect()` | Same signature | Same signature | ✅ Unchanged |
-| `push_input_event()` | Same signature | Same signature | ⚠️ **Not for clipboard** (use `push_input_event_with_length()`) |
-| `poll_output_event()` | — | **V3 new**: poll producer→consumer output events | ✅ New API |
-| `push_input_event_with_length()` | — | **V3 new**: send variable-length input event (clipboard) | ✅ New API |
-| `poll_output_event_extend_data()` | — | **V3 new**: drain variable-length output payload | ✅ New API |
-| `set_exit_fallback_callback()` | — | **V3 new**: callback on producer reconnect | ✅ New API |
-| `get_data_fd()` | — | **V3 new**: get data channel fd | ✅ New API |
-| `handle_unhandled_event()` | — | **V3 new**: drain unhandled variable-length events | ❌ **Required**: must call to keep stream clean |
-
-> **Consumer incompatibility**: A V3 producer may send `DATA_MSG_OUTPUT_EVENT`(103) with clipboard payload. A V2 consumer has no `poll_output_event()` and cannot read these messages, corrupting the data channel stream.
-
-### 12.3 Wire protocol — **incompatible**
-
-| Aspect | V2 | V3 | Compatibility |
-|--------|----|----|---------------|
-| `DATA_MSG_OUTPUT_EVENT` (103) | Does not exist | New | ❌ V2 consumer cannot recognize |
-| `INPUT_TYPE_CLIPBOARD` (8) | Does not exist | New | ❌ V2 producer does not drain payload |
-| `OUTPUT_TYPE_CLIPBOARD` | Does not exist | New | ❌ Same |
-| Variable‑length payload | Does not exist | `clipboard.size` + trailing bytes | ❌ Fixed-size receivers cannot handle |
-| `struct InputEvent` | 7 types (union size = 20B) | 8 types (union size unchanged) | ✅ Struct size unchanged |
-| `struct OutputEvent` | Does not exist | New (20B) | ❌ V2 has no such struct |
-| `struct buf_info` | `{ stride, width, height, format, modifier, offset }` | Same | ✅ Unchanged |
-| Control messages | All unchanged | All unchanged | ✅ |
-
-### 12.4 Daemon — **no update needed**
-
-| Aspect | Note |
-|--------|------|
-| fd relay | Daemon stores/forwards fds via `SCM_RIGHTS`, **unaware** of individual fd semantics |
-| slot count | Both V2 and V3 consumer deposit **4** fds |
-| ctrl_msg types | All message types unchanged |
-| **Conclusion** | **Zero daemon changes, binary compatible** |
-
----
-
-## 13. Compatibility Summary
-
-| Component | Compatibility | Needs changes |
-|-----------|---------------|---------------|
-| **Producer library** | **Incompatible** | **Must update**: handle `INPUT_TYPE_CLIPBOARD` or call `handle_unhandled_event()` |
-| **Consumer library** | **Incompatible** | **Must update**: add `poll_output_event()` or call `handle_unhandled_event()` |
-| **Daemon** | **Fully compatible** | Zero changes |
-| **Wire protocol** | **Incompatible** | V3 introduces variable-length events and new message type (103) |
-
-### Cross-version interop
-
-| Scenario | Result |
-|----------|--------|
-| V3 producer + V3 consumer | ✅ **Works** — bidirectional clipboard, display refresh, runtime resolution changes |
-| V2 producer + V3 consumer | ❌ **Stream corruption** — V2 `poll_input_event()` does not drain trailing payload |
-| V3 producer + V2 consumer | ❌ **Stream corruption** — V2 consumer cannot read `DATA_MSG_OUTPUT_EVENT`(103) |
-| V2 producer + V2 consumer | ✅ **Works** — same as V2 behavior |
-| V1 producer + V3 `libdisplay_producer.so` | ❌ **Stream corruption** — V1 code does not drain clipboard payload |
-| V1 producer + V3 consumer (no clipboard) | ⚠️ **Conditional** — works if consumer never sends clipboard, but not guaranteed |
-| V1 consumer + V3 `libdisplay_consumer.so` | ❌ **Incompatible** — `refresh_done()` returns fence fd (V2 change) |
-| V3 daemon + V2/V3 producer/consumer | ✅ **Works** — daemon is unaware of fd semantics |
-
-> [!CAUTION]
-> **V2/V1 producer mixed with V3 consumer corrupts stream**: even if V2/V1 producer code links against V3 library, if its event loop does not call `handle_unhandled_event()`, the clipboard payload bytes are left in the socket buffer, corrupting the data channel stream. **Application code must be updated.**
->
-> **V2 consumer cannot mix with V3 producer**: V2 consumer lacks `poll_output_event()` and cannot read `DATA_MSG_OUTPUT_EVENT`(103). **Library and code must be upgraded.**
-
----
-
-## 14. Migration Guide
-
-### 14.1 Producer — **must update event handling code**
-
-V2 producer code **must be updated** to handle V3 variable-length events:
-
-**V2 code (incompatible):**
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_TOUCH:
-        handle_touch(&ev.touch);
-        break;
-    case INPUT_TYPE_KEY:
-        handle_key(&ev.key);
-        break;
-    // ... other fixed-size events ...
-    // ❌ missing INPUT_TYPE_CLIPBOARD handling → stream corruption
-    }
-}
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant P as Public scene/present
+    participant W as WM renderer
+    C->>P: shared index + buffer-ready signal
+    P-->>W: RENDER_TARGET_READY(generation, slot, count)
+    W->>W: obtain writable target and render that slot
+    W->>P: commit(states, acquire fence) -> commit_id
+    W->>P: present()
+    P-->>C: one frame-done byte + optional fence FD
+    C->>C: queue rendered buffer with fence
+    C->>P: next selection / buffer-ready
+    P-->>W: PRESENTED(commit_id): consumer acknowledgement
+    P-->>W: BUFFER_RELEASED when safe (separate lifetime decision)
+    P-->>W: RENDER_TARGET_READY for current work
 ```
 
-**V3 code (compatible):**
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_TOUCH:
-        handle_touch(&ev.touch);
-        break;
-    case INPUT_TYPE_KEY:
-        handle_key(&ev.key);
-        break;
-    case INPUT_TYPE_DISPLAY_REFRESH:
-        output->setRefreshRate(ev.display.refresh_mhz);
-        break;
-    case INPUT_TYPE_CLIPBOARD:
-        poll_input_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setSystemClipboard(buf, ev.clipboard.size);
-        break;
-    default:
-        handle_unhandled_event(ctx, &ev);  // must drain unknown variable-length events
-        break;
-    }
-}
-```
+The last events describe distinct facts, not a guaranteed universal event order. Release may be delayed by retention or synchronization; the next target cannot be overwritten merely because a previous commit was acknowledged. A static desktop must still service a valid consumer target request, even without new client damage.
 
-**Upgrade steps:**
-
-1. Copy new `display_producer.{c,h}`, `protocol.h`, `socket_utils.{c,h}` into source tree
-2. Add `INPUT_TYPE_CLIPBOARD` branch in `poll_input_event()` event loop
-3. Call `handle_unhandled_event()` on unhandled event types to drain variable-length payload
-4. Optionally use `push_output_event_with_length()` to send clipboard data to consumer
-
-### 14.2 Consumer — **must upgrade library and add event thread**
-
-V2 consumer code **must be upgraded** to handle output events from V3 producer:
-
-**Upgrade steps:**
-
-1. Replace old files with new `display_consumer.{c,h}` and `protocol.h`
-2. Start an event thread polling `poll_output_event()`
-3. Handle `OUTPUT_TYPE_CLIPBOARD` or call `handle_unhandled_event()` to drain
-4. Optionally use `push_input_event_with_length()` to send clipboard data to producer
-5. Optionally register `set_exit_fallback_callback()` to sync clipboard on reconnect
+### 12.1 Layer state construction
 
 ```c
-// V3 consumer event thread
-void *event_thread_func(void *arg) {
-    display_ctx *ctx = arg;
-    while (connected) {
-        struct OutputEvent ev;
-        if (poll_output_event(ctx, &ev, 100) > 0) {
-            switch (ev.type) {
-            case OUTPUT_TYPE_CLIPBOARD:
-                poll_output_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-                setAndroidClipboard(buf, ev.clipboard.size);
-                break;
-            default:
-                handle_unhandled_event(ctx, &ev);
-                break;
-            }
-        }
-    }
+/* Schematic: all rendering/import/error paths remain native WM work. */
+anland_de_target_t target;
+if (anland_de_backend_get_writable_target(backend, &target) != 0)
+    return; /* preserve repaint until readiness */
+
+/* Render into the import for (target.generation, target.index).
+   Produce acquire_fd, or explicitly wait until GPU work is complete. */
+anland_layer_state_t state = {
+    .layer_id = desktop_layer,
+    .buffer_id = (uint64_t)target.index + 1, /* current full-screen adapter convention */
+    .destination = {0, 0, target.width, target.height},
+    .opacity = 1.0f,
+    .visible = true,
+    .acquire_fence_fd = acquire_fd, /* -1 ONLY if already ready */
+};
+/* Revalidate target generation/index after rendering, before this call. */
+uint64_t commit_id;
+if (anland_de_backend_commit(backend, &state, 1, &commit_id) == 0) {
+    /* Record commit_id -> native frame FIRST, even if present later fails. */
+    int result = anland_de_backend_present(backend);
+    /* Handle result; always continue draining drop/release feedback. */
 }
+/* Scene commit borrows acquire_fd. Close caller's owned fd when appropriate. */
 ```
 
-### 14.3 Daemon — **no update needed**
+`source.width=0` selects the whole source. A visible buffered layer requires nonzero destination dimensions. Layer IDs are opaque/nonzero; `buffer_id=0` means no buffer. `slot+1` is the current full-screen mapping, not a future universal buffer ABI. `damage=NULL, damage_count=0` means the whole source rectangle. This snippet deliberately omits native rendering and FD cleanup implementation; it is not a copy-paste replacement for a backend.
 
-Reuse V2 daemon binary directly.
+### 12.2 Three different fence contracts
 
----
+| API boundary | Ownership |
+|---|---|
+| Scene/DE commit `acquire_fence_fd` | Borrowed during the call; public backend duplicates if retained |
+| `anland_device_set_render_fence()` / raw `set_render_fence()` | Takes ownership of the supplied FD |
+| `anland_scene_dispatch()` release event / consumer `refresh_done()` output | Receiver owns the returned FD |
 
-## 15. Source map
+Do not mix raw split-frame `set_render_fence()+trigger_refresh()` and device `pageflip()` for one frame. New WM frame paths should use the DE facade, not bypass its bookkeeping through these low-level helpers. Retire resources before removing their synchronization state; a release wait/import failure is a reason to quarantine/stop output, not to close the FD and assume completion.
 
-| Area | File | Changes |
-|------|------|---------|
-| Wire format & constants | [common/protocol.h](common/protocol.h) | `INPUT_TYPE_CLIPBOARD`(8), `OUTPUT_TYPE_CLIPBOARD`(1), `DATA_MSG_OUTPUT_EVENT`(103), `struct OutputEvent` |
-| Framing & fd passing | [common/socket_utils.c](common/socket_utils.c) | Unchanged |
-| Broker | [daemon/daemon.c](daemon/daemon.c) | **Unchanged** |
-| **Consumer library** | [libdisplay_consumer/display_consumer.c](libdisplay_consumer/display_consumer.c) | New: `push_input_event_with_length()`, `poll_output_event()`, `poll_output_event_extend_data()`, `set_exit_fallback_callback()`, `get_data_fd()`, `handle_unhandled_event()` |
-| **Producer library** | [libdisplay_producer/display_producer.c](libdisplay_producer/display_producer.c) | New: `poll_input_event_extend_data()`, `push_output_event()`, `push_output_event_with_length()`, `get_dmabuf_fd_at()`, `get_dmabuf_info_at()`, `handle_unhandled_event()` |
-| **V3 consumer app** | [consumers/anland_v3/](consumers/anland_v3/) | Bidirectional clipboard, event thread, echo guard |
-| **V3 KWin patches** | [producers/kde/ubuntu2604_v3/](producers/kde/ubuntu2604_v3/) | Minimal integration patch (~70 lines), backend sources via overlay |
+<a id="section-13"></a>
 
----
+## 13. API map and return contracts
 
-## History
+| API family | Main operations | Important return/lifetime rule |
+|---|---|---|
+| Desktop facade | `create/destroy`, `add_window_desc/update_window/remove_window`, `commit/present/pump/dispatch` | Owner for normal WM integration; accessors return borrowed objects |
+| Target/output | `get_target/get_writable_target/get_output`, `buffer_fd` | Target queries return 0 or -1; duplicated buffer FD is owned |
+| Presentation | `connected/target_available/renderable`, `reconnect/reopen/drop_session` | Connected is not synonymous with renderable |
+| Scene layers | `layer_create/update/destroy/count` | Stable IDs within scene lifetime; destroyed-layer commits are dropped |
+| Scene transaction | `commit_submit`, `commit_is_pending`, `invalidate/generation` | Accepted != presented != released; query is not a cross-thread reservation |
+| Scene feedback | `event_fd`, `dispatch`, `pending_events` | `dispatch` drains eventfd; caller must not drain it independently |
+| Device session | `open/open_deferred`, `connect_result`, `is_daemon_alive`, `reopen` | Distinguish no consumer from dead daemon |
+| Native image view | `fb_count`, `get_fb/get_drm_fb`, `current_fb_raw` | Format domains differ; caller closes duplicated FD |
+| Input | `poll_input/read_input/read_fds` | 1 complete, 0 pending/none, -1 lost; read extensions before next header |
+| Async output | `queue_clipboard`, `flush_output`, `pending_output` | Enqueue 0 accepted; flush 0 drained / 1 pending / -1 lost |
+| Media | audio `start/set_fd/stop`; camera `start/set_resources/clear/stop` | Audio duplicates a borrowed socket; camera adopts resource FDs |
+| Consumer | `connect_to_deamon`, `set_screen_info`, `push_dmabufs`, `select_dmabuf`, `refresh_done` | Separate registration, pool publication, selection and frame wait |
 
-| Version | Document |
-|---------|----------|
-| V1 | [doc/History/v1.md](doc/History/v1.md) |
-| V2 | [doc/History/v2.md](doc/History/v2.md) |
+Scene backend reporting functions (`backend_handed_off/presented/dropped/release_buffer/...`) implement the public presentation backend's side of the contract, not a second transport a WM should recreate. `anland_scene_backend_release_buffer()` takes ownership of the release FD on **all** paths; this differs from a commit's borrowed fence.
 
----
+Current limits include 32 scene layers, 8 damage rectangles per layer snapshot, 64 named bytes, a 64-entry scene event queue and a separately bounded 1024-release notification capacity. See header constants and actual overflow handling when designing integrations; these are not new Android multi-window capabilities.
 
-## 16. License
+<a id="section-14"></a>
 
-This project's own code is **MIT**‑licensed. Each non‑reference compositor backend
-carries **its own upstream license** instead.
+## 14. Audio engine details
 
-### 16.1 MIT‑licensed components
+Audio uses its own full-duplex stream, with an 8-byte packed `audio_msg {type,size}` header. Each direction describes its role and format before PCM. The current `audio_format` contains five `uint32_t` fields (20 bytes): `rate`, `channels`, `format`, `role`, `quantum`.
 
-| Component | Path |
-|-----------|------|
-| V3 consumer (Android) | [consumers/anland_v3/](consumers/anland_v3/) |
-| Shared protocol & utils | [common/](common/) |
-| Broker daemon | [daemon/](daemon/) |
-| Reference C libraries | [libdisplay_consumer/](libdisplay_consumer/), [libdisplay_producer/](libdisplay_producer/) |
+| Constant | Value | Meaning |
+|---|---:|---|
+| `AUDIO_MSG_FORMAT` | 1 | Format/role/quantum announcement |
+| `AUDIO_MSG_PCM` | 2 | PCM payload |
+| `AUDIO_MSG_SHM` | 3 | Shared-memory ring transport request |
+| `AUDIO_MSG_SHM_FD` | 4 | Shared-memory descriptor transfer |
+| `AUDIO_FORMAT_S16LE` | 0 | Interleaved signed 16-bit little-endian PCM |
+| `AUDIO_ROLE_PLAYBACK` | 0 | Linux desktop -> Android speaker |
+| `AUDIO_ROLE_CAPTURE` | 1 | Android microphone -> Linux virtual source |
 
-> A **vendored copy** of the reference C library that a port embeds in its own tree
-> **follows the host compositor's license**, not MIT — e.g. a copy embedded into GPL
-> KWin is distributed under KWin's GPL terms. The MIT grant applies to the canonical
-> library in this repo.
+Stereo frame order is left then right (FL/FR). PCM byte accounting is `frames * channels * 2` for S16LE; all counts must be validated before multiplication/allocation. `quantum` is measured in audio frames, zero means engine default. Consumer hardware-chosen rate/channels drive negotiation; do not assume every device uses 48 kHz stereo or that declaring an extension means every path uses it.
+
+The producer audio engine keeps PipeWire streams alive across consumer loss: detached playback is discarded and the microphone source supplies silence. `anland_audio_set_fd(-1)` detaches, while `stop()` destroys the engine. Rebinding resets microphone buffering and reannounces playback format, so do not invoke `set_fd()` every rendered frame. Compare both FD identity and session generation: numeric reuse can hide a new connection.
+
+<a id="section-15"></a>
+
+## 15. Migration, reproducibility and diagnosis
+
+### 15.1 Migrating from the historical transport integration
+
+| Historical assumption | Current action |
+|---|---|
+| Four deposited FDs and unchanged old daemon | Use matching current daemon/consumer/producer; audio makes pickup five-FD |
+| First buffer-ready means a frame was displayed | Treat it as target-ready; wait for feedback tied to an actual commit |
+| `trigger_refresh()` success is native presentation | Use facade commit/present and matching scene events |
+| A slot index permanently identifies a buffer | Include generation; reimport on new pool/session |
+| Every unknown event is fixed-size | Drain known payload/FD extensions or fail closed; preserve stream framing |
+| Any no-fence result means GPU work is done | Export a real fence or explicitly complete GPU work |
+| A public API version string proves capabilities | Compile/link against the actual called functions |
+| Copied producer snippets may be maintained in each port | Generate overlays from the canonical public implementation |
+
+The historical raw symbol spelling `connect_to_deamon` remains as declared; do not silently rename it in examples. Old migration instructions to copy only `display_producer.c`/`protocol.h` do not include the current scene/present/device/media implementation. Rebuild native bridges and WM packages together when their dependencies or ABI change.
+
+### 15.2 Reproducible input and output record
+
+Record WM/public-source revisions, lockfile and patch hashes, target architecture, compiler/toolchain, build flags, enabled features, dependency sources and artifact hashes. Dependency downloads should finish before offline configure/compile; use Cargo locks and pinned wraps/submodules. For Quilt, create/register the patch **before** editing its files, then refresh. A source-identity stamp does not detect every manual edit or invalidate every stale object.
+
+Validate packages through their native metadata and extraction, not just filenames: `bsdtar`/`pacman` for Arch, `dpkg-deb` for Debian, RPM tools for RPM. Dynamic integration should show correct ELF dependencies/RPATH and exported/imported APIs; static integration needs actual calls/link-map evidence and need not show `DT_NEEDED: libdisplay_producer.so`. Ensure generated overlays resolve symlinks and omit cache/build artifacts and personal paths.
+
+### 15.3 Troubleshooting by boundary
+
+| Symptom | First checks | Avoid |
+|---|---|---|
+| No daemon connection | Actual selected endpoint, mount/permissions, daemon log/control health | Guessing from a different port's default socket |
+| Daemon works but no output | Consumer arrival, screen-info stage, five-FD pickup, metadata count and target readiness | Inventing a mode or busy-looping pickup |
+| First frame appears, then freezes | Commit ID completion, pending/release state, event-loop pump/dispatch, target response | Reporting every eventfd signal as presentation |
+| Black/corrupt image | Format domain, modifier/stride/offset, import support and acquire fence | Guessing unknown fourcc/modifier or substituting CPU readback silently |
+| Reconnect fails | Control alive vs consumer absent, watcher refresh, new generation/import set | Reusing old same-number FDs or slots |
+| Clipboard/input stream stalls | Pending extension, short reads/writes, queue limits and payload deadlines | Polling a new header before extension completion |
+| No sound | PipeWire session, installed bridge API calls, bound audio FD, node routing and negotiation | Only adding `PULSE_SERVER` when the bridge is not wired |
+| X11 fails, Wayland works | Actually installed patched Xwayland, render-device path, satellite where needed | Assuming building a new package restarted the live server |
+| Package timestamp is new but behavior unchanged | Hash versus prior package, affected objects actually recompiled, installed file identity | Treating timestamps or wrapper rc=0 as build proof |
+
+Use non-destructive logs and preflight before authorized runtime testing. Preserve known successful deployment configuration and evidence; a deliberately broken test configuration is not proof that the original setup never worked.
+
+<a id="section-16"></a>
+
+## 16. History and license
+
+- [V1](doc/History/v1.md)
+- [V2](doc/History/v2.md)
+- [V3 — original English and Chinese READMEs](doc/History/v3.md)
+
+The root [LICENSE](LICENSE) contains **GNU GPL v3**. Consult component and upstream notices for their applicable terms, including compositor, Flutter and bundled dependencies; this README does not grant a blanket MIT license or relicense third-party code. Historical README statements are retained for archival purposes, not current licensing authority.

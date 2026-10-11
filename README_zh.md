@@ -1,760 +1,598 @@
-# Anland 显示协议 V3
+# Anland v5
 
-> 一套缓冲区共享协议：Linux 合成器（KWin / Weston）把桌面渲染进 GPU 缓冲区，
-> 由 Android 端的显示表面进行呈现，二者通过一个轻量守护进程在 Unix 域套接字上完成对接。
->
-> **V3** 新增**双向剪贴板交换**——producer（合成器）与 consumer（Android 显示）
-> 可通过数据通道互相推送剪贴板内容。剪贴板数据采用**变长**两包协议（头部 + 负载），
-> 这引入了与 V2 的 **ABI 和 API 不兼容**：调用者必须处理所有事件类型，
-> 或显式丢弃未处理的变长负载。
+<p align="left">
+  <img src="doc/logo.png" width="140" alt="Anland logo" />
+  <img src="https://stone.professorlee.work/api/stone/superturtlee/anland" alt="Stone Badge" />
+</p>
 
-> [English](README.md)
+**通过共享 GPU 缓冲区，将 Linux Wayland 桌面呈现在 Android 屏幕上。**
+Linux 合成器仍负责窗口管理、完整桌面合成、原生 seat 和会话；Android consumer 拥有显示缓冲区并呈现渲染结果，轻量 Unix socket daemon 负责连接对接与文件描述符传递。
 
----
+[English](README.md) · [使用指南](doc/UserManual/anland_guide_zh.md) · [Android 设置说明](doc/UserManual/anland_settings_guide_zh.md) · [V3 历史文档](doc/History/v3.md)
 
-## 用户文档
+本文描述当前 v5 源码树，包含 Denial。目录存在只表示适配配方已纳入仓库，**不表示所有发行版、GPU 和功能均已通过编译或图形验证**。公共头文件、源码锁定清单和脚本实际行为优先于示例及历史文档。
 
-- [Anland 使用指南](doc/UserManual/anland_guide_zh.md) - 安装 Anland，并通过 chroot 或 Droidspaces 连接支持 Anland 的 Wayland 桌面。
-- [Anland 设置使用说明](doc/UserManual/anland_settings_guide_zh.md) - 配置 Android 应用中的输入、显示、连接、音频与窗口行为。
+## 目录
 
----
+- [1. 仓库索引](#section-1)
+- [2. 架构与所有权](#section-2)
+- [3. 合成器与发行版入口](#section-3)
+- [4. 公共 API 与帧生命周期](#section-4)
+- [5. 传输、输入与媒体](#section-5)
+- [6. 构建与打包](#section-6)
+- [7. 新合成器适配流程](#section-7)
+- [8. 启动与验证](#section-8)
+- [9. 线上协议参考](#section-9)
+- [10. 变长负载、队列与服务资源](#section-10)
+- [11. 握手与恢复状态机](#section-11)
+- [12. 逐帧传输与 scene 反馈](#section-12)
+- [13. API 索引与返回契约](#section-13)
+- [14. 音频引擎细节](#section-14)
+- [15. 迁移、复现与诊断](#section-15)
+- [16. 历史与许可](#section-16)
 
-## 1. 角色
+<a id="section-1"></a>
 
-| 角色 | 程序 | 职责 |
-|------|------|------|
-| **守护进程** | `daemon` | 充当对接中介，最多保存一个 consumer 与一个 producer，缓存屏幕信息，并通过 `SCM_RIGHTS` 在两者间传递文件描述符。**与 V2 相同，无需更新。** |
-| **消费端** | Android app / `test_sdl_consumer` | 拥有全部资源：分配 dmabuf、buffer‑ready eventfd、shm 索引页与**两条** socketpair（`data` + `fence`），并最终**呈现**已渲染的帧。V3 还负责**接收 producer 发来的剪贴板数据**。 |
-| **生产端** | KWin / Weston `backend‑anland` | 即合成器，把桌面内容**渲染**进 consumer 提供的共享缓冲区。V3 还负责**接收 consumer 发来的剪贴板数据**并**向 consumer 发送剪贴板数据**。 |
+## 1. 仓库索引
 
-> [!NOTE]
-> **命名**: producer 生产像素内容，consumer 消费（显示）这些内容。consumer 是资源拥有者，
-> 因为它才是把缓冲区真正扫描输出到屏幕的一方。
+| 区域 | 职责 |
+|---|---|
+| [consumers/anland_v5/](consumers/anland_v5/) | Android v5 consumer 与应用 |
+| [daemon/](daemon/)、[libdisplay_daemon/](libdisplay_daemon/) | 连接中介及守护进程实现 |
+| [common/](common/) | 协议结构、消息分帧与 FD 传递 |
+| [libdisplay_consumer/](libdisplay_consumer/) | consumer 侧 C 传输库 |
+| [libdisplay_producer/](libdisplay_producer/) | 唯一公共 producer 实现：device、scene、present、桌面 facade 和媒体桥 |
+| [producers/](producers/) | 每个合成器一套后端，以及发行版集成和打包配方 |
+| [magisk_module/](magisk_module/) | Android daemon 部署材料 |
+| [doc/UserManual/](doc/UserManual/) | 安装与应用设置说明 |
+| [.github/workflows/build.yml](.github/workflows/build.yml) | Android plain/Tracy APK 与 daemon 构建工作流 |
 
----
+根目录 CMake 构建 daemon 和 C 库，**不会**一次构建全部合成器适配或 Android APK。APK 使用 `consumers/anland_v5/android_consumer/` 下的 Gradle 工程。
 
-## 2. V3 变更概览
+<a id="section-2"></a>
 
-| 方面 | V2 | V3 | 影响 |
-|------|----|----|------|
-| 剪贴板 | 单向 | **双向** | 新增 `DATA_MSG_OUTPUT_EVENT`(103) P→C 方向 |
-| 变长事件 | 未使用 | `clipboard.size` + trailing payload | ❌ **ABI 不兼容**：旧版 `poll_input_event()` 无法排空变长负载，导致流损坏 |
-| `handle_unhandled_event()` | 不需要 | **必须调用** | ❌ **API 不兼容**：未处理的变长事件必须显式排空 |
-| `push_input_event_with_length()` / `push_output_event_with_length()` | 不需要 | **剪贴板必须使用** | 签名不变，但变长事件**不得**用 `push_input_event()` / `push_output_event()` 发送 |
-| 守护进程 | — | **不变** | 零改动 |
+## 2. 架构与所有权
 
-> [!CAUTION]
-> **ABI 不兼容**: V3 consumer 可能发送 `INPUT_TYPE_CLIPBOARD` 事件，其尾随负载字节超过
-> `sizeof(struct InputEvent)`。仅调用 `poll_input_event()`（读取恰好一个固定大小
-> `InputEvent`）的 V2 producer 会**将尾随字节留在 socket 缓冲区中**，
-> 损坏所有后续消息。反方向的 `DATA_MSG_OUTPUT_EVENT` + 剪贴板负载同理。
-
----
-
-## 3. 传输与通道
-
-共有**四条**通信路径——与 V2 相同，fence 通道使用 **socketpair**，
-数据通道现承载**变长输出事件**。
-
-| 通道 | 类型 | 创建者 | 承载内容 |
-|------|------|--------|----------|
-| **控制通道** | `AF_UNIX` `SOCK_STREAM` to daemon | 各端各一条 | 握手控制消息 |
-| **数据通道** | `socketpair()` | Consumer | 缓冲区集合、输入事件与**输出事件** |
-| **buf_ready** | `eventfd` | Consumer | Consumer → Producer: 已选定缓冲区，请渲染 |
-| **fence** | `socketpair()` | Consumer | Producer → Consumer: 渲染完成消息 + 可选栅栏 fd |
-| **索引页** | 4‑byte `memfd` | Consumer | 当前选中的缓冲区下标 |
-
-守护进程默认套接字路径:
-`/data/local/tmp/display_daemon.sock`
-
-所有控制/数据帧都是固定 8 字节头部加可选负载（见 `common/protocol.h`）：
-
-```c
-struct ctrl_msg { uint32_t type; uint32_t size; uint8_t payload[]; } __attribute__((packed));
-struct data_msg { uint32_t type; uint32_t size; uint8_t payload[]; } __attribute__((packed));
+```text
+Linux 合成器：原生窗口、renderer、frame clock、seat 与桌面
+  -> 薄 Anland backend：原生图像导入、事件与帧反馈转换
+  -> anland_de_backend
+       -> anland_scene / anland_present
+       -> anland_scene_legacy（现有全屏传输的内部适配）
+       -> anland_device / display_producer / 公共协议
+  -> 既有 daemon -> Android consumer -> Android 呈现
 ```
 
-`size` 为负载字节数（不含头部）。可靠收发函数 `send_all` / `recv_all` 及附带 fd 的
-`send_fds` / `recv_fds` 见 `common/socket_utils.c`。
+- **Producer：** 将完整桌面渲染进 consumer 提供的目标，不是 Android 逐窗口转发服务。
+- **Consumer：** 拥有共享显示资源并负责呈现；consumer ACK 不等于物理 scanout 或硬件 VSync 证明。
+- **Daemon：** 对接控制连接与资源 FD；稳态图像交接无需每帧往返 daemon。
+- **公共 producer：** 负责协议编解码、提交事务、反馈、buffer 释放、背压与会话失效。各后端转换原生合成器对象，不重复实现这些机制。
 
----
+每个合成器只有一套后端。发行版／版本差异放入补丁、依赖锁、打包配方和启动配置。`anland_scene_legacy` 是内部实现名，**不是**供 WM 选择的第二套协议。producer 内部 layer 不意味着 Android 存在逐窗口 Surface。适配不得替换 consumer、另建 wire protocol 或自行维护一套传输状态机。
 
-## 4. 寄存的四个描述符
+<a id="section-3"></a>
 
-consumer 打招呼时通过 `SCM_RIGHTS` 附带**四个** fd，顺序固定如下
-（见 `display_consumer.c` 的 `send_hello_fds()`）：
+## 3. 合成器与发行版入口
 
-| 下标 | 方向 | 用途 |
-|:----:|------|------|
-| `fds[0]` | C → P | `buf_ready_efd`: 选定缓冲区的信号 |
-| `fds[1]` | P → C | `fence_fd` socketpair 写端: 渲染完成消息 + 可选 fence fd via `SCM_RIGHTS` |
-| `fds[2]` | C ↔ P | 数据通道: socketpair 的 producer 端 |
-| `fds[3]` | C → P | `shm_fd`: 4 字节索引页 |
+下表路径均相对 `producers/<名称>/`，目录名区分大小写。
 
-> **V3 无变更**：fd 槽位与 V2 完全相同
+| 合成器 | 后端 | 当前仓库的发行版入口 |
+|---|---|---|
+| [Gamescope](producers/gamescope/) | `anland_backend/`（C session wrapper、C++/Vulkan） | `SteamOS_v5` |
+| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/`（GObject/Cogl/Clutter） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
+| [KDE / KWin](producers/kde/) | `anland_backend/`（Qt output/EGL/input） | `Arch_v5`、`Debian13_v5`、`Fedora43_v5`、`SteamOS_v5`、`ubuntu2604_v5` |
+| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5` |
+| [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Debian13_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Debian13_v5` |
+| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5` |
 
-consumer 自留 `sv[0]` 作为自身 `data_fd`，寄存 `sv[1]`。守护进程把这些保存为
-**deposited fds**，待 producer 请求时转交。**Daemon 不感知 fd 语义，无需更新。**
+[producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) 是额外的 Xwayland 配方，不是独立 WM 后端。仅构建 Mutter/KWin 不等于交付完整 GNOME/Plasma，会话仍需 shell、portal、agent 和运行数据。Niri 的 X11 接入还需核对 xwayland-satellite 及其启动关系。
 
----
+<a id="section-4"></a>
 
-## 5. 消息参考
+## 4. 公共 API 与帧生命周期
 
-### 5.1 控制消息（控制通道）
+先阅读 [anland_de_backend.h](libdisplay_producer/anland_de_backend.h)、[anland_present.h](libdisplay_producer/anland_present.h)、[anland_scene.h](libdisplay_producer/anland_scene.h) 和 [anland_device.h](libdisplay_producer/anland_device.h)。
 
-| 消息 | Value | 方向 | 负载/描述符 | 含义 |
-|------|:-----:|------|-------------|------|
-| `CTRL_MSG_CONSUMER_HELLO` | 1 | C → D | + 4 fds | 注册为 consumer 并寄存 fd |
-| `CTRL_MSG_PRODUCER_HELLO` | 2 | P → D | — | 注册为 producer |
-| `CTRL_MSG_SCREEN_INFO`    | 7 | C → D, D → P | `screen_info` | 发布/转发屏幕参数 |
-| `CTRL_MSG_REJECT`         | 8 | D → C | — | 屏幕参数冲突，拒绝 |
-| `CTRL_MSG_PICKUP_FDS`     | 9 | P → D | — | producer 索取寄存的 fd |
-| `CTRL_MSG_FDS_READY`      | 10 | D → P (+4 fds), D → C (notify) | + 4 fds to producer | 描述符已交付 |
+1. 创建唯一 `anland_de_backend` owner，通过 `anland_de_backend_add_window_desc()` 添加代表完整合成输出的 layer。
+2. 将设备就绪与 scene 事件接入原生事件循环，驱动 `pump()` 和 `dispatch()`；对象创建／连接成功不代表已有 render target。
+3. 查询实时输出及 `anland_de_backend_get_writable_target()`。`get_target()` 只描述已发布目标，不证明该 buffer 可安全写入。
+4. 用原生 renderer 导入目标，按**会话 generation 与 slot**管理，使用实际 buffer 数量，校验尺寸、stride、offset、format 和 modifier。`anland_device_get_drm_fb()` 返回 DRM fourcc 元数据及调用者拥有的复制 FD；不能把原始协议／HAL 格式直接当作 DRM fourcc。
+5. 渲染到记录的目标，导出 acquire fence 或明确等待 GPU 完成，再次核对 generation/slot 后提交。
+6. 调用 `anland_de_backend_commit(..., &commit_id)`，记录对应原生 frame，再调用 `present()`；继续 `pump()`／`dispatch()` 处理呈现、丢帧和释放。
 
-### 5.2 数据消息（数据通道）
+| Scene 事件 | 原生合成器应如何处理 |
+|---|---|
+| `RENDER_TARGET_READY` | 重新查询并校验目标，仅在可写时安排渲染；不是上一帧完成。 |
+| `PRESENTED` | 用已有 consumer 反馈完成对应 commit 的原生 frame，不虚构硬件时间。 |
+| `BUFFER_RELEASED` | 处理 release fence 后允许安全复用，不要求每帧销毁导入图像。 |
+| `COMMIT_DROPPED` | 通过丢帧／取消路径结束对应 frame 的等待。 |
+| `OUTPUT_CHANGED` | 按需更新 mode、导入对象与 damage 历史。 |
 
-| 消息 | Value | 方向 | 负载/描述符 | 含义 |
-|------|:-----:|------|-------------|------|
-| `DATA_MSG_BUFS_READY` | 200 | C → P | `N × buf_info` + `N` dmabuf fds | 共享缓冲区集合 |
-| `DATA_MSG_INPUT_EVENT`| 102 | C → P | `InputEvent` | 触摸/按键/指针/剪贴板/显示刷新率 |
-| `DATA_MSG_OUTPUT_EVENT`| **103** | **P → C** | `OutputEvent` | producer 发来的**剪贴板**（**V3 双向**） |
-| `DATA_MSG_BUF_READY`  | 100 | — | *保留* | 由 eventfd 取代 |
-| `DATA_MSG_REFRESH_DONE`| 101 | — | *保留* | 由 fence 通道取代 |
+**所有权与安全：** commit 的 acquire fence 是借用；dispatch 返回的 release fence 和复制的 buffer FD 属于调用者。device 的 data、buffer-ready、audio FD 是借用。无 acquire fence 必须显式设为 `-1`，不能清零成 fd 0。释放同步失败不得复用 buffer。帧路径操作应在合成器事件循环中串行执行。
 
-### 5.3 结构体
+背压时保留 repaint/damage 请求，等待可写目标。consumer 丢失使用 `reconnect()`；daemon／控制连接死亡使用 `reopen()`；导入失败或坏会话数据需 `drop_session()` 并清理本地资源。generation 改变使旧 target、回调与导入失效。watcher 身份包含 owner 和事件掩码，不只看 FD 编号。销毁 owner 前停止使用会话资源的媒体引擎。
+
+初始实现优先全帧重绘。buffer age/damage 优化必须符合真实 slot 轮转历史，并处理旋转、resize 与重连。
+
+<a id="section-5"></a>
+
+## 5. 传输、输入与媒体
+
+线上协议以 [common/protocol.h](common/protocol.h) 为准，分帧与 FD 工具见 [common/socket_utils.c](common/socket_utils.c)。device 内置默认 socket 为 `/data/local/tmp/display_daemon.sock`；`ANLAND_SOCKET`、显式 endpoint 和发现路径可改变它。应阅读选定启动脚本，不假定所有适配的 endpoint 相同。
+
+| 通路 | 职责 |
+|---|---|
+| 控制 Unix socket | daemon 注册、输出信息与资源领取 |
+| 数据通道 | buffer 集合、输入／输出事件、变长剪贴板／文本和服务资源消息 |
+| buffer-ready eventfd + 共享索引页 | consumer 选择 producer 本轮渲染目标 |
+| fence 通道 | 渲染交接及可选同步 FD |
+| 独立音频通道 | 桌面播放与麦克风采集，避免 PCM 堵塞输入通道 |
+
+当前协议已超出 v3：包含文本输入、动作、资源 FD、consumer 运行变量、前台调度及音频格式／PCM／共享内存消息。当前音频 endpoint 使用 hello FD slot 4；旧 README 的“四个 FD”描述属于历史，不是当前接入契约。
+
+- 键盘、指针和触摸经原生 seat 接口注入，断连时释放按住状态。
+- 必须处理或完整消费变长 payload 与附带 FD，包括不支持的服务；限制长度与总读取期限，残留字节／FD 会破坏分帧。
+- 剪贴板发送优先使用 `anland_device_queue_clipboard()`、`pending_output()` 和 `flush_output()`，配合可写监听；入队不等于送达。防止双向回声与过期异步 selection 覆盖。
+- 优先原生 text-input/IME；fallback 必须校验完整 UTF-8，只发给聚焦客户端，不能触发 WM 全局快捷键。
+- 复用 [anland_audio.h](libdisplay_producer/anland_audio.h) 和 [anland_camera.h](libdisplay_producer/anland_camera.h)，但功能声明以 WM 实际接线为准。
+- 指针锁定与前台调度通过公共 device 控制，重连后恢复状态。触屏手势需真实 touch contacts，不能从滚轮事件伪造手指数。
+
+v1/v2/v3 的历史兼容结论不能证明 v5 互操作。consumer、协议、producer／bridge 和后端必须成套构建部署；pkg-config 的 `5.0.0` 版本也不能证明某项 API 存在。
+
+<a id="section-6"></a>
+
+## 6. 构建与打包
+
+使用目标发行版入口的 `build.sh` 和原生配方，先确认实际接受的参数：没有通用阶段 CLI 或统一依赖安装开关。优先普通用户编译、仓库外持久缓存、锁定源码和原生包交付。
+
+**构建、安装、图形启动是不同操作。** 构建入口通常以 `ANLAND_INSTALL=1` 控制最终安装（部分兼容 `INSTALL`），但依赖准备仍可能调用 sudo。运行前必须核对脚本。安装可能替换发行版的 WM／Xwayland 包，不代表可以重启正在运行的桌面或音频服务。
+
+在匹配的 Linux 环境中，从仓库根目录运行示例：
+
+```sh
+# Arch Linux ARM，KWin 配方绑定受支持的上游版本。
+JOBS=4 ANLAND_INSTALL=0 bash producers/kde/Arch_v5/build.sh --noconfirm
+
+# Debian 13 ARM64，使用环境变量，不使用历史阶段参数。
+JOBS=4 ANLAND_INSTALL=0 bash producers/hyprland/Debian13_v5/build.sh
+JOBS=2 ANLAND_INSTALL=0 bash producers/mango/Debian13_v5/build.sh
+
+# Arch Linux ARM，普通用户；显式允许准备依赖，不安装最终产物。
+JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
+  bash producers/denial/Arch_v5/build.sh --noconfirm
+```
+
+### 公共库链接
+
+每个产物只选择一份公共实现：通过 pkg-config 动态链接 `display-producer`、内建权威公共源码，或由 Rust 使用窄 C bridge。`producer.cmake` 统一源码与依赖；`presentation.cmake` 提供展示层对象；`display-producer.pc.in` 提供发现元数据。不能既内建又动态链接重复实现。overlay 从唯一公共树生成，打包时解析仓库符号链接，不长期维护传输代码分叉。实际 API 需 compile/link 探测，不能只看版本字符串。
+
+### 当前构建链说明
+
+- **Hyprland / Debian 13：** lockfile 锁定依赖栈与插件 ABI；公共 producer 内建到 Aquamarine。产物位于 `producers/hyprland/Debian13_v5/artifacts/`，默认 `JOBS=4`。`nocheck nodwz` 明确意味着产包成功**不是**测试通过。
+- **Mango / Debian 13：** 私有 prefix 共享 producer、wlroots 与 SceneFX；产物位于 `producers/mango/Debian13_v5/artifacts/`，默认 `JOBS=2`。
+- **Denial / Arch：** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) 锁定 Denial `0.5.0-anland5`、Flutter `3.47.5` revision；Cargo/pub 锁文件负责传递依赖。缓存默认 `$XDG_CACHE_HOME/denial-anland`，未设置时为 `$HOME/.cache/denial-anland`；产物默认 `$WORKDIR/packages`，可由 `ARTIFACTS_DIR` 覆盖。`ANLAND_ENGINE_MODE=auto|build|prepared`、`ANLAND_OFFLINE=1`、`ANLAND_WITH_DE=0` 控制引擎／缓存／桌面行为。产物含 engine、`denial`、可选 `denial-desktop`、修补版 Xwayland、本地签名、`packages.list`、`manifest.env` 和 `SHA256SUMS`。安装前审查并信任本地签名密钥，它不是上游发布密钥。
+
+### Xwayland
+
+Denial Arch 当前复用 KDE Arch 的 Xwayland `24.1.13` 配方／补丁，支持 `XWAYLAND_TARBALL` 本地归档与 `XWAYLAND_PATCH` 覆盖。产物加入 Denial 包清单、签名、校验和可选安装。Debian Hyprland/Mango 使用各自锁定的 Xwayland 源码配方，不可将某发行版补丁强套到任意版本。
+
+kgsl/Turnip 补丁允许 implicit-modifier dma-buf 路径；v3 合成器不等待 v4 feedback；支持 render device fallback（`XWAYLAND_GBM_DEVICE`）。`1274 -> LINEAR` 仅针对已知 freedreno/kgsl 路径，不是猜测任意未知 modifier 的许可。新构建设计应隔离 WM 私有库／工具链变量对 Xwayland 的影响。安装新包不会重启现有 Xwayland 进程。
+
+<a id="section-7"></a>
+
+## 7. 新合成器适配流程
+
+选择最接近的原生参考：C/GObject 看 Mutter，C++/Qt 看 KWin，Vulkan 看 Gamescope，Rust+C bridge 看 Niri/Denial，wlroots 看 Mango，Aquamarine 看 Hyprland。复制历史模式前先读当前实现。
+
+1. 记录上游 revision、renderer／外部目标导入、事件循环、帧生命周期、seat／文本／剪贴板接口、GPU／fence 能力、目标架构与完整会话依赖。
+2. 后端主体独立；版本补丁只注册后端并暴露最小原生钩子。公共机制留在 `libdisplay_producer/`。
+3. 先建立可写 target -> 渲染 -> commit/present -> 反馈／释放闭环，再添加桌面服务。
+4. 锁定源码归档／commit、submodule、依赖 revision 和匹配补丁；尽可能先核对预期哈希再解包，不忽略补丁失败。
+5. 按依赖顺序构建，再按链接方式构建公共库／bridge、WM 和原生包。发行版没有 WM 包时仍可提供工具及库；新建 PKGBUILD、Debian 包或 RPM spec，不默认全局 `sudo make install`。
+6. 分离 prepare、编译、打包、验证、可选安装和明确授权的图形测试。保持唯一后端与唯一公共实现，不为了移植 WM 修改 Android consumer。
+
+<a id="section-8"></a>
+
+## 8. 启动与验证
+
+核对环境和配置后再使用目标 `startup.sh` 或已安装会话入口。设备特定 GPU 变量限于该入口，不作为全局默认。不要覆盖用户配置、抢占其他 producer 会话或自动终止／重启 WM、PipeWire、daemon、consumer。入口提供的 `--check` 预检不等于 consumer 握手或图形 smoke test。
+
+完整验证记录应区分：
+
+- **契约测试：** 首次 target 与呈现分离；accepted／ACK／released 状态；背压；提交和 fence 失败；旧 generation；FD 所有权；resize／重连及 watcher 复用；有界剪贴板／文本／资源消费。
+- **构建／包检查：** 真实编译和链接退出码、日志明确结论、架构、内容、依赖、符号与 RPATH。与旧产物对比哈希，排除增量构建复用旧对象；仅时间戳不够。
+- **明确授权的图形测试：** 首帧与持续重绘、窗口／光标／特效、输入及声明支持的媒体、consumer／daemon 恢复、旋转／resize、Wayland 与 X11 客户端。
+
+Android workflow 有 native input-grab 与 JVM 单元测试步骤，不代表覆盖全部 producer 适配。
+
+<a id="section-9"></a>
+
+## 9. 线上协议参考
+
+本节说明仓库中的 C 传输实现，不定义新的通用网络协议。packed 结构通过本地 Unix socket 和 `SCM_RIGHTS` 交换；`ctrl_msg`／`data_msg` 没有版本协商字段，结构声明也没有大小端转换。结构体大小或消息编号未变，不代表跨代兼容。
+
+### 9.1 消息头与 buffer 元数据
 
 ```c
-struct screen_info { uint32_t width, height, format, refresh; };
+/* common/protocol.h：两种消息头均为 8 字节，不含 payload。 */
+struct ctrl_msg {
+    uint32_t type;
+    uint32_t size;
+    uint8_t payload[];
+} __attribute__((packed));
+struct data_msg {
+    uint32_t type;
+    uint32_t size;
+    uint8_t payload[];
+} __attribute__((packed));
+
+struct screen_info {
+    uint32_t width, height, format, refresh;
+} __attribute__((packed));
 
 struct buf_info {
-    uint32_t stride;
+    uint32_t stride;    /* 字节 */
     uint32_t width;
     uint32_t height;
-    uint32_t format;
+    uint32_t format;    /* 传输／HAL 约定，不自动等于 DRM fourcc */
     uint64_t modifier;
     uint32_t offset;
-};
-
-struct InputEvent {
-    uint32_t type;
-    union {
-        struct { int32_t action; float x, y; int32_t pointer_id; } touch;
-        struct { int32_t action; int32_t keycode; } key;
-        struct { float x, y, dx, dy; } pointer_motion;
-        struct { uint32_t button; int32_t pressed; } pointer_button;
-        struct { uint32_t axis; float value; int32_t discrete; } pointer_axis;
-        struct { uint32_t refresh_mhz; } display;
-        struct { uint32_t size; } clipboard;
-        struct { uint32_t padding[4]; };
-    };
-} __attribute__((packed));
-
-struct OutputEvent{
-    uint32_t type;
-    union {
-        struct { uint32_t size; } clipboard;
-        struct { uint32_t padding[4]; };
-    };
 } __attribute__((packed));
 ```
 
-#### 输入事件类型
+此 packed 定义中，`screen_info` 为 16 字节，`buf_info` 为 28 字节。公共 output 将刷新率字段命名为 `refresh_mhz`，`60000` 表示 60 Hz。`MAX_BUFS=8` 是上限，不是固定 swapchain 长度。`BUFS_READY` 包含 `N` 条元数据及恰好 `N` 个 dma-buf FD。producer 校验字节数非零、能被 `sizeof(buf_info)` 整除、未超上限且与实际 FD 数相符。
 
-| 类型 | Value | V1 | V2 | V3 | 负载 | 变长? |
-|------|:-----:|:--:|:--:|:--:|------|:-----:|
-| `INPUT_TYPE_TOUCH` | 1 | ✅ | ✅ | ✅ | `touch { action, x, y, pointer_id }` | 否 |
-| `INPUT_TYPE_KEY` | 2 | ✅ | ✅ | ✅ | `key { action, keycode }` | 否 |
-| `INPUT_TYPE_POINTER_MOTION` | 3 | ✅ | ✅ | ✅ | `pointer_motion { x, y, dx, dy }` | 否 |
-| `INPUT_TYPE_POINTER_BUTTON` | 4 | ✅ | ✅ | ✅ | `pointer_button { button, pressed }` | 否 |
-| `INPUT_TYPE_POINTER_AXIS` | 5 | ✅ | ✅ | ✅ | `pointer_axis { axis, value, discrete }` | 否 |
-| `INPUT_TYPE_TOUCH_FRAME` | 6 | — | ✅ | ✅ | — (frame boundary) | 否 |
-| `INPUT_TYPE_DISPLAY_REFRESH` | 7 | — | ✅ | ✅ | `display { refresh_mhz }` | 否 |
-| `INPUT_TYPE_CLIPBOARD` | 8 | — | — | **✅ V3 新增** | `clipboard { size }` + variable‑length data | **是** |
+### 9.2 控制消息
 
-#### 输出事件类型
+`C` = consumer，`P` = producer，`D` = daemon。
 
-| 类型 | Value | V2 | V3 | 负载 | 变长? |
-|------|:-----:|:--:|:--:|------|:-----:|
-| `OUTPUT_TYPE_CLIPBOARD` | 1 | — | **✅ V3 新增** | `clipboard { size }` + variable‑length data | **是** |
+| 常量 | 值 | 方向 | 消息体／描述符 | 当前作用 |
+|---|---:|---|---|---|
+| `CTRL_MSG_CONSUMER_HELLO` | 1 | C -> D | 零 payload，五个寄存 FD | 注册／重新寄存 consumer 资源 |
+| `CTRL_MSG_PRODUCER_HELLO` | 2 | P -> D | 零 payload | 注册 producer |
+| `CTRL_MSG_SCREEN_INFO` | 7 | C -> D -> P | `screen_info` | 存储尺寸／格式／刷新率，发给等待中的 producer |
+| `CTRL_MSG_REJECT` | 8 | 已定义 | — | 保留定义，不是当前 daemon 的尺寸变更策略 |
+| `CTRL_MSG_PICKUP_FDS` | 9 | P -> D | 零 payload | 领取寄存会话资源 |
+| `CTRL_MSG_FDS_READY` | 10 | D -> P、D -> C | 向 P 传五个 FD，向 C 通知 | 完成资源交接 |
 
-> [!IMPORTANT]
-> 逐帧的缓冲区交接**不**走数据消息。选中下标通过 `shm` 页、`buf_ready_efd`（选中）与
-> **fence 通道**（渲染完成 + 可选栅栏）传递，详见 §7。
+daemon 当前最多保存一个 consumer 和一个 producer。新连接声明同一角色时会替换旧连接；启动／会话锁应防止意外抢占。consumer 离开时会清理旧寄存 FD。与归档 v3 的描述不同，`libdisplay_daemon/display_daemon.c` **接受新的屏幕信息**，更新存储并转发给等待中的 producer，不再用永久的“首个 mode 锁”拒绝不同尺寸。这不保证无需更新会话／导入对象即可完成原生热切换。
 
----
+### 9.3 寄存 FD 布局
 
-## 6. 变长事件协议（V3 关键变更）
+`libdisplay_consumer/display_consumer.c::send_hello_fds()` 寄存五个 FD；当前 producer pickup 要求**恰好五个**：
 
-V3 在数据通道上引入**变长事件**。此前所有 `InputEvent` 和 `OutputEvent` 消息均为
-固定大小。V3 中，剪贴板事件携带一个**头部**包（固定大小的事件结构体，
-`clipboard.size` 已设置），后紧跟 `clipboard.size` 字节的原始负载。
+| 槽位 | 资源 | 方向／语义 |
+|---:|---|---|
+| 0 | `buf_ready_efd` | C -> P 的节拍／目标选择 eventfd |
+| 1 | fence socketpair 的 producer 端 | P -> C 的 frame-done 消息及可选 acquire fence FD |
+| 2 | data socketpair 的 producer 端 | 双向事件／资源传输及初始 buffer 集合 |
+| 3 | `shm_fd` | 共享 `uint32_t` buffer 索引，P 只读映射 |
+| 4 | audio socketpair 的 producer 端 | 全双工播放和麦克风流 |
 
-### 6.1 线上格式
+consumer 保留自己的 socketpair 端，发送后关闭本地寄存端副本。`SCM_RIGHTS` 在接收进程中创建描述符，不传递 FD 数字身份。daemon 交付后关闭自身副本。device accessor 提供借用会话 FD，renderer 导入使用独立拥有的复制 FD。旧版四 FD consumer **不会**仅因前四槽相同就被当前 producer 接受。
 
+### 9.4 数据消息
+
+| 常量 | 值 | 方向 | Payload |
+|---|---:|---|---|
+| `DATA_MSG_BUF_READY` | 100 | 当前帧路径保留 | 选择使用 eventfd + 共享页 |
+| `DATA_MSG_REFRESH_DONE` | 101 | 当前帧路径保留 | 帧交接使用 fence socketpair |
+| `DATA_MSG_INPUT_EVENT` | 102 | C -> P | packed `InputEvent`，可能随后附原始字节 |
+| `DATA_MSG_OUTPUT_EVENT` | 103 | P -> C | packed `OutputEvent`，可能随后附原始字节 |
+| `DATA_MSG_INPUT_EXTEND_FDS` | 104 | C -> P | 用 `SCM_RIGHTS` 传递服务 FD 的后续消息 |
+| `DATA_MSG_BUFS_READY` | 200 | C -> P | `N * buf_info` 及 `N` 个 dma-buf FD |
+
+当前 packed 输入／输出事件各为 20 字节：4 字节 type 与 16 字节 union。union 包含浮点坐标，输出调度布局使用原生 `pid_t`；这是当前本地 ABI，不是架构无关序列化承诺。
+
+### 9.5 输入事件
+
+| 类型后缀（`INPUT_TYPE_`） | 值 | 字段／后续数据 |
+|---|---:|---|
+| `TOUCH` | 1 | `action, x, y, pointer_id` |
+| `KEY` | 2 | `action, keycode` |
+| `POINTER_MOTION` | 3 | `x, y, dx, dy` |
+| `POINTER_BUTTON` | 4 | `button, pressed` |
+| `POINTER_AXIS` | 5 | `axis, value, discrete` |
+| `TOUCH_FRAME` | 6 | 触摸批次边界 |
+| `DISPLAY_REFRESH` | 7 | `refresh_mhz` |
+| `CLIPBOARD` | 8 | `clipboard.size`，随后对应字节数 |
+| `TEXT_INPUT` | 9 | `text_input.size`，随后对应 UTF-8 字节 |
+| `ACTION` | 10 | `input_action.action, value` |
+| `RESOURCE` | 11 | `resource.type, fdnum`，随后 extended-FD 消息 |
+| `RESOURCE_INVALID` | 12 | 同样的 resource 字段，报告无效／不可用服务资源 |
+
+触摸／按键动作常量为 `DOWN=0`、`UP=1`、`MOVE=2`；原生键码和坐标空间转换由 WM adapter 负责。资源处理需依据声明的 FD 数，不能假定错误通知一定没有 FD。不支持但带已知扩展的事件仍须完整消费扩展并关闭收到的拥有 FD。
+
+### 9.6 输出事件
+
+| 类型（`OUTPUT_TYPE_`） | 值 | 字段／作用 |
+|---|---:|---|
+| `CLIPBOARD` | 1 | `clipboard.size`，随后原始字节 |
+| `RESOURCES_REQUEST` | 2 | 服务 `type` 与最多三个 `uint32_t args` |
+| `SET_CONSUMER_VAR` | 3 | `var, value`，临时运行参数请求 |
+| `SCHEDULING` | 4 | producer 命名空间的 `pid` 与 flags |
+
+`SERVICE_TYPE_CAMERA=1`。`CONSUMER_VAR_CAPTURE_MOUSE=1` 请求捕获指针，value 为零撤销。调度 flags 为 `SETTREE=0x01`、`ON=0x02`：先报告旧聚焦子树关闭，再报告新子树开启，由 consumer/root helper 解析 producer PID 命名空间。这不授权 WM 直接操纵 Android 进程。consumer fallback 重置临时参数，重连后需重发当前状态。
+
+<a id="section-10"></a>
+
+## 10. 变长负载、队列与服务资源
+
+### 10.1 剪贴板／文本分帧
+
+```text
+固定事件：
+  [ data header: type, size=20 ][ event: type + union ]
+
+剪贴板／文本：
+  [ data header: type, size=20 ][ event: type + *.size=L ][ L 原始字节 ]
+
+服务回复：
+  [ DATA_MSG_INPUT_EVENT ][ resource: type, fdnum ]
+  [ DATA_MSG_INPUT_EXTEND_FDS + SCM_RIGHTS 描述符 ]
 ```
-Standard event (fixed size):
-┌──────────────────┬────────────────────┐
-│ data_msg header  │ InputEvent/OutputEvent │
-│ type + size(=20) │ type + union        │
-└──────────────────┴────────────────────┘
 
-Variable‑length event (V3 clipboard):
-┌──────────────────┬────────────────────┬─────────────────────┐
-│ data_msg header  │ InputEvent/OutputEvent │ payload bytes      │
-│ type + size(=20) │ type + clipboard.size  │ (clipboard.size)   │
-└──────────────────┴────────────────────┴─────────────────────┘
-                        ▲ header ▲          ▲ trailing data ▲
-```
+事件消息的 `data_msg.size` 仅描述**事件结构体**，不含尾随剪贴板／文本长度；`BUFS_READY` 则描述元数据数组。不能将某一规则推广至所有消息。`clipboard.size`／`text_input.size` 必须匹配实际尾随字节；不能使用固定事件 sender 发送变长事件。
 
-> [!CAUTION]
-> `data_msg.size` 字段始终等于 `sizeof(InputEvent)` 或 `sizeof(OutputEvent)`
-> （20 字节）——**不包含**尾随负载。尾随负载大小由 `clipboard.size` 携带。
-> 接收者在消费事件结构体后必须**额外**读取 `clipboard.size` 字节。
+Unix stream 可能拆分消息头、payload 和附带数据，一次 `recv()` 不等于一条消息。当前 producer 输入 parser 保留部分字节／FD，支持 `timeout_ms=0` 非阻塞，并使未完成输入帧在 5 秒后过期。调用者须串行访问 context，重试**同一待完成操作及 size**，扩展未完成时不能读取下一个事件头。这是 producer 实现的契约，不能推断 consumer 或每个 helper 都具有相同超时行为。
 
-### 6.2 发送规则
+### 10.2 有界剪贴板发送
 
-- 剪贴板事件**必须使用 `push_*_with_length()`**——`_with_length` 变体在同一次
-  `send_all()` 调用中追加负载字节。
-- 非剪贴板事件使用 `push_*()`——固定大小，无尾随数据。
+device facade payload 上限为 **1 MiB**（`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`），异步 output queue 总上限为 **2 MiB**。这些是实现限制，不是协商得到的协议功能。
 
 ```c
-// ✅ Correct: clipboard with variable‑length payload
-struct InputEvent ev = { .type = INPUT_TYPE_CLIPBOARD, .clipboard.size = len };
-push_input_event_with_length(ctx, &ev, text, len);
-
-// ❌ WRONG: sending clipboard without trailing data
-push_input_event(ctx, &ev);  // consumer receives event but NO payload → stream corruption
+/* 事件循环模式示意，不是独立合成器。 */
+int rc = anland_device_queue_clipboard(dev, text, size);
+if (rc < 0) {
+    /* ENOBUFS：保持会话，下次重试最新 selection。
+       其他错误：执行 adapter 的会话／错误处理。 */
+}
+/* 在可写通知后，以及单轮预算限制留下 pending 后继续驱动： */
+rc = anland_device_flush_output(dev); /* 0 已排空，1 pending，-1 丢失 */
+/* pending_output(dev) 非零时保留 POLLOUT。
+   不得自行向 anland_device_data_fd(dev) 写入。 */
 ```
 
-### 6.3 接收规则
+producer 所有写入共用队列顺序，包括同步 API。入队 `ENOBUFS` 不修改 queue，也不脱离会话。同步 `push_output_event*()` 路径使用 10ms 完整写入期限；背压／部分失败会脱离会话以保护分帧。它是有界同步 I/O，不是异步 queue。selection epoch 与强引用 owner 应防止延迟 offer 覆盖更新的剪贴板。
 
-当 `poll_input_event()` 或 `poll_output_event()` 返回 `type == INPUT_TYPE_CLIPBOARD`
-或 `type == OUTPUT_TYPE_CLIPBOARD` 的事件时，接收者**必须**调用
-`poll_input_event_extend_data()` 或 `poll_output_event_extend_data()` 排空尾随负载，
-即使打算丢弃数据。
+### 10.3 摄像头资源生命周期
 
-**生产端:**
-
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_CLIPBOARD:
-        // Option A: use the data
-        poll_input_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setSystemClipboard(buf, ev.clipboard.size);
-        break;
-    case INPUT_TYPE_DISPLAY_REFRESH:
-        output->setRefreshRate(ev.display.refresh_mhz);
-        break;
-    // ... other fixed‑size events ...
-    default:
-        handle_unhandled_event(ctx, &ev);  // MUST drain unknown variable‑length events
-        break;
-    }
-}
+```text
+WM -> request_resources(CAMERA, args)
+consumer -> 分配服务 -> RESOURCE(type, fdnum)
+consumer -> INPUT_EXTEND_FDS(ctrl_fd, stream_fd[...])
+WM -> 校验数量／布局 -> anland_camera_set_resources(...)
+Linux app 打开虚拟摄像头 -> 开始录制
+app 停止／会话丢失 -> 停止录制并释放资源
 ```
 
-**消费端:**
+consumer 库通过 `allocate_services()` 注册 `service_info` 分配／释放回调，通过 `handle_resource_request()` 处理 `OUTPUT_TYPE_RESOURCES_REQUEST`。`service_info.userdata` 识别所属连接，不必使用全局状态。
 
-```c
-struct OutputEvent ev;
-if (poll_output_event(ctx, &ev, 100) > 0) {
-    switch (ev.type) {
-    case OUTPUT_TYPE_CLIPBOARD:
-        poll_output_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setAndroidClipboard(buf, ev.clipboard.size);
-        break;
-    default:
-        handle_unhandled_event(ctx, &ev);  // MUST drain unknown variable‑length events
-        break;
-    }
-}
-```
+`anland_camera_start()` 启动引擎；`set_resources()` **接管** control 和 stream FD。第一个是 control socket，随后每个摄像头一个 stream socket。节点是动态的：`clear()` 停止采集、移除节点并关闭接管 FD；`stop()` 同时销毁引擎。当前 camera 头文件描述 I420 帧和按应用需求启动录制。它与持久音频节点不同，仅在 WM 实际接线后可用。
 
-### 6.4 排空未处理事件
+<a id="section-11"></a>
 
-两个库都提供 `handle_unhandled_event()`，用于排空调用者未处理的已知变长事件类型
-的尾随负载。**此函数是必须的**——对于未处理的剪贴板事件，不调用它（或 `*_extend_data()`）
-会在 socket 缓冲区中留下字节并损坏流。
+## 11. 握手与恢复状态机
 
-```c
-// Producer: drain unhandled consumer events
-void handle_unhandled_event(display_ctx *ctx, const struct InputEvent *event) {
-    switch (event->type) {
-    case INPUT_TYPE_CLIPBOARD:
-        if (event->clipboard.size > 0) {
-            void *payload = malloc(event->clipboard.size);
-            if (payload) {
-                poll_input_event_extend_data(ctx, payload, event->clipboard.size, 1000);
-                free(payload);
-            }
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-// Consumer: drain unhandled producer events
-void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event) {
-    switch (event->type) {
-    case OUTPUT_TYPE_CLIPBOARD:
-        if (event->clipboard.size > 0) {
-            void *payload = malloc(event->clipboard.size);
-            if (payload) {
-                poll_output_event_extend_data(ctx, payload, event->clipboard.size, 1000);
-                free(payload);
-            }
-        }
-        break;
-    default:
-        break;
-    }
-}
-```
-
----
-
-## 7. 稳态帧循环
-
-双方退出 fallback 后，每一帧的交换都**不再经过守护进程**——通过共享 `shm` 页、
-`buf_ready_efd` 与**专用 fence 通道**（socketpair）完成。V3 在数据通道上新增了
-剪贴板交换，但这些是**异步的，不影响帧节奏**。
+### 11.1 producer 分阶段连接
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant C as Consumer 消费端
-    participant SHM as shm index 索引页
-    participant P as Producer 生产端
-
-    Note over C,P: one‑time, right after handshake 握手后一次性
-    C->>P: BUFS_READY + dmabuf fds (data channel)
-    P-->>P: import dmabufs 导入缓冲区
-
-    loop per frame 每帧
-        C->>SHM: write selected index 写入选中下标 (select_dmabuf)
-        C-->>P: eventfd_write(buf_ready_efd)
-        P->>SHM: read index 读取下标 (get_selected_idx)
-        P-->>P: render into dmabuf[idx] 渲染到该缓冲区
-        P-->>C: sendmsg(fence_fd, 1 byte ± fence fd via SCM_RIGHTS)  (trigger_refresh)
-        C-->>C: recvmsg(fence_fd) → get fence fd 获取栅栏 fd (refresh_done)
-        C->>C: queueBuffer(fence_fd) → SurfaceFlinger waits GPU-side
-    end
-
-    Note over C,P: input flows the other way 输入反向流动
-    C->>P: INPUT_EVENT (data channel, poll_input_event)
-
-    Note over C,P: (V3) clipboard flows bidirectionally 剪贴板双向流动
-    C-->>P: INPUT_EVENT(INPUT_TYPE_CLIPBOARD) + payload
-    P-->>C: OUTPUT_EVENT(OUTPUT_TYPE_CLIPBOARD) + payload
-
-    Note over C,P: (V2) consumer reports display refresh rate 刷新率上报
-    C-->>P: INPUT_EVENT(INPUT_TYPE_DISPLAY_REFRESH, mHz)
-    P-->>P: update RenderLoop pacing 调整渲染节拍
-```
-
-- `select_dmabuf(idx)` → 写入下标并触发信号。
-- producer 被唤醒后读下标、渲染、可选存 fence、再调用 `trigger_refresh()`。
-- `trigger_refresh()` 在 fence socketpair 上发送 1 字节 + 可选 SCM_RIGHTS fence fd。
-- `refresh_done()` 在 fence 通道上等待，**5 秒**超时即进入 fallback，
-  读取消息后返回 fence fd（或 `-1` 无 fence）。
-
-### 7.1 剪贴板交换（V3）
-
-剪贴板数据通过数据通道**双向**交换，采用两包协议：一个**头部**包（带 `clipboard.size`
-的 `InputEvent` / `OutputEvent`）后跟**负载**字节。
-
-**Consumer → Producer** (via `push_input_event_with_length`):
-
-| 步骤 | 发生了什么 |
-|------|------------|
-| 1 | Consumer 调用 `push_input_event_with_length(ctx, &clipboard_event, data, len)` |
-| 2 | 库发送 `DATA_MSG_INPUT_EVENT` with `type=INPUT_TYPE_CLIPBOARD`, `size=len` |
-| 3 | 立即发送 `len` 字节原始剪贴板负载（同一次 `send_all()` 调用） |
-| 4 | Producer 通过 `poll_input_event()` 接收 → 看到 `INPUT_TYPE_CLIPBOARD` → 调用 `poll_input_event_extend_data()` |
-
-**Producer → Consumer** (via `push_output_event_with_length`):
-
-| 步骤 | 发生了什么 |
-|------|------------|
-| 1 | Producer 调用 `push_output_event_with_length(ctx, &clipboard_event, data, len)` |
-| 2 | 库发送 `DATA_MSG_OUTPUT_EVENT` with `type=OUTPUT_TYPE_CLIPBOARD`, `size=len` |
-| 3 | 立即发送 `len` 字节原始剪贴板负载（同一次 `send_all()` 调用） |
-| 4 | Consumer 事件线程通过 `poll_output_event()` 接收 → 看到 `OUTPUT_TYPE_CLIPBOARD` → `poll_output_event_extend_data()` |
-
-> [!NOTE]
-> **回声保护**: 为防止剪贴板回声循环，consumer 跟踪最近发送的剪贴板文本，不会重新发送从 producer
-> 接收到的文本。
-
----
-
-## 8. 握手流程
-
-守护进程**解耦了连接顺序**：consumer 与 producer 可以任意先后连接。先到者会被暂存，
-直到另一端出现。**握手线上协议与 V2 相同。**
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Consumer 消费端
-    participant D as Daemon 守护进程
-    participant P as Producer 生产端
-
-    Note over C,D: Consumer registers & deposits resources<br/>消费端注册并寄存资源
-    C->>D: CONSUMER_HELLO  + [buf_ready, fence, data_end, shm]
-    D-->>D: store deposited fds 暂存 fd
-    C->>D: SCREEN_INFO (w,h,format,refresh)
-    D-->>D: store screen_info 暂存屏幕参数
-
-    Note over P,D: Producer registers (any time)<br/>生产端注册（任意时刻）
+    participant C as Android consumer
+    participant D as Daemon
+    participant P as Public producer
+    participant W as WM adapter
+    C->>D: CONSUMER_HELLO + 5 FDs
+    C->>D: SCREEN_INFO
     P->>D: PRODUCER_HELLO
-    alt screen_info already known 已知屏幕参数
-        D->>P: SCREEN_INFO
-    else not yet 尚未获得
-        D-->>D: producer_waiting_screen = true
-        Note over D,P: forwarded as soon as the consumer sends it<br/>一旦 consumer 发来即转发
-    end
-
-    Note over C,P: Reconnect loop discovers the peer<br/>重连循环发现对端 (see §10)
-    loop every RECONNECT_INTERVAL_MS (200ms)
-        P->>D: PICKUP_FDS
-        alt deposited fds present (≥4) 已有寄存 fd
-            D->>P: FDS_READY + [buf_ready, fence, data_end, shm]
-            D->>C: FDS_READY (notify 通知)
-            C->>P: BUFS_READY + dmabuf fds (over data channel 数据通道)
-            Note over C,P: both leave fallback 双方退出 fallback
-        else none yet 暂无
-            D--xP: timeout 超时 → retry next tick 下一拍重试
-        end
-    end
+    D-->>P: SCREEN_INFO (when available)
+    W->>P: readiness or bounded retry drives reconnect/pump
+    P->>D: PICKUP_FDS
+    D-->>P: FDS_READY + 5 FDs
+    D-->>C: FDS_READY notification
+    C->>P: BUFS_READY + metadata + dma-buf FDs
+    C->>P: select index and signal buffer-ready
+    P-->>W: OUTPUT_CHANGED / RENDER_TARGET_READY
+    W->>W: validate and import current generation
 ```
 
-### 屏幕参数锁
+注册顺序不固定，图中仅是一种顺序。严格 `connect_to_deamon()` 等待 screen info，没有 consumer 到达期限。`connect_to_deamon_deferred()`／`defer_connector=true` 允许缺少 connector 时启动，但不伪造 mode。等待会阻塞 WM 的原生回调应使用 deferred／事件驱动路径。
 
-守护进程保存**第一份** `screen_info`。之后若有 consumer 提交**不同**的几何参数，会收到
-`CTRL_MSG_REJECT` 并被断开——会话被锁定为单一显示模式（见 `daemon.c` 的
-`handle_client_data`）。
+`try_exit_fallback()` 当前是**非阻塞分阶段握手**，不是旧版反复阻塞 100ms 的 pickup/read。部分 screen、pickup、buffer record 保留跨重试。公共头文件规定 **pickup 到 metadata 的总期限为 3 秒**，不是每次 read 各 3 秒，也不是 consumer 到达统一限 3 秒。`EAGAIN` 表示 pending；EOF／协议／期限错误释放部分资源。歧义控制回复还会关闭 daemon 连接。pool 领取成功仍不证明已有可写选中目标。
 
----
-
-## 9. 状态机
-
-两端都以 **`fallback`** 状态启动，且**只能通过守护进程反复尝试握手来发现彼此**。两端之间
-没有直接连接，也没有"对端在线"的通知——发现对端**就等于**一次成功的重连尝试。
-**状态机与 V2 相同。**
-
-### 9.1 生产端状态机
-
-`connect_to_deamon()` **只**完成守护进程握手（取得 `screen_info`），随后刻意停留在
-fallback。backend 再以定时器（`RECONNECT_INTERVAL_MS = 200 ms`）轮询 `try_exit_fallback()`。
+### 11.2 producer 生命周期
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Disconnected
-
-    Disconnected --> Fallback: connect_to_deamon() OK<br/>got screen_info 取得屏幕参数
-    Disconnected --> [*]: connect failed 连接失败
-
-    Fallback --> Fallback: try_exit_fallback() == -1<br/>no consumer yet · 无 consumer<br/>wait 200ms then retry 等待后重试
-    Fallback --> Connected: try_exit_fallback() == 0<br/>fds + dmabufs in hand 拿到 fd 与缓冲区
-
-    Connected --> Connected: render frames 渲染帧
-    Connected --> Fallback: consumer lost 对端丢失<br/>POLLHUP / send fail → enter_fallback()
-
-    note right of Fallback
-        timer polls every 200ms
-        定时器每 200ms 轮询一次
-    end note
+    [*] --> ControlConnecting
+    ControlConnecting --> WaitingConsumer: HELLO accepted
+    ControlConnecting --> RetryControl: daemon unavailable
+    RetryControl --> ControlConnecting: bounded reopen retry
+    WaitingConsumer --> WaitingConsumer: screen/pickup/pool pending
+    WaitingConsumer --> Importing: complete live buffer pool
+    Importing --> Active: valid imports and writable target
+    Importing --> WaitingConsumer: drop invalid session
+    Active --> Active: render, commit, feedback, release
+    Active --> WaitingConsumer: consumer loss / session drop
+    Active --> RetryControl: daemon control lost
+    WaitingConsumer --> RetryControl: daemon control lost
+    Active --> Stopped: explicit teardown
+    Stopped --> [*]
 ```
 
-`try_exit_fallback()` 是**两步且原子**的——只有两步**都**成功才会清除 fallback
-（见 `display_producer.c`）：
+`anland_device_connect_result()` 区分 `READY`、`NO_CONSUMER`、`DAEMON_LOST`；永久轮询 consumer pickup 无法恢复死去的 daemon 连接。`reopen()` 保留公共 device/scene owner 并替换控制连接；`reconnect()` 在原控制连接上领取 consumer。scene invalidate 保留 layer 身份，但不保留旧 target／import generation。
 
-1. **`pickup_fds()`** — 发送 `PICKUP_FDS`，轮询 `ctrl_fd` (100 ms) 等待 `FDS_READY`，
-   收到 4 个 fd 并 `mmap` 索引页。
-2. **`receive_dmabufs()`** — 轮询 `data_fd` (100 ms) 等待 `BUFS_READY`，保存缓冲区集合。
-
-任意步骤失败 → `release_consumer_resources()` 并留在 fallback，可在下一拍安全重试。
-
-### 9.2 消费端状态机
-
-consumer 在 `connect_to_deamon()` 时创建资源并寄存，初始为 fallback。它**惰性**退出
-fallback：每次 `select_dmabuf()` 先调用 `try_exit_fallback()`，仅检查守护进程是否已转发
-`FDS_READY`（即刚有 producer 取走了 fd）。
+### 11.3 consumer 生命周期
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fallback: connect_to_deamon()<br/>create resources + deposit fds<br/>创建资源并寄存 fd
-
-    Fallback --> Fallback: no FDS_READY yet 暂无<br/>(select_dmabuf is a no‑op 空操作)
-    Fallback --> Connected: FDS_READY seen 收到通知<br/>→ push_dmabufs() 推送缓冲区
-
-    Connected --> Connected: select / refresh frames 选帧/呈现
-    Connected --> Fallback: send fail · 发送失败<br/>refresh timeout 5s · 刷新超时<br/>→ enter_fallback()
-
-    note right of Fallback
-        enter_fallback() rebuilds eventfd/socketpair/shm
-        and re‑sends CONSUMER_HELLO (re‑deposits)
-        重建 eventfd/socketpair/shm 并重新 HELLO 寄存
-    end note
+    [*] --> Fallback: connect and deposit resources
+    Fallback --> Fallback: no FDS_READY yet
+    Fallback --> Connected: select_dmabuf sees pickup / sends buffer set
+    Connected --> Connected: select target / await frame message
+    Connected --> Fallback: channel failure / frame wait timeout
+    Fallback --> [*]: explicit disconnect
 ```
 
-> [!NOTE]
-> **V3 新增**：consumer 提供 `set_exit_fallback_callback()`，允许宿主应用在 producer
-> 重连时作出反应（如启动事件线程、同步剪贴板）。这是**可选的**，不改变状态机。
+consumer 在 `select_dmabuf()` 中惰性尝试退出 fallback。已连接时 `push_dmabufs()` 更新存储 pool 后触发 fallback／重新寄存，不会悄悄替换正在使用的 producer 导入。fallback 重建 eventfd、索引页与 socketpair，释放服务资源；回调允许应用停止／恢复相关 worker。
 
----
+`refresh_done()` 最长等待 fence 通道消息 **5 秒**。返回的 fence FD 属于调用者，可按 Android queue API 的所有权规则移交。`-1` 可能表示有效交接但无 fence、没有 pending frame，或错误／fallback，**不是**通用成功布尔值。daemon 重启还要求应用恢复控制连接；只重建 consumer 本地 socketpair 不能复活死去的 control FD。
 
-## 10. 断连与恢复
+<a id="section-12"></a>
 
-| 事件 | 检测方 | 反应 |
-|------|--------|------|
-| Producer 丢失 consumer | `POLLHUP`/`POLLERR` on `data_fd`, 或发送失败 | `enter_fallback()`: 释放 consumer 资源，触发回调，恢复 200 ms 重连定时器 |
-| Consumer 失去 producer | 发送失败或 5 秒 `refresh_done` 超时 | `enter_fallback()`: 拆除并重建 eventfd/socketpair/shm，重新发送 `CONSUMER_HELLO`（重新寄存） |
-| Consumer 会话中重连 | daemon 收到带 ≥3 fd 的 `CONSUMER_HELLO` | 替换已寄存的 fd；若有 producer 正在等待则立即交付 |
-| 任一端重连 | 新的 `*_HELLO` | daemon 释放该角色的旧连接并接纳新连接 |
+## 12. 逐帧传输与 scene 反馈
 
----
-
-## 11. 设计要点
-
-- **单一重连路径** — 启动与恢复都汇入 `try_exit_fallback()`，没有单独的"首次连接"逻辑
-- **原子退出** — producer 必须同时拿到 fd 与 dmabuf 才退出 fallback，从而可立即导入并渲染
-- **守护进程不在热路径** — 它只负责握手，之后每帧仅用 shm + eventfd + fence 通道，零守护进程往返
-- **非阻塞握手** — 握手轮询采用较短的 100 ms 超时，保证无 consumer 时 producer 的重连循环仍然灵敏
-- **显示模式锁** — 以第一份 `screen_info` 为准，参数不符的 consumer 会被拒绝
-- **GPU 侧 fence 同步** — producer 通过 `SCM_RIGHTS` 传递真实的 dma-buf sync-file fence；consumer 将其交给 SurfaceFlinger，消除了 CPU 端 `glFinish()` 阻塞
-- **双向剪贴板（V3）** — 剪贴板数据通过数据通道双向流动，使用头部 + 负载两包协议。回声保护防止循环。变长事件要求所有接收者排空尾随负载
-- **必须排空协议** — 任何带变长负载的事件类型（目前为剪贴板）**必须**通过 `handle_unhandled_event()` 或 `*_extend_data()` 排空，即使调用者不关心数据。否则会损坏数据通道流
-
----
-
-## 12. V2 至 V3 API 变更
-
-### 12.1 Producer 库 (`libdisplay_producer`) — **API 与 ABI 均不兼容**
-
-| 函数 | V2 | V3 | 兼容性 |
-|------|----|----|--------|
-| `connect_to_deamon()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `disconnect()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `get_screen_info()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `trigger_refresh()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `set_render_fence()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `push_output_event()` | 相同签名 | 相同签名 | ⚠️ **不得用于剪贴板**（变长事件必须用 `push_output_event_with_length()`） |
-| `is_fallback()` / `try_exit_fallback()` / `set_fallback_callback()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `poll_input_event()` | 相同签名 | 相同签名 | ⚠️ **行为变化**：可能返回 `INPUT_TYPE_CLIPBOARD`，调用者必须处理或调用 `handle_unhandled_event()` 排空 |
-| `get_data_fd()` / `get_buffer_ready_fd()` / `get_buf_count()` / `get_selected_idx()` / `get_dmabuf_fd()` / `get_dmabuf_fd_at()` / `get_dmabuf_info()` / `get_dmabuf_info_at()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `poll_input_event_extend_data()` | — | **V3 新增**：排空变长输入事件的尾随负载 | ❌ **必须实现**：处理 `INPUT_TYPE_CLIPBOARD` 时必须调用 |
-| `push_output_event_with_length()` | — | **V3 新增**：发送变长输出事件（剪贴板） | ✅ 新增 API |
-| `handle_unhandled_event()` | — | **V3 新增**：排空未处理的变长事件 | ❌ **必须调用**：收到未处理的变长事件时必须调用以排空流 |
-
-> **Producer 不兼容说明**：V2 producer 的 `poll_input_event()` 签名不变但行为变化——V3 consumer 可能发送 `INPUT_TYPE_CLIPBOARD` 变长事件。不排空尾随负载会导致 data channel 流损坏。
-
-### 12.2 Consumer 库 (`libdisplay_consumer`) — **API 与 ABI 均不兼容**
-
-| 函数 | V2 | V3 | 兼容性 |
-|------|----|----|--------|
-| `connect_to_deamon()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `refresh_done()` | 返回 fence fd (>=0 or -1) | 相同签名 | ✅ 不变 |
-| `push_dmabufs()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `select_dmabuf()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `set_screen_info()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `set_fallback_callback()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `disconnect()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `push_input_event()` | 相同签名 | 相同签名 | ⚠️ **不得用于剪贴板**（变长事件必须用 `push_input_event_with_length()`） |
-| `poll_output_event()` | — | **V3 新增**：轮询 producer→consumer 输出事件 | ✅ 新增 API |
-| `push_input_event_with_length()` | — | **V3 新增**：发送变长输入事件（剪贴板） | ✅ 新增 API |
-| `poll_output_event_extend_data()` | — | **V3 新增**：排空变长输出事件的尾随负载 | ✅ 新增 API |
-| `set_exit_fallback_callback()` | — | **V3 新增**：producer 重连时回调 | ✅ 新增 API |
-| `get_data_fd()` | — | **V3 新增**：获取 data channel fd | ✅ 新增 API |
-| `handle_unhandled_event()` | — | **V3 新增**：排空未处理的变长事件 | ❌ **必须调用**：收到未处理的变长事件时必须调用以排空流 |
-
-> **Consumer 不兼容说明**：V3 producer 可能发送 `DATA_MSG_OUTPUT_EVENT`（103）+ 剪贴板变长负载。V2 consumer 没有 `poll_output_event()`，无法读取这些消息，导致 data channel 流损坏。
-
-### 12.3 线上协议 — **不兼容**
-
-| 方面 | V2 | V3 | 兼容性 |
-|------|----|----|--------|
-| `DATA_MSG_OUTPUT_EVENT` (103) | 不存在 | 新增 | ❌ V2 consumer 无法识别 |
-| `INPUT_TYPE_CLIPBOARD` (8) | 不存在 | 新增 | ❌ V2 producer 不排空尾随负载 |
-| `OUTPUT_TYPE_CLIPBOARD` | 不存在 | 新增 | ❌ 同上 |
-| 变长负载 | 不存在 | `clipboard.size` + trailing bytes | ❌ 固定大小接收者无法处理 |
-| `struct InputEvent` | 7 种类型 (union size = 20B) | 8 种类型 (union size 不变) | ✅ 结构体大小不变 |
-| `struct OutputEvent` | 不存在 | 新增 (20B) | ❌ V2 无此结构体 |
-| `struct buf_info` | `{ stride, width, height, format, modifier, offset }` | 相同 | ✅ 不变 |
-| 控制消息 | 全部不变 | 全部不变 | ✅ |
-
-### 12.4 Daemon — **无需更新**
-
-| 方面 | 说明 |
-|------|------|
-| fd 中继 | Daemon 通过 `SCM_RIGHTS` 存储/转发 fd，**不感知**单个 fd 的语义 |
-| 槽位数 | V2 与 V3 consumer 都寄送 **4** 个 fd |
-| ctrl_msg 类型 | 所有消息类型不变 |
-| **结论** | **daemon 零改动，直接复用二进制** |
-
----
-
-## 13. 兼容性总结
-
-| 组件 | 兼容性 | 是否需要修改 |
-|------|--------|-------------|
-| **Producer 库** | **不兼容** | **必须修改**：添加 `INPUT_TYPE_CLIPBOARD` 处理或调用 `handle_unhandled_event()` |
-| **Consumer 库** | **不兼容** | **必须修改**：添加 `poll_output_event()` 调用或调用 `handle_unhandled_event()` |
-| **Daemon** | **完全兼容** | 零修改 |
-| **线上协议** | **不兼容** | V3 引入变长事件和新消息类型 (103) |
-
-### 跨版本互操作
-
-| 场景 | 结果 |
-|------|------|
-| V3 producer + V3 consumer | ✅ **正常工作** — 双向剪贴板、显示刷新率、运行时分辨率变更均可用 |
-| V2 producer + V3 consumer | ❌ **流损坏** — V3 consumer 可能发送 `INPUT_TYPE_CLIPBOARD` 变长事件，V2 producer 的 `poll_input_event()` 不排空尾随负载 |
-| V3 producer + V2 consumer | ❌ **流损坏** — V3 producer 可能发送 `DATA_MSG_OUTPUT_EVENT`(103) 变长事件，V2 consumer 无法读取 |
-| V2 producer + V2 consumer | ✅ **正常工作** — 与 V2 行为一致 |
-| V1 producer + V3 `libdisplay_producer.so` | ❌ **流损坏** — V1 producer 调用 `poll_input_event()` 获取触摸/按键事件，当 V3 consumer 发送 `INPUT_TYPE_CLIPBOARD` 变长事件时，V1 代码不排空尾随负载 |
-| V1 producer + V3 consumer（无剪贴板） | ⚠️ **有条件正常** — 若 V3 consumer 从不发送剪贴板事件则不触发；但无法保证 |
-| V1 consumer + V3 `libdisplay_consumer.so` | ❌ **不兼容** — `refresh_done()` 返回 fence fd（V2 变更） |
-| V3 daemon + V2/V3 producer/consumer | ✅ **正常工作** — daemon 不感知 fd 语义 |
-
-> [!CAUTION]
-> **V2/V1 producer 与 V3 consumer 混用会流损坏**：即使 V2/V1 producer 代码链接了 V3 库，如果其事件处理循环不调用 `handle_unhandled_event()`，当 V3 consumer 发送剪贴板事件时，`poll_input_event()` 只读取了固定大小的 `InputEvent` 结构体，尾随负载字节留在 socket 缓冲区中，data channel 流将被损坏。**必须修改应用代码**。
->
-> **V2 consumer 无法与 V3 producer 混用**：V2 consumer 没有 `poll_output_event()` 函数，无法读取 V3 producer 发送的 `DATA_MSG_OUTPUT_EVENT`(103) 消息。**必须升级库并修改代码**。
-
----
-
-## 14. 迁移指南
-
-### 14.1 Producer — **必须修改事件处理代码**
-
-V2 producer 代码**必须修改**以处理 V3 变长事件：
-
-**V2 代码（不兼容）：**
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_TOUCH:
-        handle_touch(&ev.touch);
-        break;
-    case INPUT_TYPE_KEY:
-        handle_key(&ev.key);
-        break;
-    // ... 其他固定大小事件 ...
-    // ❌ 缺少 INPUT_TYPE_CLIPBOARD 处理 → 流损坏
-    }
-}
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant P as Public scene/present
+    participant W as WM renderer
+    C->>P: shared index + buffer-ready signal
+    P-->>W: RENDER_TARGET_READY(generation, slot, count)
+    W->>W: obtain writable target and render that slot
+    W->>P: commit(states, acquire fence) -> commit_id
+    W->>P: present()
+    P-->>C: one frame-done byte + optional fence FD
+    C->>C: queue rendered buffer with fence
+    C->>P: next selection / buffer-ready
+    P-->>W: PRESENTED(commit_id): consumer acknowledgement
+    P-->>W: BUFFER_RELEASED when safe (separate lifetime decision)
+    P-->>W: RENDER_TARGET_READY for current work
 ```
 
-**V3 代码（兼容）：**
-```c
-struct InputEvent ev;
-if (poll_input_event(ctx, &ev, 16) > 0) {
-    switch (ev.type) {
-    case INPUT_TYPE_TOUCH:
-        handle_touch(&ev.touch);
-        break;
-    case INPUT_TYPE_KEY:
-        handle_key(&ev.key);
-        break;
-    case INPUT_TYPE_DISPLAY_REFRESH:
-        output->setRefreshRate(ev.display.refresh_mhz);
-        break;
-    case INPUT_TYPE_CLIPBOARD:
-        poll_input_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-        setSystemClipboard(buf, ev.clipboard.size);
-        break;
-    default:
-        handle_unhandled_event(ctx, &ev);  // 必须排空未知变长事件
-        break;
-    }
-}
-```
+最后几种事件描述不同事实，不保证通用的固定顺序。retention／同步可能延迟释放，不能因为上一 commit 已 ACK 就覆盖下一个 target。即使静态桌面没有新 client damage，也需响应有效 consumer target 请求。
 
-**升级步骤：**
-
-1. 拷贝新的 `display_producer.{c,h}`、`protocol.h`、`socket_utils.{c,h}` 到源码树
-2. 在 `poll_input_event()` 的事件处理循环中添加 `INPUT_TYPE_CLIPBOARD` 分支
-3. 对未处理的事件类型调用 `handle_unhandled_event()` 排空变长负载
-4. 可选使用 `push_output_event_with_length()` 向 consumer 发送剪贴板数据
-
-### 14.2 Consumer — **必须升级库并添加事件线程**
-
-V2 consumer 代码**必须升级**以处理 V3 producer 发送的输出事件：
-
-**升级步骤：**
-
-1. 使用新的 `display_consumer.{c,h}` 和 `protocol.h` 替换旧文件
-2. 启动事件线程轮询 `poll_output_event()`
-3. 处理 `OUTPUT_TYPE_CLIPBOARD` 或调用 `handle_unhandled_event()` 排空
-4. 可选使用 `push_input_event_with_length()` 向 producer 发送剪贴板数据
-5. 可选注册 `set_exit_fallback_callback()` 在 producer 重连时同步剪贴板
+### 12.1 构造 layer state
 
 ```c
-// V3 consumer 事件线程
-void *event_thread_func(void *arg) {
-    display_ctx *ctx = arg;
-    while (connected) {
-        struct OutputEvent ev;
-        if (poll_output_event(ctx, &ev, 100) > 0) {
-            switch (ev.type) {
-            case OUTPUT_TYPE_CLIPBOARD:
-                poll_output_event_extend_data(ctx, buf, ev.clipboard.size, 1000);
-                setAndroidClipboard(buf, ev.clipboard.size);
-                break;
-            default:
-                handle_unhandled_event(ctx, &ev);
-                break;
-            }
-        }
-    }
+/* 示意：渲染、导入、错误处理仍由 WM 原生实现负责。 */
+anland_de_target_t target;
+if (anland_de_backend_get_writable_target(backend, &target) != 0)
+    return; /* 保留 repaint，等待就绪 */
+
+/* 渲染到 (target.generation, target.index) 对应导入对象。
+   生成 acquire_fd，或明确等待 GPU 完成。 */
+anland_layer_state_t state = {
+    .layer_id = desktop_layer,
+    .buffer_id = (uint64_t)target.index + 1, /* 当前全屏 adapter 约定 */
+    .destination = {0, 0, target.width, target.height},
+    .opacity = 1.0f,
+    .visible = true,
+    .acquire_fence_fd = acquire_fd, /* 仅已就绪时为 -1 */
+};
+/* 渲染后，调用前重新核对 generation/index。 */
+uint64_t commit_id;
+if (anland_de_backend_commit(backend, &state, 1, &commit_id) == 0) {
+    /* 先登记 commit_id -> native frame，即使之后 present 失败。 */
+    int result = anland_de_backend_present(backend);
+    /* 处理 result，并继续排空 drop/release 反馈。 */
 }
+/* Scene commit 借用 acquire_fd；调用者按契约关闭其拥有 FD。 */
 ```
 
-### 14.3 Daemon — **无需更新**
+`source.width=0` 表示完整 source。可见且有 buffer 的 layer 必须有非零 destination 尺寸。layer ID 非零且不透明；`buffer_id=0` 表示无 buffer。`slot+1` 是当前全屏映射，不是未来通用 buffer ABI。`damage=NULL, damage_count=0` 表示完整 source rectangle。此例特意省略原生渲染及 FD 清理实现，不是可直接替换后端的完整代码。
 
-直接复用 V2 的 daemon 二进制即可。
+### 12.2 三种不同 fence 所有权
 
----
+| API 边界 | 所有权 |
+|---|---|
+| Scene/DE commit 的 `acquire_fence_fd` | 调用期间借用，公共 backend 需保留时自行 dup |
+| `anland_device_set_render_fence()`／原始 `set_render_fence()` | 接管传入 FD |
+| `anland_scene_dispatch()` release event／consumer `refresh_done()` 输出 | 接收者拥有返回 FD |
 
-## 15. 源码索引
+同一帧不可混用原始 split-frame `set_render_fence()+trigger_refresh()` 与 device `pageflip()`。新 WM 帧路径应使用 DE facade，不用底层 helper 绕过其记账。先安全退休资源，再移除同步状态；release 等待／导入失败应隔离图像或停止输出，不是关闭 FD 后假定完成。
 
-| 区域 | 文件 | 变更 |
-|------|------|------|
-| 协议常量 | [common/protocol.h](common/protocol.h) | `INPUT_TYPE_CLIPBOARD`(8)、`OUTPUT_TYPE_CLIPBOARD`(1)、`DATA_MSG_OUTPUT_EVENT`(103)、`struct OutputEvent` |
-| 收发与 fd 传递 | [common/socket_utils.c](common/socket_utils.c) | 不变 |
-| 中介 | [daemon/daemon.c](daemon/daemon.c) | **不变** |
-| **消费端库** | [libdisplay_consumer/display_consumer.c](libdisplay_consumer/display_consumer.c) | 新增：`push_input_event_with_length()`、`poll_output_event()`、`poll_output_event_extend_data()`、`set_exit_fallback_callback()`、`get_data_fd()`、`handle_unhandled_event()` |
-| **生产端库** | [libdisplay_producer/display_producer.c](libdisplay_producer/display_producer.c) | 新增：`poll_input_event_extend_data()`、`push_output_event()`、`push_output_event_with_length()`、`get_dmabuf_fd_at()`、`get_dmabuf_info_at()`、`handle_unhandled_event()` |
-| **V3 consumer 应用** | [consumers/anland_v3/](consumers/anland_v3/) | 双向剪贴板、事件线程、回声保护 |
-| **V3 KWin 补丁** | [producers/kde/ubuntu2604_v3/](producers/kde/ubuntu2604_v3/) | 最小化集成补丁（~70 行），backend 源文件通过 overlay 机制预置 |
+<a id="section-13"></a>
 
----
+## 13. API 索引与返回契约
 
-## 历史文档
+| API 层 | 主要操作 | 重要返回／生命周期规则 |
+|---|---|---|
+| Desktop facade | `create/destroy`、`add_window_desc/update_window/remove_window`、`commit/present/pump/dispatch` | 正常 WM 接入的 owner，accessor 返回借用对象 |
+| Target/output | `get_target/get_writable_target/get_output`、`buffer_fd` | target 查询返回 0/-1，复制 buffer FD 属于调用者 |
+| Presentation | `connected/target_available/renderable`、`reconnect/reopen/drop_session` | connected 不等于 renderable |
+| Scene layer | `layer_create/update/destroy/count` | scene 生命周期内 ID 稳定，销毁 layer 会 drop 关联 commit |
+| Scene transaction | `commit_submit`、`commit_is_pending`、`invalidate/generation` | accepted != presented != released；查询不是跨线程预留锁 |
+| Scene feedback | `event_fd`、`dispatch`、`pending_events` | dispatch 排空 eventfd，调用者不能提前自行排空 |
+| Device session | `open/open_deferred`、`connect_result`、`is_daemon_alive`、`reopen` | 区分无 consumer 与 daemon 死亡 |
+| 原生 image view | `fb_count`、`get_fb/get_drm_fb`、`current_fb_raw` | 格式域不同，调用者关闭复制 FD |
+| 输入 | `poll_input/read_input/read_fds` | 1 完成，0 pending/无事件，-1 丢失；先消费扩展再读新头 |
+| 异步输出 | `queue_clipboard`、`flush_output`、`pending_output` | 入队 0 接受；flush 0 排空／1 pending／-1 丢失 |
+| 媒体 | audio `start/set_fd/stop`；camera `start/set_resources/clear/stop` | audio 复制借用 socket，camera 接管资源 FD |
+| Consumer | `connect_to_deamon`、`set_screen_info`、`push_dmabufs`、`select_dmabuf`、`refresh_done` | 注册、pool 发布、选择与等待帧完成相互分离 |
 
-| 版本 | 文档 |
-|------|------|
-| V1 | [doc/History/v1.md](doc/History/v1.md) |
-| V2 | [doc/History/v2.md](doc/History/v2.md) |
+Scene backend reporting（`backend_handed_off/presented/dropped/release_buffer/...`）是公共 present backend 实现契约的一侧，不是让 WM 复制第二套传输。`anland_scene_backend_release_buffer()` 在**所有返回路径**接管 release FD，与 commit 的借用 fence 不同。
 
----
+当前限制包括 32 个 scene layer、每个 layer snapshot 8 个 damage rect、64 字节名称容量、64 条 scene event queue，以及独立有界的 1024 条 release notification 容量。适配时查阅头文件常量与真实溢出处理；这些限制不意味着新增 Android 多窗口能力。
 
-## 16. 许可
+<a id="section-14"></a>
 
-本项目自有代码采用 **MIT** 许可。每个合成器后端则**附带其自身的上游许可**。
+## 14. 音频引擎细节
 
-### 16.1 MIT 许可的组成部分
+音频走独立全双工流，使用 8 字节 packed `audio_msg {type,size}` 头。每个方向在 PCM 前声明 role／format。当前 `audio_format` 为五个 `uint32_t` 字段，共 20 字节：`rate`、`channels`、`format`、`role`、`quantum`。
 
-| 组成部分 | 路径 |
-|----------|------|
-| V3 consumer (Android) | [consumers/anland_v3/](consumers/anland_v3/) |
-| 共享协议与工具 | [common/](common/) |
-| 中介守护进程 | [daemon/](daemon/) |
-| 参考 C 库 | [libdisplay_consumer/](libdisplay_consumer/), [libdisplay_producer/](libdisplay_producer/) |
+| 常量 | 值 | 含义 |
+|---|---:|---|
+| `AUDIO_MSG_FORMAT` | 1 | 格式／role／quantum 声明 |
+| `AUDIO_MSG_PCM` | 2 | PCM payload |
+| `AUDIO_MSG_SHM` | 3 | 共享内存 ring transport 请求 |
+| `AUDIO_MSG_SHM_FD` | 4 | 共享内存 FD 传递 |
+| `AUDIO_FORMAT_S16LE` | 0 | 交错 signed 16-bit little-endian PCM |
+| `AUDIO_ROLE_PLAYBACK` | 0 | Linux 桌面 -> Android 扬声器 |
+| `AUDIO_ROLE_CAPTURE` | 1 | Android 麦克风 -> Linux 虚拟 source |
 
-> 移植嵌入自身源码树的**参考 C 库拷贝**，**跟随宿主合成器的许可**，而非 MIT——
-> 例如嵌入 GPL 版 KWin 的拷贝按 KWin 的 GPL 条款分发。MIT 仅覆盖本仓库中的权威库本身。
+立体声每帧顺序为左、右（FL/FR）。S16LE 字节数为 `frames * channels * 2`，乘法／分配前须校验所有计数。`quantum` 单位是音频 frame，0 为引擎默认。consumer 实际硬件选定的 rate/channels 驱动协商，不能假定全部设备都是 48kHz 立体声，也不能因常量已声明就认为每条路径都使用了某扩展。
+
+producer 音频引擎在 consumer 丢失后保留 PipeWire stream：脱离时丢弃播放 PCM，麦克风 source 输出静音。`anland_audio_set_fd(-1)` 仅脱离，`stop()` 销毁引擎。重绑会重置麦克风缓冲和重发播放格式，不要每帧调用 `set_fd()`。同时比较 FD 身份与会话 generation，因为数字复用可能隐藏新连接。
+
+<a id="section-15"></a>
+
+## 15. 迁移、复现与诊断
+
+### 15.1 从历史传输集成迁移
+
+| 旧假定 | 当前做法 |
+|---|---|
+| 四个寄存 FD，旧 daemon 不用升级 | 使用配套当前 daemon/consumer/producer，audio 使 pickup 变为五 FD |
+| 首个 buffer-ready 就是已显示 | 当作 target-ready，等待与真实 commit 关联的反馈 |
+| `trigger_refresh()` 成功就是原生呈现 | 使用 facade commit/present 与匹配 scene event |
+| slot index 永久代表同一 buffer | 包含 generation，新 pool／会话重新导入 |
+| 未知事件都是固定长度 | 消费已知 payload／FD 扩展或 fail-closed，保持分帧 |
+| 无 fence 结果就意味着 GPU 完成 | 导出真实 fence 或明确完成 GPU 工作 |
+| 公共版本字符串证明能力 | 对实际调用函数执行 compile/link 探测 |
+| 各适配维护 producer 代码副本 | 从权威公共实现生成 overlay |
+
+原始符号拼写 `connect_to_deamon` 仍保留，示例不能擅自改名。旧迁移说明只复制 `display_producer.c`／`protocol.h`，并未包含当前 scene/present/device/media 实现。依赖／ABI 改变时 native bridge 和 WM 包需成套重建。
+
+### 15.2 可复现输入与产物记录
+
+记录 WM／公共源码 revision、lockfile 和补丁哈希、目标架构、编译器／工具链、flags、启用功能、依赖来源及产物哈希。离线 configure/compile 前完成依赖下载，使用 Cargo lock 和固定 wrap/submodule。Quilt 必须**先**创建／登记补丁，再编辑文件并 refresh。源码 identity stamp 不检测全部手改，也不保证旧对象自动失效。
+
+通过原生元数据和解包验证产物，不只看文件名：Arch 使用 `bsdtar`／`pacman`，Debian 使用 `dpkg-deb`，RPM 使用对应工具。动态链接检查 ELF 依赖／RPATH 和导入导出 API；静态内建需真实调用／link map 证据，不必出现 `DT_NEEDED: libdisplay_producer.so`。生成 overlay 应解析符号链接，并排除缓存、构建产物和个人路径。
+
+### 15.3 按边界排障
+
+| 症状 | 优先核对 | 不要这样做 |
+|---|---|---|
+| daemon 无法连接 | 实际选中 endpoint、挂载／权限、daemon log／control 状态 | 依据另一适配的默认 socket 猜测 |
+| daemon 正常但无输出 | consumer 到达、screen-info 阶段、五 FD pickup、metadata 数量与 target-ready | 伪造 mode 或忙循环 pickup |
+| 首帧正常后冻结 | commit ID 完成、pending/release 状态、pump/dispatch、target 答复 | 每个 eventfd 信号都报告为呈现 |
+| 黑屏／损坏图像 | 格式域、modifier/stride/offset、导入能力与 acquire fence | 猜未知 fourcc/modifier 或静默退化 CPU readback |
+| 重连失败 | control alive 与无 consumer 的区别、watcher 更新、新 generation/import | 复用旧同号 FD 或 slot |
+| 剪贴板／输入停滞 | pending 扩展、短读短写、queue 限制和 payload 期限 | 扩展未完成就读新事件头 |
+| 无声 | PipeWire session、已安装 bridge 调用、audio FD、节点路由与协商 | bridge 没接线却只增加 `PULSE_SERVER` |
+| Wayland 正常但 X11 失败 | 实际安装的修补版 Xwayland、render device、必要 satellite | 假定新包构建后 live server 已重启 |
+| 包时间戳新但行为未变 | 与历史包哈希对比、受影响对象是否重编译、安装文件身份 | 用时间戳或包装器 rc=0 当作构建证明 |
+
+明确授权运行验证前先采集非破坏性日志与预检。保留已成功部署的配置和证据；人为构造的坏配置失败不能证明原配置从未正常工作。
+
+<a id="section-16"></a>
+
+## 16. 历史与许可
+
+- [V1](doc/History/v1.md)
+- [V2](doc/History/v2.md)
+- [V3：原中英文 README](doc/History/v3.md)
+
+根目录 [LICENSE](LICENSE) 为 **GNU GPL v3**。合成器、Flutter 和捆绑依赖等组件的适用许可应同时查阅各自及上游声明；本文不授予整个项目统一 MIT 许可，也不重新授权第三方代码。历史 README 的许可说法仅作归档，不是当前许可依据。
