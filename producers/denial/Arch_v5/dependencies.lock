@@ -1,0 +1,12 @@
+# Upstream revisions only. Cargo.lock/pubspec.lock own transitive dependencies.
+# Public producer and backend use this Anland checkout; no per-source checksums.
+DENIAL_URL=https://github.com/denialwm/denial.git
+DENIAL_REV=c56aa2d6e8d70bd87b279e4edd70588c7ec15a6d
+DENIAL_VERSION=0.5.0-anland5
+FLUTTER_URL=https://github.com/denialwm/flutter.git
+FLUTTER_REV=8ccaca769f497d5cb5e376e12d7e053d6adb6b2d
+FLUTTER_VERSION=3.47.5
+# Shared cached engine inputs, not a pre-existing output package.
+ENGINE_VERSION=3.47.5.r1.g8ccaca769f49.gleslto-1
+ENGINE_SHA256=76a75bd2c51249ec2c728d389461cc9dc6c71432e37fe2734b4f6d35b8290a48
+ENGINE_ICU_SHA256=9f48c7f9c7c94d516a14870707e910ab94d75ae640ff6842c4af53276cd26ebe

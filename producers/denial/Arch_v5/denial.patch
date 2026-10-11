@@ -1,0 +1,3296 @@
+diff --git a/compositor/Cargo.toml b/compositor/Cargo.toml
+--- a/compositor/Cargo.toml
++++ b/compositor/Cargo.toml
+@@ -14,6 +14,7 @@
+ [features]
+ default = ["xwayland"]
+ external-output = ["flutter"]
++anland = ["external-output"]
+ flutter = [
+     "kms",
+     "control",
+diff --git a/compositor/build.rs b/compositor/build.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/build.rs
+@@ -0,0 +1,22 @@
++fn main() {
++    println!("cargo:rerun-if-env-changed=ANLAND_DENIAL_LIB_DIR");
++    if std::env::var_os("CARGO_FEATURE_ANLAND").is_none() {
++        return;
++    }
++    let path = std::env::var_os("ANLAND_DENIAL_LIB_DIR")
++        .expect("anland requires ANLAND_DENIAL_LIB_DIR from the staged bridge/public build");
++    let path = std::path::PathBuf::from(path)
++        .canonicalize()
++        .expect("ANLAND_DENIAL_LIB_DIR does not exist");
++    for name in ["libanland_denial_bridge.so", "libdisplay_producer.so"] {
++        assert!(
++            path.join(name).is_file(),
++            "missing staged Anland library: {name}"
++        );
++        println!("cargo:rerun-if-changed={}", path.join(name).display());
++    }
++    println!("cargo:rustc-link-search=native={}", path.display());
++    // The executable and both libraries share the private installed directory.
++    // Do not embed the staging directory into a distributable executable.
++    println!("cargo:rustc-link-arg-bin=deniald=-Wl,-rpath,$ORIGIN");
++}
+diff --git a/compositor/src/bin/deniald.rs b/compositor/src/bin/deniald.rs
+--- a/compositor/src/bin/deniald.rs
++++ b/compositor/src/bin/deniald.rs
+@@ -1,5 +1,9 @@
+ #![deny(unsafe_op_in_unsafe_fn)]
+ #![deny(clippy::undocumented_unsafe_blocks)]
++
++#[cfg(feature = "anland")]
++#[path = "deniald/anland_backend/mod.rs"]
++mod anland_backend;
+ 
+ #[path = "deniald/application_theming.rs"]
+ mod application_theming;
+@@ -21,6 +25,12 @@
+ #[cfg(feature = "flutter")]
+ #[path = "deniald/flutter_event_loop.rs"]
+ mod flutter_event_loop;
++#[cfg(feature = "flutter")]
++#[path = "deniald/flutter_desktop.rs"]
++mod flutter_desktop;
++#[cfg(feature = "flutter")]
++#[path = "deniald/flutter_launcher.rs"]
++mod flutter_launcher;
+ #[cfg(feature = "flutter")]
+ #[path = "deniald/flutter_runtime.rs"]
+ mod flutter_runtime;
+diff --git a/compositor/src/bin/deniald/clipboard.rs b/compositor/src/bin/deniald/clipboard.rs
+--- a/compositor/src/bin/deniald/clipboard.rs
++++ b/compositor/src/bin/deniald/clipboard.rs
+@@ -536,6 +536,61 @@
+         });
+         state.bump_revision();
+         Ok(item_id)
++    }
++
++    /// Live selection identity, independent from history/UI revisions. Snapshot
++    /// capture results are already checked against this epoch by finish_capture.
++    #[cfg(feature = "anland")]
++    pub(crate) fn selection_epoch(&self) -> u64 {
++        let state = self.lock();
++        match state.current {
++            CurrentSelection::External { epoch, .. } | CurrentSelection::Managed { epoch, .. } => {
++                epoch
++            }
++            CurrentSelection::None => state.next_epoch.wrapping_sub(1),
++        }
++    }
++
++    #[cfg(feature = "anland")]
++    pub(crate) fn set_consumer_text(&self, text: &str) -> Result<u64, ClipboardError> {
++        let id = self.set_text(text)?;
++        // Preserve the stable Flutter wire origin enum; source metadata records
++        // the actual provider rather than inventing a new clipboard protocol.
++        let mut state = self.lock();
++        if let Some(item) = state.managed.as_ref().filter(|item| item.id == id).cloned() {
++            let mut item = (*item).clone();
++            item.source = ClipboardSourceIdentity::bounded("anland", "Anland consumer");
++            let item = Arc::new(item);
++            if let Some(index) = state.history.iter().position(|entry| entry.id == id) {
++                state.history[index] = Arc::clone(&item);
++            }
++            state.managed = Some(item);
++        }
++        Ok(match state.current {
++            CurrentSelection::Managed { epoch, .. } => epoch,
++            _ => 0,
++        })
++    }
++
++    #[cfg(feature = "anland")]
++    pub(crate) fn consumer_export_text(&self) -> Option<String> {
++        let state = self.lock();
++        if state.locked
++            || matches!(
++                state.current,
++                CurrentSelection::External {
++                    history_item_id: None,
++                    ..
++                }
++            )
++        {
++            return None;
++        }
++        if matches!(state.current, CurrentSelection::None) {
++            return Some(String::new());
++        }
++        drop(state);
++        self.current_text()
+     }
+ 
+     pub fn current_text(&self) -> Option<String> {
+diff --git a/compositor/src/bin/deniald/flutter_desktop.rs b/compositor/src/bin/deniald/flutter_desktop.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_desktop.rs
+@@ -0,0 +1,206 @@
++//! Desktop services and Flutter callback processing shared by display backends.
++use super::*;
++#[cfg(feature = "external-output")]
++#[path = "flutter_desktop/session.rs"]
++mod session;
++#[cfg(feature = "external-output")]
++pub(crate) use session::Startup;
++use smithay::reexports::calloop::channel::{Event as ChannelEvent, channel};
++
++pub(super) fn install_runtime_events(
++    event_loop: &mut EventLoop<'_, RuntimeState>,
++) -> Result<Sender<flutter_runtime::RuntimeEvent>, Box<dyn Error>> {
++    let (sender, source) = channel();
++    event_loop.handle().insert_source(
++        source,
++        |event, _, state: &mut RuntimeState| match event {
++            ChannelEvent::Msg(flutter_runtime::RuntimeEvent::SampledBuffersReady {
++                fence,
++                batch,
++            }) => {
++                state.sampled_buffer_releases.push((fence, batch));
++            }
++            ChannelEvent::Msg(event) => state.flutter_events.push(event),
++            ChannelEvent::Closed => state.flutter_channel_closed = true,
++        },
++    )?;
++    Ok(sender)
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn initialize(
++    event_loop: &mut EventLoop<'_, RuntimeState>,
++    runtime: &flutter_runtime::FlutterRuntime,
++    wayland: Option<wayland_frontend::WaylandFrontend>,
++    desktop_size: PixelSize,
++    gamma_control: Arc<Mutex<gamma_control::GammaController>>,
++    output_control: Option<output_control::OutputControlPublisher>,
++    portal_ipc: Option<portal_ipc::PortalIpcPublisher>,
++) -> Result<RuntimeState, Box<dyn Error>> {
++    let system_controls = wayland
++        .as_ref()
++        .map(|_| SystemControls::new())
++        .transpose()?;
++    let notification_server = start_notification_server(event_loop)?;
++    let authentication = Some(runtime.authentication());
++    let clipboard = runtime.clipboard();
++    let native_escape_shortcut = wayland
++        .as_ref()
++        .map(|frontend| frontend.shortcuts.engine())
++        .unwrap_or_default();
++    let initial_theme_snapshot = portal_ipc.as_ref().map(|publisher| publisher.snapshot());
++    let initial_settings_document_revision = output_control
++        .as_ref()
++        .map(|publisher| publisher.settings_document_revision());
++    let events = RuntimeState {
++        wayland,
++        gamma_control,
++        native_escape_shortcut,
++        clipboard,
++        system_controls,
++        notification_server,
++        portal_ipc,
++        published_theme_snapshot: initial_theme_snapshot,
++        published_settings_document_revision: initial_settings_document_revision,
++        resolved_theme_accent: initial_theme_snapshot
++            .map_or_else(DesktopAccentColor::default, |snapshot| {
++                snapshot.accent_color
++            }),
++        authentication,
++        flutter_active: true,
++        flutter_input: flutter_runtime::InputQueue::new(desktop_size),
++        output_control,
++        ..RuntimeState::default()
++    };
++    if let Some(settings_path) = events
++        .wayland
++        .as_ref()
++        .map(|frontend| frontend.settings.path().to_path_buf())
++        && let Err(error) = settings_watch::install(&event_loop.handle(), &settings_path)
++    {
++        warn!(%error, path = %settings_path.display(), "could not watch Denial settings for external edits");
++    }
++    Ok(events)
++}
++
++fn start_notification_server(
++    event_loop: &mut EventLoop<'_, RuntimeState>,
++) -> Result<Option<NotificationServer>, Box<dyn Error>> {
++    let notification_events = Arc::new(Mutex::new(VecDeque::with_capacity(
++        NOTIFICATION_EVENT_QUEUE_CAPACITY,
++    )));
++    let notification_publish_queue = Arc::clone(&notification_events);
++    let (notification_sender, notification_source) = channel();
++    match NotificationServer::start(move |event, _| {
++        let should_wake = {
++            let mut queue = notification_publish_queue
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let should_wake = queue.is_empty();
++            if queue.len() == NOTIFICATION_EVENT_QUEUE_CAPACITY {
++                queue.pop_front();
++            }
++            queue.push_back(event);
++            should_wake
++        };
++        if should_wake {
++            // One calloop message wakes the compositor for the complete
++            // coalesced batch; the notification worker never busy-waits.
++            let _ = notification_sender.send(());
++        }
++    }) {
++        Ok(server) => {
++            let notification_dispatch_queue = Arc::clone(&notification_events);
++            event_loop.handle().insert_source(
++                notification_source,
++                move |event, _, state: &mut RuntimeState| {
++                    if let ChannelEvent::Msg(()) = event {
++                        let mut queue = notification_dispatch_queue
++                            .lock()
++                            .unwrap_or_else(std::sync::PoisonError::into_inner);
++                        state.pending_notification_events.extend(queue.drain(..));
++                    }
++                },
++            )?;
++            Ok(Some(server))
++        }
++        Err(error) => {
++            error!(%error, "Denial could not start its notification service");
++            Ok(None)
++        }
++    }
++}
++
++pub(super) fn process_flutter_event_batch(
++    runtime: &mut flutter_runtime::FlutterRuntime,
++    events: &mut RuntimeState,
++) -> Result<(), Box<dyn Error>> {
++    if events.flutter_input.has_pending() {
++        runtime.process_input_batch(&mut events.flutter_input)?;
++    }
++    // Drain in place so the callback queue retains its allocation across the
++    // steady-state AwaitVSync and platform-task hot path.
++    let event_count = events
++        .flutter_events
++        .len()
++        .min(MAX_FLUTTER_EVENTS_PER_ITERATION);
++    runtime.process_events(events.flutter_events.drain(..event_count))?;
++    synchronize_authentication_boundary(events);
++    synchronize_flutter_window_commands(runtime, events)?;
++    Ok(())
++}
++
++pub(super) fn synchronize_periodic_shell_services(
++    runtime: &mut flutter_runtime::FlutterRuntime,
++    flutter_launcher: &mut FlutterLauncher,
++    events: &mut RuntimeState,
++) -> Result<(), Box<dyn Error>> {
++    synchronize_clipboard(runtime, events)?;
++    synchronize_system_control_events(runtime, events)?;
++    synchronize_notification_events(runtime, events)?;
++    synchronize_xembed_tray(runtime, events)?;
++    synchronize_shell_keyboard(runtime, events)?;
++    synchronize_settings(runtime, events)?;
++    synchronize_system_bar_configuration(runtime, events, Some(flutter_launcher));
++    Ok(())
++}
++
++/// Shared desktop applications; callers enforce diagnostic and readiness gates.
++pub(super) fn start_startup_applications(
++    runtime: &flutter_runtime::FlutterRuntime,
++    polkit_agent: bool,
++    systemd_started: bool,
++    plugin_rebuild_needed: bool,
++) {
++    if !systemd_started
++        && polkit_agent
++        && std::env::var("DENIAL_POLKIT_AGENT").as_deref() != Ok("0")
++    {
++        let binary =
++            std::env::var("DENIAL_POLKIT_BINARY").unwrap_or_else(|_| "denial-polkit-agent".into());
++        if let Err(error) =
++            runtime.start_startup_application(vec![binary], "dev.denial.Polkit.desktop")
++        {
++            warn!(%error, "could not start authentication agent");
++        }
++    }
++    if let Some(arguments) = crate::welcome::launch_arguments()
++        && let Err(error) =
++            runtime.start_startup_application(arguments, "dev.denial.Welcome.desktop")
++    {
++        warn!(%error, "could not start Welcome");
++    }
++    if plugin_rebuild_needed {
++        if let Some(arguments) = crate::plugin_bundle::resume_arguments() {
++            if let Err(error) =
++                runtime.start_startup_application(arguments, "dev.denial.PluginManager.desktop")
++            {
++                warn!(%error, "could not resume the plugin rebuild");
++            }
++        } else {
++            info!(
++                "plugins need a rebuild for this Denial version; the plugin manager is not installed"
++            );
++        }
++    }
++}
+diff --git a/compositor/src/bin/deniald/flutter_desktop/session.rs b/compositor/src/bin/deniald/flutter_desktop/session.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_desktop/session.rs
+@@ -0,0 +1,72 @@
++//! Activate desktop services only after the display backend reports its readiness boundary.
++//! Reuse upstream session/application APIs; no service lifecycle during checks,
++//! bounded diagnostics or --wm-only, and no repeated onboarding on reconnect.
++use crate::flutter_launcher::FlutterLauncher;
++use crate::flutter_runtime::FlutterRuntime;
++use crate::options::RuntimeLimit;
++use crate::wayland_frontend::WaylandFrontend;
++use std::path::Path;
++use tracing::warn;
++
++pub(crate) struct Startup {
++    enabled: bool,
++    activated: bool,
++    systemd_started: bool,
++    polkit_agent: bool,
++}
++
++impl Startup {
++    pub fn new(limit: RuntimeLimit, polkit_agent: bool, desktop_enabled: bool) -> Self {
++        Self {
++            enabled: limit == RuntimeLimit::UntilLogout && desktop_enabled,
++            activated: false,
++            systemd_started: false,
++            polkit_agent,
++        }
++    }
++
++    fn claim_ready(&mut self, ready: bool) -> bool {
++        if !self.enabled || self.activated || !ready {
++            return false;
++        }
++        self.activated = true;
++        true
++    }
++
++    pub fn activate(
++        &mut self,
++        ready: bool,
++        runtime: &FlutterRuntime,
++        frontend: &WaylandFrontend,
++        control_socket: Option<&Path>,
++        launcher: &FlutterLauncher,
++    ) {
++        if !self.claim_ready(ready) {
++            return;
++        }
++        match crate::publish_session_activation_environment(
++            frontend.socket_name(),
++            frontend.xdisplay_name().as_deref(),
++            control_socket.map(Path::as_os_str),
++            self.polkit_agent,
++        ) {
++            Ok(activation) => self.systemd_started = activation.starts_systemd_target(),
++            Err(error) => warn!(%error, "could not activate the desktop session environment"),
++        }
++        super::start_startup_applications(
++            runtime,
++            self.polkit_agent,
++            self.systemd_started,
++            launcher.plugin_rebuild_needed(),
++        );
++    }
++
++    pub fn stop(&mut self) {
++        if self.systemd_started {
++            self.systemd_started = false;
++            if let Err(error) = crate::stop_systemd_graphical_session() {
++                warn!(%error, "could not retire the desktop graphical-session target");
++            }
++        }
++    }
++}
+diff --git a/compositor/src/bin/deniald/flutter_event_loop.rs b/compositor/src/bin/deniald/flutter_event_loop.rs
+--- a/compositor/src/bin/deniald/flutter_event_loop.rs
++++ b/compositor/src/bin/deniald/flutter_event_loop.rs
+@@ -7,6 +7,7 @@
+     log_shutdown, recover_stalled_kms_presentation, service_session_lifecycle,
+ };
+ use super::*;
++use super::flutter_desktop::{process_flutter_event_batch, synchronize_periodic_shell_services};
+ use smithay::reexports::calloop::channel::{Event as ChannelEvent, channel};
+ use smithay::reexports::calloop::ping::make_ping;
+ 
+@@ -68,53 +69,6 @@
+     ready_output_apply || pending_output_apply || resident_geometry_reconfigure_requested
+ }
+ 
+-fn start_notification_server(
+-    event_loop: &mut EventLoop<'_, RuntimeState>,
+-) -> Result<Option<NotificationServer>, Box<dyn Error>> {
+-    let notification_events = Arc::new(Mutex::new(VecDeque::with_capacity(
+-        NOTIFICATION_EVENT_QUEUE_CAPACITY,
+-    )));
+-    let notification_publish_queue = Arc::clone(&notification_events);
+-    let (notification_sender, notification_source) = channel();
+-    match NotificationServer::start(move |event, _| {
+-        let should_wake = {
+-            let mut queue = notification_publish_queue
+-                .lock()
+-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            let should_wake = queue.is_empty();
+-            if queue.len() == NOTIFICATION_EVENT_QUEUE_CAPACITY {
+-                queue.pop_front();
+-            }
+-            queue.push_back(event);
+-            should_wake
+-        };
+-        if should_wake {
+-            // One calloop message wakes the compositor for the complete
+-            // coalesced batch; the notification worker never busy-waits.
+-            let _ = notification_sender.send(());
+-        }
+-    }) {
+-        Ok(server) => {
+-            let notification_dispatch_queue = Arc::clone(&notification_events);
+-            event_loop.handle().insert_source(
+-                notification_source,
+-                move |event, _, state: &mut RuntimeState| {
+-                    if let ChannelEvent::Msg(()) = event {
+-                        let mut queue = notification_dispatch_queue
+-                            .lock()
+-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+-                        state.pending_notification_events.extend(queue.drain(..));
+-                    }
+-                },
+-            )?;
+-            Ok(Some(server))
+-        }
+-        Err(error) => {
+-            error!(%error, "Denial could not start its notification service");
+-            Ok(None)
+-        }
+-    }
+-}
+ 
+ fn start_orientation_sensor(
+     event_loop: &mut EventLoop<'_, RuntimeState>,
+@@ -2004,24 +1958,6 @@
+     Ok(())
+ }
+ 
+-fn process_flutter_event_batch(
+-    runtime: &mut flutter_runtime::FlutterRuntime,
+-    events: &mut RuntimeState,
+-) -> Result<(), Box<dyn Error>> {
+-    if events.flutter_input.has_pending() {
+-        runtime.process_input_batch(&mut events.flutter_input)?;
+-    }
+-    // Drain in place so the callback queue retains its allocation across the
+-    // steady-state AwaitVSync and platform-task hot path.
+-    let event_count = events
+-        .flutter_events
+-        .len()
+-        .min(MAX_FLUTTER_EVENTS_PER_ITERATION);
+-    runtime.process_events(events.flutter_events.drain(..event_count))?;
+-    synchronize_authentication_boundary(events);
+-    synchronize_flutter_window_commands(runtime, events)?;
+-    Ok(())
+-}
+ 
+ fn dispatch_when_background_slice_expires(
+     started: Instant,
+@@ -2050,20 +1986,6 @@
+     Ok(())
+ }
+ 
+-fn synchronize_periodic_shell_services(
+-    runtime: &mut flutter_runtime::FlutterRuntime,
+-    flutter_launcher: &mut FlutterLauncher,
+-    events: &mut RuntimeState,
+-) -> Result<(), Box<dyn Error>> {
+-    synchronize_clipboard(runtime, events)?;
+-    synchronize_system_control_events(runtime, events)?;
+-    synchronize_notification_events(runtime, events)?;
+-    synchronize_xembed_tray(runtime, events)?;
+-    synchronize_shell_keyboard(runtime, events)?;
+-    synchronize_settings(runtime, events)?;
+-    synchronize_system_bar_configuration(runtime, events, Some(flutter_launcher));
+-    Ok(())
+-}
+ 
+ fn cancel_invalid_screenshot_selection(
+     manager: &mut Option<screenshot::ScreenshotManager>,
+@@ -2503,50 +2425,15 @@
+                 .ok_or("Flutter session duration exceeds the monotonic clock range")
+         })
+         .transpose()?;
+-    let system_controls = wayland
+-        .as_ref()
+-        .map(|_| SystemControls::new())
+-        .transpose()?;
+-    let notification_server = start_notification_server(event_loop)?;
+-    let initial_runtime = flutter
+-        .as_ref()
+-        .ok_or("Flutter runtime was not initialized")?;
+-    let authentication = Some(initial_runtime.authentication());
+-    let clipboard = initial_runtime.clipboard();
+-    let native_escape_shortcut = wayland
+-        .as_ref()
+-        .map(|frontend| frontend.shortcuts.engine())
+-        .unwrap_or_default();
+-    let initial_theme_snapshot = portal_ipc.as_ref().map(|publisher| publisher.snapshot());
+-    let initial_settings_document_revision = output_control.settings_document_revision();
+-    let mut events = RuntimeState {
++    let mut events = flutter_desktop::initialize(
++        event_loop,
++        flutter.as_ref().ok_or("Flutter runtime was not initialized")?,
+         wayland,
++        swapchain.desktop_size(),
+         gamma_control,
+-        native_escape_shortcut,
+-        clipboard,
+-        system_controls,
+-        notification_server,
++        Some(output_control.clone()),
+         portal_ipc,
+-        published_theme_snapshot: initial_theme_snapshot,
+-        published_settings_document_revision: Some(initial_settings_document_revision),
+-        resolved_theme_accent: initial_theme_snapshot
+-            .map_or_else(DesktopAccentColor::default, |snapshot| {
+-                snapshot.accent_color
+-            }),
+-        authentication,
+-        flutter_active: true,
+-        flutter_input: flutter_runtime::InputQueue::new(swapchain.desktop_size()),
+-        output_control: Some(output_control.clone()),
+-        ..RuntimeState::default()
+-    };
+-    if let Some(settings_path) = events
+-        .wayland
+-        .as_ref()
+-        .map(|frontend| frontend.settings.path().to_path_buf())
+-        && let Err(error) = settings_watch::install(&event_loop.handle(), &settings_path)
+-    {
+-        warn!(%error, path = %settings_path.display(), "could not watch Denial settings for external edits");
+-    }
++    )?;
+     let _orientation_sensor = start_orientation_sensor(event_loop)?;
+     let (volition_wake, volition_wake_source) = make_ping()?;
+     // Queued Volition records are acknowledged at the top of each iteration.
+diff --git a/compositor/src/bin/deniald/flutter_launcher.rs b/compositor/src/bin/deniald/flutter_launcher.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_launcher.rs
+@@ -0,0 +1,398 @@
++//! Shared Flutter shell launch, recovery, authentication and development state.
++use super::*;
++use smithay::backend::egl::EGLContext;
++
++pub(super) struct FlutterLauncher {
++    factory: Option<flutter_runtime::FlutterRuntimeFactory>,
++    renderer_backend: denial_flutter_engine::RendererBackend,
++    offscreen_blit: bool,
++    active_mode: ui_development::UiRuntimeMode,
++    resident_jit_engine_fingerprint: Option<[u8; 32]>,
++    ui_development: ui_development::UiDevelopmentController,
++    events: Sender<flutter_runtime::RuntimeEvent>,
++    authentication: Arc<authentication::AuthenticationController>,
++    clipboard: clipboard::ClipboardManager,
++    wayland_display: Option<OsString>,
++    x11_display: Option<OsString>,
++    output_control_socket: Option<OsString>,
++    work_area: options::WorkAreaOptions,
++    pub(super) generation: u64,
++}
++
++pub(super) struct FlutterLaunchConfiguration<'a> {
++    pub(super) bundle: &'a Path,
++    pub(super) renderer_backend: denial_flutter_engine::RendererBackend,
++    pub(super) offscreen_blit: bool,
++    pub(super) debug_bundle: Option<PathBuf>,
++    pub(super) ui_workspace: Option<PathBuf>,
++}
++
++impl FlutterLauncher {
++    pub(super) fn plugin_rebuild_needed(&self) -> bool {
++        self.ui_development.plugin_rebuild_needed()
++    }
++
++    pub(super) fn new(
++        configuration: FlutterLaunchConfiguration<'_>,
++        events: Sender<flutter_runtime::RuntimeEvent>,
++        wayland_display: Option<OsString>,
++        x11_display: Option<OsString>,
++        output_control_socket: Option<OsString>,
++        work_area: options::WorkAreaOptions,
++        start_locked: bool,
++    ) -> Result<Self, Box<dyn Error>> {
++        let ui_development = ui_development::UiDevelopmentController::new(
++            configuration.bundle,
++            configuration.debug_bundle,
++            configuration.ui_workspace,
++        );
++        Ok(Self {
++            factory: Some(flutter_runtime::FlutterRuntimeFactory::new(
++                configuration.bundle,
++                denial_flutter_engine::DartRuntimeMode::Aot,
++                configuration.renderer_backend,
++            )?),
++            renderer_backend: configuration.renderer_backend,
++            offscreen_blit: configuration.offscreen_blit,
++            active_mode: ui_development::UiRuntimeMode::OfficialOptimized,
++            resident_jit_engine_fingerprint: None,
++            ui_development,
++            events,
++            authentication: Arc::new(authentication::AuthenticationController::new(start_locked)?),
++            clipboard: clipboard::ClipboardManager::default(),
++            wayland_display,
++            x11_display,
++            output_control_socket,
++            work_area,
++            generation: 0,
++        })
++    }
++
++    pub(super) fn uses_offscreen_blit(&self) -> bool {
++        self.offscreen_blit
++    }
++
++    pub(super) fn prepare_with_pools<'a>(
++        &self,
++        shared_context: &EGLContext,
++        pools: impl IntoIterator<Item = flutter_runtime::OutputRenderTargetPool<'a>>,
++        desktop_size: PixelSize,
++    ) -> Result<flutter_runtime::PreparedFlutterRenderer, Box<dyn Error>> {
++        flutter_runtime::PreparedFlutterRenderer::new(
++            shared_context,
++            pools,
++            desktop_size,
++            self.renderer_backend,
++            self.offscreen_blit,
++            self.events.clone(),
++        )
++    }
++
++    /// Common startup and packaged-shell recovery for every display backend.
++    /// The owner supplies real native buffers and an advertised refresh rate.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn start_with_pools<'a>(
++        &mut self,
++        shared_context: &EGLContext,
++        pools: impl IntoIterator<Item = flutter_runtime::OutputRenderTargetPool<'a>>,
++        snapshot: &TopologySnapshot,
++        atlas: &AtlasPlan,
++        refresh_millihz: u32,
++        prepared: Option<flutter_runtime::PreparedFlutterRenderer>,
++    ) -> Result<flutter_runtime::FlutterRuntime, Box<dyn Error>> {
++        if refresh_millihz == 0 {
++            return Err("Flutter runtime has no output refresh".into());
++        }
++        let pools = pools.into_iter().collect::<Vec<_>>();
++        self.generation = self.generation.wrapping_add(1).max(1);
++        if let Err(error) = self.activate_requested_factory() {
++            let failed_mode = self.ui_development.desired_mode();
++            if failed_mode == ui_development::UiRuntimeMode::OfficialOptimized {
++                return Err(error);
++            }
++            self.ui_development
++                .runtime_failed(failed_mode, error.as_ref());
++            warn!(
++                %error,
++                ?failed_mode,
++                "could not prepare custom Flutter runtime; restoring the packaged shell"
++            );
++            self.replace_factory(ui_development::UiRuntimeMode::OfficialOptimized)?;
++        }
++        let using_prepared = prepared.is_some();
++        let runtime = self.start_with_current_factory(
++            shared_context,
++            pools.clone(),
++            snapshot,
++            atlas,
++            refresh_millihz,
++            prepared,
++        );
++        let mut runtime = match runtime {
++            Ok(runtime) => runtime,
++            Err(error) if self.active_mode != ui_development::UiRuntimeMode::OfficialOptimized => {
++                let failed_mode = self.active_mode;
++                self.ui_development
++                    .runtime_failed(failed_mode, error.as_ref());
++                warn!(
++                    %error,
++                    ?failed_mode,
++                    "custom Flutter runtime failed; selecting the packaged shell"
++                );
++                self.replace_factory(ui_development::UiRuntimeMode::OfficialOptimized)?;
++                if using_prepared {
++                    // The failed engine consumed this preparation. Let the
++                    // topology transaction restore its prepared rollback
++                    // renderer; never reimport targets after old-engine teardown.
++                    return Err(error);
++                }
++                self.start_with_current_factory(
++                    shared_context,
++                    pools,
++                    snapshot,
++                    atlas,
++                    refresh_millihz,
++                    None,
++                )?
++            }
++            Err(error) => return Err(error),
++        };
++        self.ui_development
++            .runtime_started(self.active_mode, self.generation);
++        self.publish_ui_development_state(&mut runtime)?;
++        Ok(runtime)
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn start_with_current_factory<'a>(
++        &self,
++        shared_context: &EGLContext,
++        output_pools: impl IntoIterator<Item = flutter_runtime::OutputRenderTargetPool<'a>>,
++        snapshot: &TopologySnapshot,
++        atlas: &AtlasPlan,
++        refresh_millihz: u32,
++        prepared: Option<flutter_runtime::PreparedFlutterRenderer>,
++    ) -> Result<flutter_runtime::FlutterRuntime, Box<dyn Error>> {
++        flutter_runtime::FlutterRuntime::start(
++            shared_context,
++            output_pools,
++            snapshot,
++            atlas,
++            refresh_millihz,
++            self.offscreen_blit,
++            self.factory
++                .as_ref()
++                .ok_or("Flutter launcher has no active runtime factory")?,
++            self.events.clone(),
++            Arc::clone(&self.authentication),
++            self.clipboard.clone(),
++            self.work_area.clone(),
++            self.generation,
++            self.wayland_display.clone(),
++            self.x11_display.clone(),
++            self.output_control_socket.clone(),
++            prepared,
++        )
++    }
++
++    fn activate_requested_factory(&mut self) -> Result<(), Box<dyn Error>> {
++        let requested = self.ui_development.desired_mode();
++        if requested == self.active_mode
++            && self
++                .factory
++                .as_ref()
++                .is_some_and(|f| Some(f.bundle()) == self.ui_development.bundle_for(requested))
++        {
++            if requested == ui_development::UiRuntimeMode::LiveDevelopment {
++                let bundle = self
++                    .ui_development
++                    .bundle_for(requested)
++                    .ok_or("live development has no configured Flutter bundle")?;
++                let prepared = flutter_runtime::bundle_engine_fingerprint(bundle)?;
++                ensure_resident_jit_engine_matches(
++                    self.resident_jit_engine_fingerprint.as_ref(),
++                    &prepared,
++                )?;
++            }
++            return Ok(());
++        }
++        self.replace_factory(requested)
++    }
++
++    fn replace_factory(
++        &mut self,
++        requested: ui_development::UiRuntimeMode,
++    ) -> Result<(), Box<dyn Error>> {
++        let bundle = self
++            .ui_development
++            .bundle_for(requested)
++            .ok_or_else(|| format!("{requested:?} has no configured Flutter bundle"))?
++            .to_owned();
++        let runtime = match requested {
++            ui_development::UiRuntimeMode::OfficialOptimized => {
++                denial_flutter_engine::DartRuntimeMode::Aot
++            }
++            ui_development::UiRuntimeMode::CustomOptimized => {
++                if self.ui_development.uses_release_plugins() {
++                    denial_flutter_engine::DartRuntimeMode::Aot
++                } else {
++                    denial_flutter_engine::DartRuntimeMode::AotProfile
++                }
++            }
++            ui_development::UiRuntimeMode::LiveDevelopment => {
++                denial_flutter_engine::DartRuntimeMode::Jit
++            }
++            ui_development::UiRuntimeMode::Unavailable => {
++                return Err("cannot launch an unavailable Flutter runtime".into());
++            }
++        };
++        let jit_engine_fingerprint = (requested == ui_development::UiRuntimeMode::LiveDevelopment)
++            .then(|| flutter_runtime::bundle_engine_fingerprint(&bundle))
++            .transpose()?;
++        if let Some(prepared) = jit_engine_fingerprint.as_ref() {
++            ensure_resident_jit_engine_matches(
++                self.resident_jit_engine_fingerprint.as_ref(),
++                prepared,
++            )?;
++        }
++
++        // AOT and JIT Flutter libraries each own process-global Dart state.
++        // The old runtime is shut down before this method is reached; release
++        // its library before loading the other runtime mode.
++        self.factory = None;
++        self.factory = Some(
++            if requested == ui_development::UiRuntimeMode::CustomOptimized
++                && self.ui_development.uses_release_plugins()
++            {
++                flutter_runtime::FlutterRuntimeFactory::with_engine(
++                    &bundle,
++                    self.ui_development
++                        .bundle_for(ui_development::UiRuntimeMode::OfficialOptimized)
++                        .expect("packaged recovery bundle"),
++                    runtime,
++                    self.renderer_backend,
++                )?
++            } else {
++                flutter_runtime::FlutterRuntimeFactory::new(
++                    &bundle,
++                    runtime,
++                    self.renderer_backend,
++                )?
++            },
++        );
++        if let Some(fingerprint) = jit_engine_fingerprint {
++            self.resident_jit_engine_fingerprint = Some(fingerprint);
++        }
++        self.active_mode = requested;
++        Ok(())
++    }
++
++    pub(super) fn synchronize_ui_development(
++        &mut self,
++        runtime: &mut flutter_runtime::FlutterRuntime,
++    ) -> Result<bool, Box<dyn Error>> {
++        let health = self
++            .ui_development
++            .poll_plugin_health(runtime.has_produced_frame());
++        let vm_service_uri = runtime.take_vm_service_uri();
++        let vm_service_changed = vm_service_uri.is_some();
++        let commands = runtime.drain_ui_development_commands().collect::<Vec<_>>();
++        if let Some(uri) = vm_service_uri {
++            self.ui_development.set_vm_service_uri(uri);
++        }
++        if commands.is_empty() && !vm_service_changed && health.is_none() {
++            return Ok(false);
++        }
++        let mut reload_requested =
++            matches!(health, Some(ui_development::UiDevelopmentEffect::Reload(_)));
++        for command in commands {
++            if let ui_development::UiDevelopmentEffect::Reload(requested_mode) =
++                self.ui_development.handle_command(command)
++            {
++                debug_assert_eq!(self.ui_development.desired_mode(), requested_mode);
++                reload_requested = true;
++            }
++        }
++        let publication = self.publish_ui_development_state(runtime);
++        resolve_ui_development_publication(reload_requested, publication)?;
++        Ok(reload_requested)
++    }
++
++    pub(super) fn handle_external_ui_development(
++        &mut self,
++        runtime: &mut flutter_runtime::FlutterRuntime,
++        command: ui_development::UiDevelopmentCommand,
++    ) -> (bool, ui_development::UiDevelopmentState) {
++        let (effect, reply) = self.ui_development.handle_external_command(command);
++        let reload_requested = matches!(effect, ui_development::UiDevelopmentEffect::Reload(_));
++        // denialctl is the recovery path when Flutter itself is unavailable
++        // or unhealthy. Updating the shell is useful, but it must never be a
++        // prerequisite for accepting an external restore command.
++        if let Err(error) = self.publish_ui_development_state(runtime) {
++            warn!(%error, "could not publish denialctl UI state to Flutter");
++        }
++        (reload_requested, reply)
++    }
++
++    pub(super) fn retain_runtime_after_switch_failure(
++        &mut self,
++        runtime: &mut flutter_runtime::FlutterRuntime,
++        error: &dyn std::fmt::Display,
++    ) {
++        let failed_mode = self.ui_development.desired_mode();
++        self.ui_development
++            .runtime_switch_failed_preserving_active(failed_mode, error);
++        if let Err(publication_error) = self.publish_ui_development_state(runtime) {
++            warn!(
++                %publication_error,
++                %error,
++                ?failed_mode,
++                "could not publish retained Flutter runtime after runtime switch failure"
++            );
++        }
++    }
++
++    fn publish_ui_development_state(
++        &self,
++        runtime: &mut flutter_runtime::FlutterRuntime,
++    ) -> Result<(), Box<dyn Error>> {
++        let packet = self.ui_development.state_packet()?;
++        runtime.publish_ui_development_state(&packet)
++    }
++
++    pub(super) fn set_work_area(&mut self, work_area: options::WorkAreaOptions) {
++        self.work_area = work_area;
++    }
++}
++
++fn resolve_ui_development_publication(
++    reload_requested: bool,
++    publication: Result<(), Box<dyn Error>>,
++) -> Result<(), Box<dyn Error>> {
++    match publication {
++        Err(error) if reload_requested => {
++            // A runtime-mode switch replaces the Flutter engine in process. The
++            // retiring engine can reject this final state message, but start()
++            // publishes the complete state again after its replacement is up.
++            warn!(
++                %error,
++                "could not publish UI development state before Flutter runtime refresh"
++            );
++            Ok(())
++        }
++        publication => publication,
++    }
++}
++
++pub(super) fn ensure_resident_jit_engine_matches(
++    resident: Option<&[u8; 32]>,
++    prepared: &[u8; 32],
++) -> Result<(), Box<dyn Error>> {
++    if resident.is_some_and(|resident| resident != prepared) {
++        return Err(
++            "The prepared JIT Flutter engine changed after this Denial session loaded its native development runtime. Restart the Denial session before enabling live UI development."
++                .into(),
++        );
++    }
++    Ok(())
++}
+diff --git a/compositor/src/bin/deniald/flutter_runtime.rs b/compositor/src/bin/deniald/flutter_runtime.rs
+--- a/compositor/src/bin/deniald/flutter_runtime.rs
++++ b/compositor/src/bin/deniald/flutter_runtime.rs
+@@ -84,6 +84,9 @@
+ pub(crate) use external_pool::ExternalPoolDescriptor;
+ #[path = "flutter_runtime/pool_selection.rs"]
+ mod pool_selection;
++#[cfg(feature = "external-output")]
++#[path = "flutter_runtime/scene_recovery.rs"]
++pub(crate) mod scene_recovery;
+ pub(crate) use pool_selection::PoolSelection;
+ #[path = "flutter_runtime/output_pipeline.rs"]
+ mod output_pipeline;
+@@ -563,6 +566,8 @@
+     native_frame_clock_enabled: bool,
+     outputs_visible: Option<bool>,
+     lock_frame_gate: lock_frame::LockFrameGate,
++    #[cfg(feature = "external-output")]
++    scene_recovery: Option<scene_recovery::RecoveryGate>,
+     fingerprint_scene: fingerprint_scene::FingerprintScene,
+     published_text_input_state: Option<(bool, bool, bool, u32, u32, u64)>,
+     frame_ready_observed: bool,
+diff --git a/compositor/src/bin/deniald/flutter_runtime/engine_session.rs b/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
+@@ -319,6 +319,8 @@
+             native_frame_clock_enabled: false,
+             outputs_visible: None,
+             lock_frame_gate: lock_frame::LockFrameGate::default(),
++            #[cfg(feature = "external-output")]
++            scene_recovery: None,
+             fingerprint_scene: fingerprint_scene::FingerprintScene::default(),
+             published_text_input_state: None,
+             frame_ready_observed: false,
+diff --git a/compositor/src/bin/deniald/flutter_runtime/lock_frame.rs b/compositor/src/bin/deniald/flutter_runtime/lock_frame.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/lock_frame.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/lock_frame.rs
+@@ -35,6 +35,19 @@
+         }
+     }
+ 
++    fn synchronize_epoch(&mut self, epoch: Option<u64>) -> bool {
++        if let Some(epoch) = epoch {
++            if self.token == 0 || self.epoch != Some(epoch) {
++                self.begin(epoch);
++                return true;
++            }
++        } else if self.token != 0 {
++            *self = Self::default();
++            return true;
++        }
++        false
++    }
++
+     fn permits(&self, token: u64, epoch: Option<u64>) -> bool {
+         epoch.is_none() || (token != 0 && token == self.render_token(epoch))
+     }
+@@ -58,15 +71,12 @@
+     }
+ 
+     pub(super) fn synchronize_lock_frame(&mut self) -> Result<(), Box<dyn Error>> {
+-        if self.lock_frame_gate.token != 0 {
+-            if let Some(epoch) = self.authentication.locked_epoch() {
+-                if self.lock_frame_gate.epoch != Some(epoch) {
+-                    self.prepare_locked_wake()?;
+-                }
+-            } else {
+-                self.lock_frame_gate = LockFrameGate::default();
+-                self.host().engine().send_platform_message(CHANNEL, b"0")?;
+-            }
++        if self
++            .lock_frame_gate
++            .synchronize_epoch(self.authentication.locked_epoch())
++        {
++            self.publish_authentication_events()?;
++            self.send_lock_frame_request()?;
+         }
+         Ok(())
+     }
+diff --git a/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs b/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
+@@ -485,6 +485,13 @@
+         let mut tagged_requests = requests.to_vec();
+         for request in &mut tagged_requests {
+             request.fingerprint_epoch = self.fingerprint_scene.render_epoch(request.tick.output);
++            #[cfg(feature = "external-output")]
++            {
++                request.scene_recovery_token = self
++                    .scene_recovery
++                    .as_ref()
++                    .map_or(0, |gate| gate.render_token());
++            }
+         }
+         self.handler.authorize_outputs(
+             &tagged_requests,
+diff --git a/compositor/src/bin/deniald/flutter_runtime/platform_dispatch.rs b/compositor/src/bin/deniald/flutter_runtime/platform_dispatch.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/platform_dispatch.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/platform_dispatch.rs
+@@ -77,6 +77,28 @@
+         // a lock request cannot be followed by one last unredacted read.
+         self.clipboard
+             .set_locked(self.authentication.security_gate_locked());
++        #[cfg(feature = "external-output")]
++        if message.channel == "denial/scene_recovery" {
++            let lock_epoch = self.authentication.locked_epoch();
++            if let Some(gate) = self.scene_recovery.as_mut() {
++                // The compositor invalidates the gate before the driver can submit
++                // if metadata/sampling or replay work changed in this event batch.
++                if let Some(metadata) = self.wire.recovery_metadata_revision() {
++                    let version = scene_recovery::SceneVersion {
++                        metadata,
++                        lock_epoch,
++                    };
++                    if gate.acknowledge(&message.data, version) {
++                        info!(
++                            generation = self.generation,
++                            metadata, "Flutter applied external recovery scene"
++                        );
++                    }
++                }
++            }
++            self.host().respond(&mut message, &[])?;
++            return Ok(());
++        }
+         if message.channel == "denial/haptics" {
+             let result = self.authentication.handle_haptics_packet(&message.data);
+             self.host().respond(&mut message, &[])?;
+diff --git a/compositor/src/bin/deniald/flutter_runtime/scene_recovery.rs b/compositor/src/bin/deniald/flutter_runtime/scene_recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_runtime/scene_recovery.rs
+@@ -0,0 +1,145 @@
++//! Local cold-scene barrier; no consumer protocol or transport ownership here.
++use std::time::{Duration, Instant};
++
++pub(crate) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct SceneVersion {
++    pub metadata: u64,
++    pub lock_epoch: Option<u64>,
++}
++#[derive(Debug)]
++pub(crate) struct RecoveryGate {
++    generation: u64,
++    started: Instant,
++    revision: u64,
++    version: Option<SceneVersion>,
++    acknowledged: bool,
++    finished: bool,
++    layout_epoch: u64,
++    layout_baseline: u64,
++}
++impl RecoveryGate {
++    pub fn new(generation: u64, started: Instant) -> Self {
++        assert_ne!(generation, 0);
++        Self {
++            generation,
++            started,
++            revision: 0,
++            version: None,
++            acknowledged: false,
++            finished: false,
++            layout_epoch: 0,
++            layout_baseline: 0,
++        }
++    }
++    /// A resident engine keeps its layout epoch and monotonically increasing
++    /// local revision. Delayed ACKs from a previous pool cannot reopen this gate.
++    pub fn restart(&mut self, started: Instant) {
++        self.started = started;
++        self.version = None;
++        self.acknowledged = false;
++        self.finished = false;
++        self.layout_baseline = self.layout_epoch;
++    }
++    pub fn finished(&self) -> bool {
++        self.finished
++    }
++    pub fn expired(&self, now: Instant) -> bool {
++        !self.finished && now.saturating_duration_since(self.started) >= RECOVERY_TIMEOUT
++    }
++    pub fn invalidate(&mut self) {
++        if !self.finished {
++            self.version = None;
++            self.acknowledged = false;
++        }
++    }
++    pub fn invalidate_lock_epoch(&mut self, epoch: Option<u64>) {
++        if self
++            .version
++            .is_some_and(|version| version.lock_epoch != epoch)
++        {
++            self.invalidate();
++        }
++    }
++    pub fn request(&mut self, version: SceneVersion) -> Option<String> {
++        if self.finished
++            || self.version.is_some_and(|snapshot| {
++                snapshot.lock_epoch == version.lock_epoch && version.metadata >= snapshot.metadata
++            })
++        {
++            return None;
++        }
++        self.revision = self
++            .revision
++            .checked_add(1)
++            .expect("scene recovery revision exhausted");
++        self.layout_baseline = self.layout_epoch;
++        self.version = Some(version);
++        self.acknowledged = false;
++        Some(format!(
++            "DENIAL_RECOVERY:{}:{}:{}:{}",
++            self.generation,
++            self.revision,
++            version.metadata,
++            version.lock_epoch.unwrap_or(0)
++        ))
++    }
++    pub fn acknowledge(&mut self, data: &[u8], current: SceneVersion) -> bool {
++        let Some(snapshot) = self.version else {
++            return false;
++        };
++        if data.len() > 110
++            || self.finished
++            || snapshot.lock_epoch != current.lock_epoch
++            || current.metadata < snapshot.metadata
++        {
++            return false;
++        }
++        let Ok(text) = std::str::from_utf8(data) else {
++            return false;
++        };
++        let mut parts = text.split(':');
++        if parts.next() != Some("DENIAL_RECOVERY") {
++            return false;
++        }
++        let values: Option<Vec<u64>> = parts
++            .map(|p| {
++                (!p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
++                    .then(|| p.parse().ok())
++                    .flatten()
++            })
++            .collect();
++        if values.as_deref()
++            != Some(&[
++                self.generation,
++                self.revision,
++                snapshot.metadata,
++                snapshot.lock_epoch.unwrap_or(0),
++            ])
++        {
++            return false;
++        }
++        self.acknowledged = true;
++        true
++    }
++    pub fn note_layout(&mut self, epoch: u64) {
++        self.layout_epoch = self.layout_epoch.max(epoch);
++    }
++    pub fn render_token(&self) -> u64 {
++        if self.acknowledged && self.version.is_some() && self.layout_epoch > self.layout_baseline {
++            self.revision
++        } else {
++            0
++        }
++    }
++    pub fn permits(&self, token: u64) -> bool {
++        self.finished || (token != 0 && token == self.render_token())
++    }
++    pub fn finish(&mut self, token: u64) -> bool {
++        if !self.permits(token) {
++            return false;
++        }
++        self.finished = true;
++        true
++    }
++}
+diff --git a/compositor/src/bin/deniald/flutter_runtime/service_bridge.rs b/compositor/src/bin/deniald/flutter_runtime/service_bridge.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/service_bridge.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/service_bridge.rs
+@@ -21,7 +21,12 @@
+     }
+ 
+     pub fn take_input_layout_update(&mut self) -> Option<wire::InputLayoutSnapshot> {
+-        self.wire.take_input_layout_update()
++        let layout = self.wire.take_input_layout_update()?;
++        #[cfg(feature = "external-output")]
++        if let Some(gate) = self.scene_recovery.as_mut() {
++            gate.note_layout(layout.epoch);
++        }
++        Some(layout)
+     }
+ 
+     pub fn recycle_input_layout(&mut self, layout: wire::InputLayoutSnapshot) {
+@@ -40,6 +45,28 @@
+         self.text_input
+             .take_state_change()
+             .map(|snapshot| (self.generation, snapshot))
++    }
++
++    #[cfg(feature = "external-output")]
++    pub fn dispatch_consumer_text_to_flutter(
++        &mut self,
++        generation: u64,
++        lifecycle: u64,
++        client_id: i64,
++        text: &str,
++    ) -> Result<bool, Box<dyn Error>> {
++        if generation != self.generation {
++            return Ok(false);
++        }
++        let engine = self.host.as_ref().expect("active Flutter runtime").engine();
++        let messages = self
++            .text_input
++            .apply_consumer_commit(lifecycle, client_id, text);
++        let delivered = !messages.is_empty();
++        for message in messages {
++            engine.send_platform_message(text_input::CHANNEL, message)?;
++        }
++        Ok(delivered)
+     }
+ 
+     pub fn dispatch_input_method_to_flutter(
+@@ -661,3 +688,80 @@
+         Ok(())
+     }
+ }
++
++#[cfg(feature = "external-output")]
++impl FlutterRuntime {
++    pub(crate) fn begin_scene_recovery(&mut self, started: Instant) -> Result<(), Box<dyn Error>> {
++        if let Some(gate) = self.scene_recovery.as_mut() {
++            gate.restart(started);
++        } else {
++            self.scene_recovery = Some(scene_recovery::RecoveryGate::new(self.generation, started));
++        }
++        self.prepare_locked_wake()?;
++        info!(
++            generation = self.generation,
++            "external scene recovery started"
++        );
++        Ok(())
++    }
++    pub(crate) fn synchronize_scene_recovery(
++        &mut self,
++        metadata: u64,
++        ready: bool,
++    ) -> Result<(), Box<dyn Error>> {
++        let lock_epoch = self.authentication.locked_epoch();
++        self.synchronize_lock_frame()?;
++        let Some(gate) = self.scene_recovery.as_mut() else {
++            return Ok(());
++        };
++        if gate.finished() {
++            return Ok(());
++        }
++        // Ordinary pending updates after the ordered snapshot do not revoke it.
++        // Lock changes always revoke, even when the scene has not settled yet.
++        if !ready {
++            gate.invalidate_lock_epoch(lock_epoch);
++            return Ok(());
++        }
++        let version = scene_recovery::SceneVersion {
++            metadata,
++            lock_epoch,
++        };
++        if let Some(packet) = gate.request(version) {
++            info!(
++                generation = self.generation,
++                metadata,
++                ?lock_epoch,
++                "external recovery scene barrier published"
++            );
++            // Same ordered Flutter channel as window snapshots, workspaces and focus.
++            self.host()
++                .engine()
++                .send_platform_message(wire::TO_FLUTTER_CHANNEL, packet.as_bytes())?;
++        }
++        Ok(())
++    }
++    pub(crate) fn scene_recovery_frame_allowed(&self, frame: &ReadyOutputFrame) -> bool {
++        self.scene_recovery
++            .as_ref()
++            .is_none_or(|gate| gate.permits(frame.request.scene_recovery_token))
++            && self.permits_wake_frame(frame.request.lock_frame_token)
++    }
++    pub(crate) fn scene_recovery_expired(&self, now: Instant) -> bool {
++        self.scene_recovery
++            .as_ref()
++            .is_some_and(|gate| gate.expired(now))
++    }
++    pub(crate) fn scene_recovery_frame_accepted(&mut self, request: OutputFrameRequest) {
++        if let Some(gate) = self.scene_recovery.as_mut()
++            && !gate.finished()
++            && gate.finish(request.scene_recovery_token)
++        {
++            info!(
++                generation = self.generation,
++                recovery_revision = request.scene_recovery_token,
++                "first restored external scene submitted"
++            );
++        }
++    }
++}
+diff --git a/compositor/src/bin/deniald/flutter_runtime/text_input.rs b/compositor/src/bin/deniald/flutter_runtime/text_input.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/text_input.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/text_input.rs
+@@ -327,6 +327,31 @@
+             self.note_state_change();
+         }
+         &self.messages[..message_count]
++    }
++
++    #[cfg(feature = "external-output")]
++    pub fn apply_consumer_commit(
++        &mut self,
++        lifecycle: u64,
++        client_id: i64,
++        text: &str,
++    ) -> &[Vec<u8>] {
++        if self.lifecycle_revision != lifecycle
++            || !crate::wayland_frontend::injected_text::valid_commit(text)
++            || self
++                .client
++                .as_ref()
++                .is_none_or(|client| client.id != client_id || client.obscure_text)
++        {
++            return &[];
++        }
++        self.apply_input_method(
++            client_id,
++            &InputMethodTransaction {
++                commit_string: Some(text.into()),
++                ..Default::default()
++            },
++        )
+     }
+ 
+     pub fn apply_input_method(
+diff --git a/compositor/src/bin/deniald/frame_scheduler.rs b/compositor/src/bin/deniald/frame_scheduler.rs
+--- a/compositor/src/bin/deniald/frame_scheduler.rs
++++ b/compositor/src/bin/deniald/frame_scheduler.rs
+@@ -26,37 +26,7 @@
+ const PHASE_LOCK_MAX_ADJUSTMENT: Duration = Duration::from_micros(250);
+ const PHASE_LOCK_GAIN_DIVISOR: i128 = 8;
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub(super) struct FrameTick {
+-    pub(super) output: OutputId,
+-    pub(super) sequence: u64,
+-    /// Stable period derived from the configured output mode. Phase locking
+-    /// moves presentation targets but never changes this cadence identity.
+-    pub(super) nominal_interval: Duration,
+-    /// Phase-corrected duration from this render deadline to its target.
+-    pub(super) interval: Duration,
+-    pub(super) render_deadline: Instant,
+-    pub(super) presentation_target: Instant,
+-}
+-
+-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+-pub(super) struct PendingFrame {
+-    pub(super) flutter_requested: bool,
+-}
+-
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub(super) enum FrameAction {
+-    Skip,
+-    Render { flutter_output: Option<OutputId> },
+-}
+-
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub(super) struct OutputFrameRequest {
+-    pub(super) tick: FrameTick,
+-    pub(super) dirty_serial: u64,
+-    pub(super) lock_frame_token: u64,
+-    pub(super) fingerprint_epoch: u64,
+-}
++pub(super) use super::frame_request::{FrameAction, FrameTick, OutputFrameRequest, PendingFrame};
+ 
+ #[derive(Debug, Default)]
+ struct DirtyOutput {
+@@ -357,6 +327,7 @@
+                 dirty_serial: dirty.serial,
+                 lock_frame_token: 0,
+                 fingerprint_epoch: 0,
++                scene_recovery_token: 0,
+             });
+             self.render_texture_ids
+                 .extend(dirty.texture_ids.keys().copied());
+diff --git a/compositor/src/bin/deniald/kms_state.rs b/compositor/src/bin/deniald/kms_state.rs
+--- a/compositor/src/bin/deniald/kms_state.rs
++++ b/compositor/src/bin/deniald/kms_state.rs
+@@ -11,9 +11,6 @@
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use smithay::reexports::rustix::{io, ioctl};
+-
+-#[cfg(feature = "flutter")]
+-use smithay::backend::egl::EGLContext;
+ 
+ const SCANOUT_BYTES_PER_PIXEL: u64 = 4;
+ const MAX_SCANOUT_DIMENSION: u32 = 16_384;
+@@ -889,7 +886,9 @@
+             render_view_id: pool.render_view_id,
+             configuration_generation: pool.configuration_generation,
+             size: pool.size,
+-            initial_scanout: pool.current,
++            selection: flutter_runtime::PoolSelection::Automatic {
++                initial_scanout: pool.current,
++            },
+             dmabufs: pool
+                 .buffers
+                 .iter()
+@@ -926,91 +925,20 @@
+ }
+ 
+ #[cfg(feature = "flutter")]
+-pub(super) struct FlutterLauncher {
+-    factory: Option<flutter_runtime::FlutterRuntimeFactory>,
+-    renderer_backend: denial_flutter_engine::RendererBackend,
+-    offscreen_blit: bool,
+-    active_mode: ui_development::UiRuntimeMode,
+-    resident_jit_engine_fingerprint: Option<[u8; 32]>,
+-    ui_development: ui_development::UiDevelopmentController,
+-    events: Sender<flutter_runtime::RuntimeEvent>,
+-    authentication: Arc<authentication::AuthenticationController>,
+-    clipboard: clipboard::ClipboardManager,
+-    wayland_display: Option<OsString>,
+-    x11_display: Option<OsString>,
+-    output_control_socket: Option<OsString>,
+-    work_area: options::WorkAreaOptions,
+-    pub(super) generation: u64,
+-}
+-
+-#[cfg(feature = "flutter")]
+-pub(super) struct FlutterLaunchConfiguration<'a> {
+-    pub(super) bundle: &'a Path,
+-    pub(super) renderer_backend: denial_flutter_engine::RendererBackend,
+-    pub(super) offscreen_blit: bool,
+-    pub(super) debug_bundle: Option<PathBuf>,
+-    pub(super) ui_workspace: Option<PathBuf>,
+-}
++pub(super) use crate::flutter_launcher::{FlutterLaunchConfiguration, FlutterLauncher};
+ 
+ #[cfg(feature = "flutter")]
+ impl FlutterLauncher {
+-    pub(super) fn plugin_rebuild_needed(&self) -> bool {
+-        self.ui_development.plugin_rebuild_needed()
+-    }
+-
+-    pub(super) fn new(
+-        configuration: FlutterLaunchConfiguration<'_>,
+-        events: Sender<flutter_runtime::RuntimeEvent>,
+-        wayland_display: Option<OsString>,
+-        x11_display: Option<OsString>,
+-        output_control_socket: Option<OsString>,
+-        work_area: options::WorkAreaOptions,
+-        start_locked: bool,
+-    ) -> Result<Self, Box<dyn Error>> {
+-        let ui_development = ui_development::UiDevelopmentController::new(
+-            configuration.bundle,
+-            configuration.debug_bundle,
+-            configuration.ui_workspace,
+-        );
+-        Ok(Self {
+-            factory: Some(flutter_runtime::FlutterRuntimeFactory::new(
+-                configuration.bundle,
+-                denial_flutter_engine::DartRuntimeMode::Aot,
+-                configuration.renderer_backend,
+-            )?),
+-            renderer_backend: configuration.renderer_backend,
+-            offscreen_blit: configuration.offscreen_blit,
+-            active_mode: ui_development::UiRuntimeMode::OfficialOptimized,
+-            resident_jit_engine_fingerprint: None,
+-            ui_development,
+-            events,
+-            authentication: Arc::new(authentication::AuthenticationController::new(start_locked)?),
+-            clipboard: clipboard::ClipboardManager::default(),
+-            wayland_display,
+-            x11_display,
+-            output_control_socket,
+-            work_area,
+-            generation: 0,
+-        })
+-    }
+-
+-    pub(super) fn uses_offscreen_blit(&self) -> bool {
+-        self.offscreen_blit
+-    }
+-
+     pub(super) fn prepare_output_targets(
+         &self,
+         renderer: &GlesRenderer,
+         swapchains: &OutputSwapchains,
+         desktop_size: PixelSize,
+     ) -> Result<flutter_runtime::PreparedFlutterRenderer, Box<dyn Error>> {
+-        flutter_runtime::PreparedFlutterRenderer::new(
++        self.prepare_with_pools(
+             renderer.egl_context(),
+             flutter_render_target_pools(swapchains),
+             desktop_size,
+-            self.renderer_backend,
+-            self.offscreen_blit,
+-            self.events.clone(),
+         )
+     }
+ 
+@@ -1033,83 +961,6 @@
+         scanouts: &[Scanout],
+         snapshot: &TopologySnapshot,
+         atlas: &AtlasPlan,
+-        prepared: Option<flutter_runtime::PreparedFlutterRenderer>,
+-    ) -> Result<flutter_runtime::FlutterRuntime, Box<dyn Error>> {
+-        self.generation = self.generation.wrapping_add(1).max(1);
+-        if let Err(error) = self.activate_requested_factory() {
+-            let failed_mode = self.ui_development.desired_mode();
+-            if failed_mode == ui_development::UiRuntimeMode::OfficialOptimized {
+-                return Err(error);
+-            }
+-            self.ui_development
+-                .runtime_failed(failed_mode, error.as_ref());
+-            warn!(
+-                %error,
+-                ?failed_mode,
+-                "could not prepare custom Flutter runtime; restoring the packaged shell"
+-            );
+-            self.replace_factory(ui_development::UiRuntimeMode::OfficialOptimized)?;
+-        }
+-        let refresh_millihz = scanouts
+-            .iter()
+-            .map(|scanout| OutputMode::from(scanout.output.mode).refresh)
+-            .max()
+-            .ok_or("Flutter runtime has no output refresh")?;
+-        let using_prepared = prepared.is_some();
+-        let runtime = self.start_with_current_factory(
+-            renderer.egl_context(),
+-            flutter_render_target_pools(output_swapchains),
+-            snapshot,
+-            atlas,
+-            scanouts,
+-            u32::try_from(refresh_millihz)?,
+-            prepared,
+-        );
+-        let mut runtime = match runtime {
+-            Ok(runtime) => runtime,
+-            Err(error) if self.active_mode != ui_development::UiRuntimeMode::OfficialOptimized => {
+-                let failed_mode = self.active_mode;
+-                self.ui_development
+-                    .runtime_failed(failed_mode, error.as_ref());
+-                warn!(
+-                    %error,
+-                    ?failed_mode,
+-                    "custom Flutter runtime failed; selecting the packaged shell"
+-                );
+-                self.replace_factory(ui_development::UiRuntimeMode::OfficialOptimized)?;
+-                if using_prepared {
+-                    // The failed engine consumed this preparation. Let the
+-                    // topology transaction restore its prepared rollback
+-                    // renderer; never reimport targets after old-engine teardown.
+-                    return Err(error);
+-                }
+-                self.start_with_current_factory(
+-                    renderer.egl_context(),
+-                    flutter_render_target_pools(output_swapchains),
+-                    snapshot,
+-                    atlas,
+-                    scanouts,
+-                    u32::try_from(refresh_millihz)?,
+-                    None,
+-                )?
+-            }
+-            Err(error) => return Err(error),
+-        };
+-        self.ui_development
+-            .runtime_started(self.active_mode, self.generation);
+-        self.publish_ui_development_state(&mut runtime)?;
+-        Ok(runtime)
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    fn start_with_current_factory<'a>(
+-        &self,
+-        shared_context: &EGLContext,
+-        output_pools: impl IntoIterator<Item = flutter_runtime::OutputRenderTargetPool<'a>>,
+-        snapshot: &TopologySnapshot,
+-        atlas: &AtlasPlan,
+-        scanouts: &[Scanout],
+-        refresh_millihz: u32,
+         prepared: Option<flutter_runtime::PreparedFlutterRenderer>,
+     ) -> Result<flutter_runtime::FlutterRuntime, Box<dyn Error>> {
+         if let Some(scanout) = scanouts
+@@ -1122,230 +973,20 @@
+             )
+             .into());
+         }
+-        flutter_runtime::FlutterRuntime::start(
+-            shared_context,
+-            output_pools,
++        let refresh_millihz = scanouts
++            .iter()
++            .map(|scanout| OutputMode::from(scanout.output.mode).refresh)
++            .max()
++            .ok_or("Flutter runtime has no output refresh")?;
++        self.start_with_pools(
++            renderer.egl_context(),
++            flutter_render_target_pools(output_swapchains),
+             snapshot,
+             atlas,
+-            refresh_millihz,
+-            self.offscreen_blit,
+-            self.factory
+-                .as_ref()
+-                .ok_or("Flutter launcher has no active runtime factory")?,
+-            self.events.clone(),
+-            Arc::clone(&self.authentication),
+-            self.clipboard.clone(),
+-            self.work_area.clone(),
+-            self.generation,
+-            self.wayland_display.clone(),
+-            self.x11_display.clone(),
+-            self.output_control_socket.clone(),
++            u32::try_from(refresh_millihz)?,
+             prepared,
+         )
+     }
+-
+-    fn activate_requested_factory(&mut self) -> Result<(), Box<dyn Error>> {
+-        let requested = self.ui_development.desired_mode();
+-        if requested == self.active_mode
+-            && self
+-                .factory
+-                .as_ref()
+-                .is_some_and(|f| Some(f.bundle()) == self.ui_development.bundle_for(requested))
+-        {
+-            if requested == ui_development::UiRuntimeMode::LiveDevelopment {
+-                let bundle = self
+-                    .ui_development
+-                    .bundle_for(requested)
+-                    .ok_or("live development has no configured Flutter bundle")?;
+-                let prepared = flutter_runtime::bundle_engine_fingerprint(bundle)?;
+-                ensure_resident_jit_engine_matches(
+-                    self.resident_jit_engine_fingerprint.as_ref(),
+-                    &prepared,
+-                )?;
+-            }
+-            return Ok(());
+-        }
+-        self.replace_factory(requested)
+-    }
+-
+-    fn replace_factory(
+-        &mut self,
+-        requested: ui_development::UiRuntimeMode,
+-    ) -> Result<(), Box<dyn Error>> {
+-        let bundle = self
+-            .ui_development
+-            .bundle_for(requested)
+-            .ok_or_else(|| format!("{requested:?} has no configured Flutter bundle"))?
+-            .to_owned();
+-        let runtime = match requested {
+-            ui_development::UiRuntimeMode::OfficialOptimized => {
+-                denial_flutter_engine::DartRuntimeMode::Aot
+-            }
+-            ui_development::UiRuntimeMode::CustomOptimized => {
+-                if self.ui_development.uses_release_plugins() {
+-                    denial_flutter_engine::DartRuntimeMode::Aot
+-                } else {
+-                    denial_flutter_engine::DartRuntimeMode::AotProfile
+-                }
+-            }
+-            ui_development::UiRuntimeMode::LiveDevelopment => {
+-                denial_flutter_engine::DartRuntimeMode::Jit
+-            }
+-            ui_development::UiRuntimeMode::Unavailable => {
+-                return Err("cannot launch an unavailable Flutter runtime".into());
+-            }
+-        };
+-        let jit_engine_fingerprint = (requested == ui_development::UiRuntimeMode::LiveDevelopment)
+-            .then(|| flutter_runtime::bundle_engine_fingerprint(&bundle))
+-            .transpose()?;
+-        if let Some(prepared) = jit_engine_fingerprint.as_ref() {
+-            ensure_resident_jit_engine_matches(
+-                self.resident_jit_engine_fingerprint.as_ref(),
+-                prepared,
+-            )?;
+-        }
+-
+-        // AOT and JIT Flutter libraries each own process-global Dart state.
+-        // The old runtime is shut down before this method is reached; release
+-        // its library before loading the other runtime mode.
+-        self.factory = None;
+-        self.factory = Some(
+-            if requested == ui_development::UiRuntimeMode::CustomOptimized
+-                && self.ui_development.uses_release_plugins()
+-            {
+-                flutter_runtime::FlutterRuntimeFactory::with_engine(
+-                    &bundle,
+-                    self.ui_development
+-                        .bundle_for(ui_development::UiRuntimeMode::OfficialOptimized)
+-                        .expect("packaged recovery bundle"),
+-                    runtime,
+-                    self.renderer_backend,
+-                )?
+-            } else {
+-                flutter_runtime::FlutterRuntimeFactory::new(
+-                    &bundle,
+-                    runtime,
+-                    self.renderer_backend,
+-                )?
+-            },
+-        );
+-        if let Some(fingerprint) = jit_engine_fingerprint {
+-            self.resident_jit_engine_fingerprint = Some(fingerprint);
+-        }
+-        self.active_mode = requested;
+-        Ok(())
+-    }
+-
+-    pub(super) fn synchronize_ui_development(
+-        &mut self,
+-        runtime: &mut flutter_runtime::FlutterRuntime,
+-    ) -> Result<bool, Box<dyn Error>> {
+-        let health = self
+-            .ui_development
+-            .poll_plugin_health(runtime.has_produced_frame());
+-        let vm_service_uri = runtime.take_vm_service_uri();
+-        let vm_service_changed = vm_service_uri.is_some();
+-        let commands = runtime.drain_ui_development_commands().collect::<Vec<_>>();
+-        if let Some(uri) = vm_service_uri {
+-            self.ui_development.set_vm_service_uri(uri);
+-        }
+-        if commands.is_empty() && !vm_service_changed && health.is_none() {
+-            return Ok(false);
+-        }
+-        let mut reload_requested =
+-            matches!(health, Some(ui_development::UiDevelopmentEffect::Reload(_)));
+-        for command in commands {
+-            if let ui_development::UiDevelopmentEffect::Reload(requested_mode) =
+-                self.ui_development.handle_command(command)
+-            {
+-                debug_assert_eq!(self.ui_development.desired_mode(), requested_mode);
+-                reload_requested = true;
+-            }
+-        }
+-        let publication = self.publish_ui_development_state(runtime);
+-        resolve_ui_development_publication(reload_requested, publication)?;
+-        Ok(reload_requested)
+-    }
+-
+-    pub(super) fn handle_external_ui_development(
+-        &mut self,
+-        runtime: &mut flutter_runtime::FlutterRuntime,
+-        command: ui_development::UiDevelopmentCommand,
+-    ) -> (bool, ui_development::UiDevelopmentState) {
+-        let (effect, reply) = self.ui_development.handle_external_command(command);
+-        let reload_requested = matches!(effect, ui_development::UiDevelopmentEffect::Reload(_));
+-        // denialctl is the recovery path when Flutter itself is unavailable
+-        // or unhealthy. Updating the shell is useful, but it must never be a
+-        // prerequisite for accepting an external restore command.
+-        if let Err(error) = self.publish_ui_development_state(runtime) {
+-            warn!(%error, "could not publish denialctl UI state to Flutter");
+-        }
+-        (reload_requested, reply)
+-    }
+-
+-    pub(super) fn retain_runtime_after_switch_failure(
+-        &mut self,
+-        runtime: &mut flutter_runtime::FlutterRuntime,
+-        error: &dyn std::fmt::Display,
+-    ) {
+-        let failed_mode = self.ui_development.desired_mode();
+-        self.ui_development
+-            .runtime_switch_failed_preserving_active(failed_mode, error);
+-        if let Err(publication_error) = self.publish_ui_development_state(runtime) {
+-            warn!(
+-                %publication_error,
+-                %error,
+-                ?failed_mode,
+-                "could not publish retained Flutter runtime after runtime switch failure"
+-            );
+-        }
+-    }
+-
+-    fn publish_ui_development_state(
+-        &self,
+-        runtime: &mut flutter_runtime::FlutterRuntime,
+-    ) -> Result<(), Box<dyn Error>> {
+-        let packet = self.ui_development.state_packet()?;
+-        runtime.publish_ui_development_state(&packet)
+-    }
+-
+-    pub(super) fn set_work_area(&mut self, work_area: options::WorkAreaOptions) {
+-        self.work_area = work_area;
+-    }
+-}
+-
+-#[cfg(feature = "flutter")]
+-fn resolve_ui_development_publication(
+-    reload_requested: bool,
+-    publication: Result<(), Box<dyn Error>>,
+-) -> Result<(), Box<dyn Error>> {
+-    match publication {
+-        Err(error) if reload_requested => {
+-            // A runtime-mode switch replaces the Flutter engine in process. The
+-            // retiring engine can reject this final state message, but start()
+-            // publishes the complete state again after its replacement is up.
+-            warn!(
+-                %error,
+-                "could not publish UI development state before Flutter runtime refresh"
+-            );
+-            Ok(())
+-        }
+-        publication => publication,
+-    }
+-}
+-
+-#[cfg(feature = "flutter")]
+-fn ensure_resident_jit_engine_matches(
+-    resident: Option<&[u8; 32]>,
+-    prepared: &[u8; 32],
+-) -> Result<(), Box<dyn Error>> {
+-    if resident.is_some_and(|resident| resident != prepared) {
+-        return Err(
+-            "The prepared JIT Flutter engine changed after this Denial session loaded its native development runtime. Restart the Denial session before enabling live UI development."
+-                .into(),
+-        );
+-    }
+-    Ok(())
+ }
+ 
+ fn common_xrgb8888_modifiers<'a>(
+diff --git a/compositor/src/bin/deniald/native_shortcut.rs b/compositor/src/bin/deniald/native_shortcut.rs
+--- a/compositor/src/bin/deniald/native_shortcut.rs
++++ b/compositor/src/bin/deniald/native_shortcut.rs
+@@ -1841,6 +1841,7 @@
+ #[derive(Clone, Debug)]
+ pub(super) struct ShortcutEngine {
+     bindings: Vec<CompiledShortcut>,
++    swap_alt_super: bool,
+     available_plugin_actions: HashSet<String>,
+     ctrl_keys: u8,
+     alt_keys: u8,
+@@ -1860,8 +1861,17 @@
+ 
+ impl ShortcutEngine {
+     fn from_file(file: &ShortcutFile) -> Result<Self, ShortcutError> {
++        let swap_alt_super = std::env::var("DENIAL_SUPER_MODIFIER").ok().as_deref() == Some("alt");
++        Self::from_file_with_modifier(file, swap_alt_super)
++    }
++
++    fn from_file_with_modifier(
++        file: &ShortcutFile,
++        swap_alt_super: bool,
++    ) -> Result<Self, ShortcutError> {
+         Ok(Self {
+             bindings: compile_shortcuts(file)?,
++            swap_alt_super,
+             available_plugin_actions: HashSet::new(),
+             ctrl_keys: 0,
+             alt_keys: 0,
+@@ -2012,7 +2022,23 @@
+     }
+ 
+     /// Observe a Linux evdev keycode before it enters Smithay's seat state.
++    /// One involutive mapping for shortcuts, launcher taps, pointer chords and
++    /// client XKB input. Do not edit shortcuts.json or mutate a held key's map.
++    pub(super) fn client_keycode(&self, evdev_keycode: u32) -> u32 {
++        if !self.swap_alt_super {
++            return evdev_keycode;
++        }
++        match evdev_keycode {
++            KEY_LEFT_ALT => KEY_LEFT_META,
++            KEY_RIGHT_ALT => KEY_RIGHT_META,
++            KEY_LEFT_META => KEY_LEFT_ALT,
++            KEY_RIGHT_META => KEY_RIGHT_ALT,
++            _ => evdev_keycode,
++        }
++    }
++
+     pub(super) fn observe(&mut self, evdev_keycode: u32, pressed: bool) -> ShortcutDisposition {
++        let evdev_keycode = self.client_keycode(evdev_keycode);
+         let logo_modifier = match evdev_keycode {
+             KEY_LEFT_META => Some(LEFT_MODIFIER),
+             KEY_RIGHT_META => Some(RIGHT_MODIFIER),
+@@ -2166,7 +2192,7 @@
+         }
+     }
+ 
+-    /// Whether either physical SUPER key is currently compositor-owned.
++    /// Whether either logical SUPER key (Alt when swapped) is compositor-owned.
+     #[cfg(any(feature = "flutter", test))]
+     pub(super) fn super_pressed(&self) -> bool {
+         self.logo_keys != 0
+diff --git a/compositor/src/bin/deniald/options.rs b/compositor/src/bin/deniald/options.rs
+--- a/compositor/src/bin/deniald/options.rs
++++ b/compositor/src/bin/deniald/options.rs
+@@ -103,8 +103,12 @@
+     Ok(padding)
+ }
+ 
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(super) enum DisplayBackend { #[default] Kms, Anland }
++
+ #[derive(Debug)]
+ pub(super) struct Options {
++    pub(super) backend: DisplayBackend,
+     pub(super) device: PathBuf,
+     pub(super) render_device: Option<PathBuf>,
+     commit_seconds: u64,
+@@ -150,6 +154,7 @@
+ impl Options {
+     fn terminal() -> Self {
+         Self {
++            backend: DisplayBackend::Kms,
+             device: PathBuf::from(DEFAULT_DEVICE),
+             render_device: None,
+             commit_seconds: 0,
+@@ -188,7 +193,8 @@
+         Self::parse_from(std::env::args().skip(1))
+     }
+ 
+-    fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn Error>> {
++    pub(super) fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn Error>> {
++        let mut backend = DisplayBackend::Kms;
+         let mut device = PathBuf::from(DEFAULT_DEVICE);
+         let mut render_device = None;
+         let mut commit_seconds = 0;
+@@ -225,6 +231,11 @@
+ 
+         while let Some(argument) = args.next() {
+             match argument.as_str() {
++                "--backend" => backend = match args.next().as_deref() {
++                    Some("kms") => DisplayBackend::Kms,
++                    Some("anland") => DisplayBackend::Anland,
++                    _ => return Err("--backend needs kms or anland".into()),
++                },
+                 "--device" => device = PathBuf::from(args.next().ok_or("--device needs a path")?),
+                 "--render-device" => {
+                     render_device = Some(PathBuf::from(
+@@ -345,7 +356,7 @@
+                 }
+                 "--help" | "-h" => {
+                     println!(
+-                        "Usage: deniald [--device PATH] [--render-device PATH] [--max-outputs N] \
++                        "Usage: deniald [--backend kms|anland] [--device PATH] [--render-device PATH] [--max-outputs N] \
+                          [--output-config PATH] \
+                          [--output-position NAME=X,Y] \
+                          [--next-output-position NAME=X,Y --reconfigure-at-frame N] \
+@@ -481,6 +492,7 @@
+             return Err("--wayland without Flutter currently requires --frames".into());
+         }
+         Ok(Self {
++            backend,
+             device,
+             render_device,
+             commit_seconds,
+diff --git a/compositor/src/bin/deniald/scene_sync.rs b/compositor/src/bin/deniald/scene_sync.rs
+--- a/compositor/src/bin/deniald/scene_sync.rs
++++ b/compositor/src/bin/deniald/scene_sync.rs
+@@ -127,6 +127,11 @@
+     }
+ 
+     #[cfg(feature = "flutter")]
++    pub(super) const fn metadata_revision(&self) -> u64 {
++        self.metadata_revision
++    }
++
++    #[cfg(feature = "flutter")]
+     pub(super) const fn buffer_revision(&self) -> u64 {
+         self.buffer_revision
+     }
+diff --git a/compositor/src/bin/deniald/startup.rs b/compositor/src/bin/deniald/startup.rs
+--- a/compositor/src/bin/deniald/startup.rs
++++ b/compositor/src/bin/deniald/startup.rs
+@@ -70,6 +70,12 @@
+ }
+ 
+ pub(super) fn run(options: Options) -> Result<(), Box<dyn Error>> {
++    if options.backend == options::DisplayBackend::Anland {
++        #[cfg(feature = "anland")]
++        return anland_backend::runtime::run(options);
++        #[cfg(not(feature = "anland"))]
++        return Err("this deniald binary was built without the `anland` Cargo feature".into());
++    }
+     #[cfg(not(feature = "flutter"))]
+     if options.flutter_bundle.is_some() {
+         return Err("this deniald binary was built without the `flutter` Cargo feature".into());
+@@ -359,9 +365,9 @@
+         let frontend = wayland_frontend::WaylandFrontend::new(
+             event_loop,
+             &snapshot,
+-            session.clone(),
++            Some(session.clone()),
+             &seat_name,
+-            drm_fd.clone(),
++            Some(drm_fd.clone()),
+             options.xwayland,
+             options.work_area.clone(),
+             output_configuration.scrolling_layout_axes.clone(),
+@@ -671,23 +677,10 @@
+ 
+     #[cfg(feature = "flutter")]
+     let mut flutter_launcher = if let Some(bundle) = options.flutter_bundle.as_deref() {
+-        use smithay::reexports::calloop::channel::{Event as ChannelEvent, channel};
+-
+         let event_loop = frame_event_loop
+             .as_mut()
+             .ok_or("Flutter runtime has no event loop")?;
+-        let (sender, source) = channel();
+-        event_loop.handle().insert_source(
+-            source,
+-            |event, _, state: &mut RuntimeState| match event {
+-                ChannelEvent::Msg(flutter_runtime::RuntimeEvent::SampledBuffersReady {
+-                    fence,
+-                    batch,
+-                }) => state.sampled_buffer_releases.push((fence, batch)),
+-                ChannelEvent::Msg(event) => state.flutter_events.push(event),
+-                ChannelEvent::Closed => state.flutter_channel_closed = true,
+-            },
+-        )?;
++        let sender = flutter_desktop::install_runtime_events(event_loop)?;
+         Some(FlutterLauncher::new(
+             FlutterLaunchConfiguration {
+                 bundle,
+@@ -768,60 +761,19 @@
+                 }
+             }
+         }
+-        // Non-systemd sessions also get the dedicated authentication agent.
+-        // This starts its backend only; the agent opens UI on a Polkit challenge.
+-        #[cfg(feature = "flutter")]
+-        if runtime_limit == RuntimeLimit::UntilLogout
+-            && !graphical_session_started
+-            && wayland.is_some()
+-            && options.polkit_agent
+-            && std::env::var("DENIAL_POLKIT_AGENT").as_deref() != Ok("0")
+-            && let Some(runtime) = flutter.as_mut()
+-        {
+-            let binary = std::env::var("DENIAL_POLKIT_BINARY")
+-                .unwrap_or_else(|_| "denial-polkit-agent".into());
+-            if let Err(error) =
+-                runtime.start_startup_application(vec![binary], "dev.denial.Polkit.desktop")
+-            {
+-                warn!(%error, "could not start authentication agent");
+-            }
+-        }
+-        // Onboarding belongs to compositor startup, not a systemd/XDG
+-        // autostart generator (which may be absent or already active).
+-        // The native application checks its completion marker before opening a window.
+-        // Bounded diagnostics and tests must never launch user applications.
+         #[cfg(feature = "flutter")]
+         if runtime_limit == RuntimeLimit::UntilLogout
+             && wayland.is_some()
+-            && let Some(runtime) = flutter.as_mut()
+-            && let Some(arguments) = welcome::launch_arguments()
+-            && let Err(error) =
+-                runtime.start_startup_application(arguments, "dev.denial.Welcome.desktop")
++            && let Some(runtime) = flutter.as_ref()
+         {
+-            warn!(%error, "could not start Welcome");
+-        }
+-        // Denial was updated under a confirmed plugin composition. The plugin
+-        // manager rebuilds it in the background, keeps the user informed and
+-        // applies it at a quiet moment; the packaged shell runs meanwhile.
+-        #[cfg(feature = "flutter")]
+-        if runtime_limit == RuntimeLimit::UntilLogout
+-            && wayland.is_some()
+-            && flutter_launcher
+-                .as_ref()
+-                .is_some_and(FlutterLauncher::plugin_rebuild_needed)
+-            && let Some(runtime) = flutter.as_mut()
+-        {
+-            if let Some(arguments) = plugin_bundle::resume_arguments() {
+-                if let Err(error) =
+-                    runtime.start_startup_application(arguments, "dev.denial.PluginManager.desktop")
+-                {
+-                    warn!(%error, "could not start the plugin rebuild after a Denial update");
+-                }
+-            } else {
+-                info!(
+-                    "plugins need a rebuild for this Denial version; the plugin manager is not installed"
+-                );
+-            }
++            flutter_desktop::start_startup_applications(
++                runtime,
++                options.polkit_agent,
++                graphical_session_started,
++                flutter_launcher
++                    .as_ref()
++                    .is_some_and(FlutterLauncher::plugin_rebuild_needed),
++            );
+         }
+         if options.flutter_bundle.is_some() {
+             #[cfg(feature = "flutter")]
+diff --git a/compositor/src/bin/deniald/wayland_frontend.rs b/compositor/src/bin/deniald/wayland_frontend.rs
+--- a/compositor/src/bin/deniald/wayland_frontend.rs
++++ b/compositor/src/bin/deniald/wayland_frontend.rs
+@@ -139,6 +139,8 @@
+     WindowOpacityClass, WindowPlacement, WindowPlacementChange, WindowPlacementPhase,
+ };
+ 
++#[path = "wayland_frontend/capture_policy.rs"]
++mod capture_policy;
+ #[path = "wayland_frontend/clipboard.rs"]
+ mod clipboard_io;
+ #[path = "wayland_frontend/cursor_state.rs"]
+@@ -155,6 +157,8 @@
+ #[cfg(feature = "flutter")]
+ #[path = "wayland_frontend/idle_inhibit.rs"]
+ mod idle_inhibit;
++#[path = "wayland_frontend/injected_text.rs"]
++pub(crate) mod injected_text;
+ #[path = "wayland_frontend/input.rs"]
+ mod input;
+ #[path = "wayland_frontend/input_method.rs"]
+@@ -193,6 +197,8 @@
+ mod surface_snapshot;
+ #[path = "wayland_frontend/text_input.rs"]
+ mod text_input;
++#[cfg(feature = "external-output")]
++pub(crate) use text_input::ConsumerTextDelivery;
+ #[path = "wayland_frontend/topology.rs"]
+ mod topology;
+ #[cfg(feature = "flutter")]
+@@ -231,6 +237,8 @@
+ use handlers::{MAX_WAYLAND_CLIENTS, WaylandClientBudget};
+ #[cfg(feature = "flutter")]
+ use idle_inhibit::IdleInhibitors;
++#[cfg(feature = "external-output")]
++pub(super) use input::process_routed_input_event;
+ #[cfg(feature = "flutter")]
+ use input::{ClientInputRoute, RoutedPointerTarget};
+ pub(super) use input::{init_libinput, reset_all_input_devices};
+@@ -590,9 +598,9 @@
+     wlr_data_control_state: WlrDataControlState,
+     pub popups: PopupManager,
+     pub seat: Seat<RuntimeState>,
+-    session: LibSeatSession,
++    session: Option<LibSeatSession>,
+     layer_shell_state: WlrLayerShellState,
+-    libinput: smithay::reexports::input::Libinput,
++    libinput: Option<smithay::reexports::input::Libinput>,
+     pub(super) settings: SettingsManager,
+     pub(super) shortcuts: ShortcutManager,
+     pub(super) keyboard_layout_names: Vec<String>,
+@@ -1208,3 +1216,6 @@
+ #[cfg(feature = "flutter")]
+ #[path = "wayland_frontend/wake_gesture.rs"]
+ mod wake_gesture;
++
++#[cfg(feature = "external-output")]
++pub(crate) use input::dispatch_consumer_keyboard_text;
+diff --git a/compositor/src/bin/deniald/wayland_frontend/capture_policy.rs b/compositor/src/bin/deniald/wayland_frontend/capture_policy.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/wayland_frontend/capture_policy.rs
+@@ -0,0 +1,20 @@
++//! Native pointer-lock ownership; no transport or Android capture confirmation.
++#[derive(Clone, Copy, Default)]
++pub(crate) struct CaptureFacts {
++    pub active_locked: bool,
++    pub same_client_focus: bool,
++    pub escaped: bool,
++    pub shell_owns_keyboard: bool,
++    pub shell_pointer_press: bool,
++    pub dragging: bool,
++}
++impl CaptureFacts {
++    pub fn requested(self) -> bool {
++        self.active_locked
++            && self.same_client_focus
++            && !self.escaped
++            && !self.shell_owns_keyboard
++            && !self.shell_pointer_press
++            && !self.dragging
++    }
++}
+diff --git a/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs b/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
+@@ -73,6 +73,7 @@
+     latch_output_sequence: u64,
+     latch_deadline: Instant,
+     ready_commits: u32,
++    awaiting_consumer: bool,
+     missed_commits: u32,
+     configure_discards: u32,
+ }
+@@ -227,6 +228,43 @@
+         }
+     }
+ 
++    #[cfg(feature = "external-output")]
++    pub(super) fn consumer_submitted(&mut self, output: OutputId, sequence: u64) {
++        for record in self.grants.values_mut() {
++            if record.output == output
++                && record.latch_output_sequence == sequence
++                && record.ready_commits != 0
++            {
++                record.awaiting_consumer = true;
++            }
++        }
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(super) fn consumer_completed(&mut self, output: OutputId, sequence: u64, accepted: bool) {
++        let tokens: Vec<_> = self
++            .grants
++            .iter()
++            .filter_map(|(token, record)| {
++                (record.output == output
++                    && record.latch_output_sequence == sequence
++                    && record.ready_commits != 0)
++                    .then_some(*token)
++            })
++            .collect();
++        for token in tokens {
++            // Terminal correlation only; ACK is not a hardware timestamp.
++            self.finish(
++                token,
++                if accepted {
++                    FrameTerminal::Presented
++                } else {
++                    FrameTerminal::MissedDeadline
++                },
++            );
++        }
++    }
++
+     fn expire_at_latch(&mut self, output: OutputId, output_sequence: u64) {
+         let due = self
+             .grants
+@@ -240,6 +278,11 @@
+             let Some(record) = self.grants.get(&token) else {
+                 continue;
+             };
++            // Consumer ACK can arrive several local ticks later. Once a frame
++            // was accepted, cadence advancement must not fabricate a drop.
++            if record.awaiting_consumer {
++                continue;
++            }
+             let terminal = if record.latch_output_sequence < output_sequence {
+                 Some(FrameTerminal::MissedDeadline)
+             } else if record.ready_commits != 0 {
+@@ -295,6 +338,7 @@
+                 latch_output_sequence,
+                 latch_deadline: tick.presentation_target,
+                 ready_commits: 0,
++                awaiting_consumer: false,
+                 missed_commits: 0,
+                 configure_discards: 0,
+             },
+diff --git a/compositor/src/bin/deniald/wayland_frontend/injected_text.rs b/compositor/src/bin/deniald/wayland_frontend/injected_text.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/wayland_frontend/injected_text.rs
+@@ -0,0 +1,36 @@
++//! Bounds and client-only keymap policy for externally injected native text.
++pub const MAX_COMMIT_BYTES: usize = 4000;
++pub fn valid_commit(text: &str) -> bool {
++    !text.is_empty() && text.len() <= MAX_COMMIT_BYTES && !text.contains('\0')
++}
++
++/// A bounded client-only map transaction, never a physical-seat keymap.
++pub const LEGACY_KEYMAP_CHARS: usize = 247;
++pub fn valid_legacy_commit(text: &str) -> bool {
++    valid_commit(text)
++        && text
++            .chars()
++            .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t' | '\u{8}'))
++}
++pub fn legacy_keymap(chars: &[char]) -> String {
++    assert!(!chars.is_empty() && chars.len() <= LEGACY_KEYMAP_CHARS);
++    let mut map = String::from("xkb_keymap { xkb_keycodes { minimum = 9; maximum = 255; ");
++    for index in 0..chars.len() {
++        map.push_str(&format!("<K{index:03}> = {}; ", index + 9));
++    }
++    map.push_str("}; xkb_types { type \"ONE_LEVEL\" { modifiers = None; map[None] = Level1; }; }; xkb_compatibility {}; xkb_symbols { ");
++    for (index, character) in chars.iter().enumerate() {
++        let symbol = match character {
++            '\n' | '\r' => 0xff0d,
++            '\t' => 0xff09,
++            '\u{8}' => 0xff08,
++            c if u32::from(*c) <= 0xff => u32::from(*c),
++            c => 0x01000000 | u32::from(*c),
++        };
++        map.push_str(&format!(
++            "key <K{index:03}> {{ type=\"ONE_LEVEL\", [ 0x{symbol:x} ] }}; "
++        ));
++    }
++    map.push_str("}; };");
++    map
++}
+diff --git a/compositor/src/bin/deniald/wayland_frontend/input.rs b/compositor/src/bin/deniald/wayland_frontend/input.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/input.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/input.rs
+@@ -5,8 +5,9 @@
+ use denial_core::topology::OutputTransform;
+ use smithay::backend::input::{
+     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
+-    GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputEvent, KeyState,
+-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
++    GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent,
++    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
++    TouchEvent,
+ };
+ #[cfg(feature = "flutter")]
+ use smithay::backend::input::{Switch, SwitchState, SwitchToggleEvent};
+@@ -27,7 +28,6 @@
+ use smithay::reexports::calloop::EventLoop;
+ #[cfg(feature = "flutter")]
+ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+-use smithay::reexports::input::event::pointer::PointerEventTrait;
+ use smithay::reexports::input::{Device as LibinputDevice, Libinput, TapButtonMap};
+ #[cfg(feature = "flutter")]
+ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+@@ -87,13 +87,13 @@
+ pub(crate) use flutter_route::reconcile_flutter_pointer_route;
+ use wayland_route::process_wayland_input_event;
+ 
+-fn output_bound_absolute_position<E>(
++fn output_bound_absolute_position<B: InputBackend, E>(
+     event: &E,
+     bounds: Rectangle<i32, Logical>,
+     transform: OutputTransform,
+ ) -> Point<f64, Logical>
+ where
+-    E: AbsolutePositionEvent<LibinputInputBackend>,
++    E: AbsolutePositionEvent<B>,
+ {
+     let (x, y) = transform.native_to_logical(
+         event.x_transformed(1).clamp(0.0, 1.0),
+@@ -356,6 +356,122 @@
+     }
+ }
+ 
++#[cfg(feature = "external-output")]
++pub(crate) fn dispatch_consumer_keyboard_text(
++    state: &mut RuntimeState,
++    target: &super::text_input::ConsumerTextTarget,
++    text: &str,
++) -> bool {
++    use smithay::input::keyboard::KeymapFile;
++    use smithay::reexports::wayland_server::protocol::{wl_keyboard, wl_keyboard::KeymapFormat};
++    use smithay::wayland::seat::WaylandFocus;
++    use std::os::fd::AsFd;
++    let Some(frontend) = state.wayland.as_ref() else {
++        return false;
++    };
++    if state.secure_session_locked()
++        || !super::injected_text::valid_legacy_commit(text)
++        || frontend.consumer_text_target().as_ref() != Some(target)
++    {
++        return false;
++    }
++    let Some(keyboard) = frontend.seat.get_keyboard() else {
++        return false;
++    };
++    let Some(surface) = keyboard
++        .current_focus()
++        .and_then(|focus| focus.wl_surface().map(|s| s.into_owned()))
++    else {
++        return false;
++    };
++    let Ok(client) = frontend.display_handle.get_client(surface.id()) else {
++        return false;
++    };
++    let keyboards: Vec<_> = keyboard.client_keyboards(&client).collect();
++    if keyboards.is_empty() {
++        return false;
++    }
++    let time = frontend.start_time.elapsed().as_millis() as u32;
++    let mods = keyboard.modifier_state().serialized;
++    let original = keyboard.with_xkb_state(state, |context| {
++        let xkb = context.xkb().lock().unwrap();
++        // SAFETY: borrowed keymap only used under the XKB mutex, no reference escapes.
++        KeymapFile::new(unsafe { xkb.keymap() })
++    });
++    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
++    let chars: Vec<_> = text.chars().collect();
++    // Compile and prepare ALL files before sending anything: bad input/keymap
++    // cannot leave a partial prefix or the client's keymap replaced.
++    let mut chunks = Vec::new();
++    for chunk in chars.chunks(super::injected_text::LEGACY_KEYMAP_CHARS) {
++        let source = super::injected_text::legacy_keymap(chunk);
++        let Some(map) = xkb::Keymap::new_from_string(
++            &context,
++            source,
++            xkb::KEYMAP_FORMAT_TEXT_V1,
++            xkb::KEYMAP_COMPILE_NO_FLAGS,
++        ) else {
++            warn!("consumer Unicode keymap compilation failed");
++            return false;
++        };
++        chunks.push((KeymapFile::new(&map), chunk.len()));
++    }
++    // with_fd(false) creates a fresh writable tempfile for old protocol clients.
++    // Retain duplicated prepared fds before ANY events, including restoration;
++    // a second with_fd() is not guaranteed to succeed under fd/disk pressure.
++    let prepare = |file: &KeymapFile| -> std::io::Result<_> {
++        let mut prepared = None;
++        file.with_fd(false, |fd, size| {
++            prepared = Some(fd.try_clone_to_owned().map(|owned| (owned, size)));
++        })?;
++        prepared.expect("with_fd did not invoke its callback")
++    };
++    let Ok((original_fd, original_size)) = prepare(&original) else {
++        warn!("consumer original keymap file preparation failed");
++        return false;
++    };
++    let mut prepared = Vec::new();
++    for (file, count) in &chunks {
++        let Ok((fd, size)) = prepare(file) else {
++            warn!("consumer Unicode keymap file preparation failed");
++            return false;
++        };
++        prepared.push((fd, size, *count));
++    }
++    // No fallible preparation, event-loop dispatch or physical XKB mutation
++    // occurs after this point. Ordered events restore the same client's map
++    // and its exact modifiers, without touching clipboard or other clients.
++    for (fd, size, count) in &prepared {
++        for resource in &keyboards {
++            resource.keymap(KeymapFormat::XkbV1, fd.as_fd(), *size as u32);
++            resource.modifiers(SERIAL_COUNTER.next_serial().into(), 0, 0, 0, 0);
++        }
++        for index in 0..*count {
++            let raw = index as u32 + 1; // XKB 9..255, evdev 1..247.
++            let serial = SERIAL_COUNTER.next_serial();
++            for resource in &keyboards {
++                resource.key(serial.into(), time, raw, wl_keyboard::KeyState::Pressed);
++                resource.key(serial.into(), time, raw, wl_keyboard::KeyState::Released);
++            }
++        }
++    }
++    for resource in &keyboards {
++        resource.keymap(
++            KeymapFormat::XkbV1,
++            original_fd.as_fd(),
++            original_size as u32,
++        );
++        resource.modifiers(
++            SERIAL_COUNTER.next_serial().into(),
++            mods.depressed,
++            mods.latched,
++            mods.locked,
++            mods.layout_effective,
++        );
++    }
++    true
++}
++
+ #[cfg(feature = "flutter")]
+ #[derive(Clone)]
+ pub(super) struct ClientInputRoute {
+@@ -958,13 +1074,18 @@
+ 
+ impl WaylandFrontend {
+     pub(in super::super) fn suspend_input_session(&mut self) {
+-        self.libinput.suspend();
++        if let Some(libinput) = self.libinput.as_mut() {
++            libinput.suspend();
++        }
+     }
+ 
+     pub(in super::super) fn resume_input_session(&mut self) -> Result<(), &'static str> {
+-        self.libinput
+-            .resume()
+-            .map_err(|()| "libinput rejected session resume")
++        if let Some(libinput) = self.libinput.as_mut() {
++            libinput
++                .resume()
++                .map_err(|()| "libinput rejected session resume")?;
++        }
++        Ok(())
+     }
+ }
+ 
+@@ -979,6 +1100,9 @@
+     if intercept_native_escape(state, keycode.raw(), key_state) {
+         return true;
+     }
++    let keycode = Keycode::new(keycode.raw().checked_sub(8).map_or(keycode.raw(), |evdev| {
++        state.native_escape_shortcut.client_keycode(evdev) + 8
++    }));
+     if !state.secure_session_locked() {
+         focus_exclusive_layer_for_keyboard_event(state);
+     }
+@@ -1445,6 +1569,42 @@
+     }
+ 
+     #[cfg(feature = "flutter")]
++    if matches!(
++        &event,
++        InputEvent::GestureSwipeBegin { .. }
++            | InputEvent::GestureSwipeUpdate { .. }
++            | InputEvent::GestureSwipeEnd { .. }
++            | InputEvent::TabletToolAxis { .. }
++            | InputEvent::TabletToolProximity { .. }
++            | InputEvent::TabletToolTip { .. }
++            | InputEvent::TabletToolButton { .. }
++    ) {
++        state.note_user_activity();
++    }
++    // Device-specific processing stays libinput-only. Never fabricate a
++    // LibinputDevice for a consumer keyboard/pointer/touch event.
++    #[cfg(feature = "flutter")]
++    if let Some(flush_clients) = process_touchpad_gesture_event(state, &event) {
++        return flush_clients;
++    }
++    if tablet::process_event(state, &event) || tablet_clients_changed {
++        return true;
++    }
++    let power_device = match &event {
++        InputEvent::Keyboard { event } => event.device().sysname().to_owned(),
++        _ => String::new(),
++    };
++    process_routed_input_event(state, event, &power_device)
++}
++
++/// Backend-independent native route. Device setup and protocol decoding remain
++/// at their original boundaries; focus, binds and secure-session policy are shared.
++pub(in super::super) fn process_routed_input_event<B: InputBackend>(
++    state: &mut RuntimeState,
++    event: InputEvent<B>,
++    power_device: &str,
++) -> bool {
++    #[cfg(feature = "flutter")]
+     if let InputEvent::Keyboard {
+         event: key_event, ..
+     } = &event
+@@ -1453,10 +1613,9 @@
+         // sequence before note_user_activity: waking first would invert an
+         // off-to-on toggle, and routing the release would undo on-to-off.
+         if key_event.key_code().raw() == 116 + 8 {
+-            state.power_button.note_key(
+-                key_event.device().sysname(),
+-                key_event.state() == KeyState::Pressed,
+-            );
++            state
++                .power_button
++                .note_key(power_device, key_event.state() == KeyState::Pressed);
+             return false;
+         }
+         return process_keyboard_transition(
+@@ -1500,19 +1659,6 @@
+         state.note_user_activity();
+     }
+ 
+-    #[cfg(feature = "flutter")]
+-    if let Some(flush_clients) = process_touchpad_gesture_event(state, &event) {
+-        return flush_clients;
+-    }
+-
+-    if tablet::process_event(state, &event) {
+-        return true;
+-    }
+-
+-    if tablet_clients_changed {
+-        return true;
+-    }
+-
+     #[cfg(not(feature = "flutter"))]
+     match &event {
+         InputEvent::Keyboard {
+@@ -1539,6 +1685,61 @@
+ 
+     process_wayland_input_event(state, event);
+     true
++}
++
++#[cfg(feature = "external-output")]
++impl WaylandFrontend {
++    /// Query only: never activate a client's constraint or infer capture from
++    /// ordinary button grabs. The existing native routes decide lock ownership.
++    pub(crate) fn consumer_pointer_capture_requested(&self, shell_pointer_press: bool) -> bool {
++        use super::capture_policy::CaptureFacts;
++        use smithay::utils::IsAlive;
++        use smithay::wayland::seat::WaylandFocus;
++        let Some(pointer) = self.seat.get_pointer() else {
++            return false;
++        };
++        let Some(surface) = pointer.current_focus().filter(|surface| surface.is_alive()) else {
++            return false;
++        };
++        let keyboard_focus = self
++            .seat
++            .get_keyboard()
++            .and_then(|keyboard| keyboard.current_focus());
++        let same_client_focus = keyboard_focus.as_ref().is_some_and(|focus| {
++            focus.alive()
++                && focus
++                    .wl_surface()
++                    .is_some_and(|focused| focused.as_ref() == &surface)
++        });
++        let active_locked = with_pointer_constraint(&surface, &pointer, |constraint| {
++            constraint.is_some_and(|constraint| {
++                constraint.is_active() && matches!(&*constraint, PointerConstraint::Locked(_))
++            })
++        });
++        CaptureFacts {
++            active_locked,
++            same_client_focus,
++            escaped: self.pointer_constraint_released_for_surface(&surface),
++            shell_owns_keyboard: self.shell_captures_keyboard(),
++            shell_pointer_press,
++            dragging: self.clipboard_drag_active,
++        }
++        .requested()
++    }
++
++    /// Input disconnect/engine retirement cannot leave a native lock active for
++    /// a replacement consumer. Normal input reset handles real key/button ups.
++    pub(crate) fn release_consumer_pointer_constraint(&mut self) {
++        if let Some(pointer) = self.seat.get_pointer()
++            && let Some(surface) = pointer.current_focus()
++        {
++            with_pointer_constraint(&surface, &pointer, |constraint| {
++                if let Some(constraint) = constraint {
++                    constraint.deactivate();
++                }
++            });
++        }
++    }
+ }
+ 
+ pub(in super::super) fn reset_all_input_devices(state: &mut RuntimeState) {
+@@ -2095,8 +2296,9 @@
+             let result = if let Some(frontend) = state.wayland.as_mut() {
+                 frontend
+                     .session
+-                    .change_vt(vt)
+-                    .map_err(|error| error.to_string())
++                    .as_mut()
++                    .ok_or_else(|| "This display backend has no physical VT session".to_owned())
++                    .and_then(|session| session.change_vt(vt).map_err(|error| error.to_string()))
+             } else {
+                 Err("Wayland frontend is unavailable".to_owned())
+             };
+diff --git a/compositor/src/bin/deniald/wayland_frontend/input/flutter_route.rs b/compositor/src/bin/deniald/wayland_frontend/input/flutter_route.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/input/flutter_route.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/input/flutter_route.rs
+@@ -52,9 +52,9 @@
+ }
+ 
+ #[cfg(feature = "flutter")]
+-pub(super) fn process_flutter_input_event(
++pub(super) fn process_flutter_input_event<B: InputBackend>(
+     state: &mut RuntimeState,
+-    event: InputEvent<LibinputInputBackend>,
++    event: InputEvent<B>,
+ ) -> bool {
+     debug_assert!(!matches!(&event, InputEvent::Keyboard { .. }));
+     let secure_locked = state.secure_session_locked();
+@@ -80,7 +80,7 @@
+                 let relative = RelativeMotionEvent {
+                     delta,
+                     delta_unaccel: Point::from((delta_unaccel.x / scale, delta_unaccel.y / scale)),
+-                    utime: motion.time_usec(),
++                    utime: motion.time(),
+                 };
+                 (position, target, relative)
+             };
+@@ -918,7 +918,7 @@
+ }
+ 
+ #[cfg(feature = "flutter")]
+-fn route_super_scrolling_layout_wheel<E: PointerAxisEvent<LibinputInputBackend>>(
++fn route_super_scrolling_layout_wheel<B: InputBackend, E: PointerAxisEvent<B>>(
+     state: &mut RuntimeState,
+     event: &E,
+ ) -> bool {
+@@ -958,7 +958,7 @@
+     true
+ }
+ 
+-pub(super) fn route_pointer_axis<E: PointerAxisEvent<LibinputInputBackend>>(
++pub(super) fn route_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(
+     state: &mut RuntimeState,
+     event: &E,
+ ) {
+diff --git a/compositor/src/bin/deniald/wayland_frontend/input/wayland_route.rs b/compositor/src/bin/deniald/wayland_frontend/input/wayland_route.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/input/wayland_route.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/input/wayland_route.rs
+@@ -78,21 +78,25 @@
+     }
+ }
+ 
+-pub(super) fn process_wayland_input_event(
++pub(super) fn process_wayland_input_event<B: InputBackend>(
+     state: &mut RuntimeState,
+-    event: InputEvent<LibinputInputBackend>,
++    event: InputEvent<B>,
+ ) {
+     match event {
+         InputEvent::Keyboard { event, .. } => process_wayland_keyboard_transition(
+             state,
+-            event.key_code(),
++            Keycode::new(event.key_code().raw().checked_sub(8).map_or(event.key_code().raw(), |evdev|
++                state.native_escape_shortcut.client_keycode(evdev) + 8)),
+             event.state(),
+             event.time_msec(),
+         ),
+         InputEvent::PointerMotion { event, .. } => {
+             let (position, under) = {
+                 let frontend = state.wayland.as_mut().expect("missing Wayland frontend");
+-                let position = frontend.clamp_pointer(frontend.pointer_location + event.delta());
++                let delta = event.delta();
++                let scale = frontend.atlas_scale.max(f64::EPSILON);
++                let delta = Point::from((delta.x / scale, delta.y / scale));
++                let position = frontend.clamp_pointer(frontend.pointer_location + delta);
+                 (position, frontend.surface_under(position))
+             };
+             let pointer = state
+@@ -120,7 +124,7 @@
+                 &RelativeMotionEvent {
+                     delta: event.delta(),
+                     delta_unaccel: event.delta_unaccel(),
+-                    utime: event.time_usec(),
++                    utime: event.time(),
+                 },
+             );
+             if blocked {
+diff --git a/compositor/src/bin/deniald/wayland_frontend/input_method.rs b/compositor/src/bin/deniald/wayland_frontend/input_method.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/input_method.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/input_method.rs
+@@ -121,7 +121,7 @@
+ }
+ 
+ impl EditorSnapshot {
+-    fn permits_external_input_method(&self) -> bool {
++    pub(super) fn permits_external_input_method(&self) -> bool {
+         !matches!(self.content_purpose, PASSWORD_PURPOSE | PIN_PURPOSE)
+     }
+ }
+@@ -353,6 +353,8 @@
+     instance: Option<InputMethodInstance>,
+     editor: Option<EditorSnapshot>,
+     blocked: bool,
++    #[cfg(feature = "external-output")]
++    consumer_epoch: u64,
+     popups: Vec<InputMethodPopup>,
+     keyboard_route: InputMethodKeyboardRoute,
+     virtual_keyboards: Vec<ZwpVirtualKeyboardV1>,
+@@ -381,6 +383,8 @@
+             instance: None,
+             editor: None,
+             blocked: false,
++            #[cfg(feature = "external-output")]
++            consumer_epoch: 0,
+             popups: Vec::new(),
+             keyboard_route: InputMethodKeyboardRoute::default(),
+             virtual_keyboards: Vec::new(),
+@@ -392,6 +396,10 @@
+         if self.blocked == blocked {
+             return false;
+         }
++        #[cfg(feature = "external-output")]
++        {
++            self.consumer_epoch = self.consumer_epoch.wrapping_add(1);
++        }
+         self.blocked = blocked;
+         self.publish_editor_state(EditorPublication::Update)
+     }
+@@ -400,6 +408,10 @@
+         if self.editor == editor {
+             return false;
+         }
++        #[cfg(feature = "external-output")]
++        {
++            self.consumer_epoch = self.consumer_epoch.wrapping_add(1);
++        }
+         self.editor = editor;
+         self.publish_editor_state(EditorPublication::Update)
+     }
+@@ -407,6 +419,10 @@
+     /// Publish a committed text-input enable, including when the selected
+     /// editor resource was already active.
+     pub(super) fn synchronize_activation(&mut self, editor: Option<EditorSnapshot>) -> bool {
++        #[cfg(feature = "external-output")]
++        {
++            self.consumer_epoch = self.consumer_epoch.wrapping_add(1);
++        }
+         self.editor = editor;
+         self.publish_editor_state(EditorPublication::Activation)
+     }
+@@ -495,6 +511,10 @@
+                 .as_ref()
+                 .is_none_or(|instance| !instance.resource.is_alive())
+         );
++        #[cfg(feature = "external-output")]
++        {
++            self.consumer_epoch = self.consumer_epoch.wrapping_add(1);
++        }
+         self.popups.clear();
+         self.flutter_transactions.clear();
+         self.instance = Some(InputMethodInstance {
+@@ -516,6 +536,10 @@
+             .is_none_or(|instance| instance.resource != *resource)
+         {
+             return false;
++        }
++        #[cfg(feature = "external-output")]
++        {
++            self.consumer_epoch = self.consumer_epoch.wrapping_add(1);
+         }
+         self.instance = None;
+         self.popups.clear();
+@@ -689,6 +713,23 @@
+ 
+     pub(super) fn active_editor(&self) -> Option<EditorSnapshot> {
+         self.active_editor_ref().cloned()
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(super) fn consumer_epoch(&self) -> u64 {
++        self.consumer_epoch
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(super) fn consumer_available(&self) -> bool {
++        // Registration reserves the Linux IM role, not every hardware text
++        // source. Android commits are already composed: only an active Linux
++        // editor transaction excludes them. Do not replace/register an IME.
++        !self.blocked
++            && self
++                .instance
++                .as_ref()
++                .is_none_or(|instance| !instance.resource.is_alive() || !instance.active)
+     }
+ 
+     pub(super) fn flutter_editor_active(&self) -> bool {
+diff --git a/compositor/src/bin/deniald/wayland_frontend/presentation.rs b/compositor/src/bin/deniald/wayland_frontend/presentation.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/presentation.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/presentation.rs
+@@ -157,6 +157,32 @@
+ 
+     pub(super) fn monotonic_now(&self) -> Duration {
+         self.clock.now().into()
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(super) fn software_presented_sampled(
++        &mut self,
++        output: &Output,
++        sampled: &[crate::surface_feedback::SurfaceFeedback],
++        observed_at: Instant,
++    ) -> bool {
++        self.sequence = next_presentation_sequence(self.sequence);
++        let timestamp: Time<Monotonic> = self.timeline_time(observed_at).into();
++        let mut delivered = false;
++        for token in sampled {
++            if let Some(mut feedback) = token.take() {
++                feedback.presented(
++                    output,
++                    self.clock_id,
++                    timestamp,
++                    Refresh::Unknown,
++                    self.sequence,
++                    wp_presentation_feedback::Kind::empty(),
++                );
++                delivered = true;
++            }
++        }
++        delivered
+     }
+ 
+     #[cfg(feature = "flutter")]
+diff --git a/compositor/src/bin/deniald/wayland_frontend/scene_input.rs b/compositor/src/bin/deniald/wayland_frontend/scene_input.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/scene_input.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/scene_input.rs
+@@ -263,6 +263,39 @@
+             .collect::<Vec<_>>();
+         self.presentation.submitted(windows, elapsed);
+         self.display_handle.flush_clients()?;
++        Ok(())
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn external_frame_submitted(&mut self, output: OutputId, sequence: u64) {
++        self.frame_timeline.consumer_submitted(output, sequence);
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn external_frame_completed(
++        &mut self,
++        output: OutputId,
++        sequence: u64,
++        accepted: bool,
++    ) {
++        self.frame_timeline
++            .consumer_completed(output, sequence, accepted);
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn external_frame_presented(
++        &mut self,
++        output: OutputId,
++        sampled: &[crate::surface_feedback::SurfaceFeedback],
++        observed_at: Instant,
++    ) -> Result<(), Box<dyn Error>> {
++        if let Some(entry) = self.outputs.iter().find(|entry| entry.id == output)
++            && self
++                .presentation
++                .software_presented_sampled(&entry.output, sampled, observed_at)
++        {
++            self.display_handle.flush_clients()?;
++        }
+         Ok(())
+     }
+ 
+diff --git a/compositor/src/bin/deniald/wayland_frontend/startup.rs b/compositor/src/bin/deniald/wayland_frontend/startup.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/startup.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/startup.rs
+@@ -7,9 +7,9 @@
+     pub fn new(
+         event_loop: &mut EventLoop<'static, RuntimeState>,
+         snapshot: &TopologySnapshot,
+-        session: LibSeatSession,
++        session: Option<LibSeatSession>,
+         seat_name: &str,
+-        drm_device: DrmDeviceFd,
++        drm_device: Option<DrmDeviceFd>,
+         xwayland_enabled: bool,
+         work_area: crate::options::WorkAreaOptions,
+         scrolling_layout_axes: BTreeMap<String, ScrollingLayoutAxis>,
+@@ -51,7 +51,9 @@
+         let input_method = InputMethodManager::new(&display_handle);
+         let shm_state = ShmState::new::<RuntimeState>(&display_handle, vec![]);
+         let dmabuf_state = DmabufState::new();
+-        let drm_syncobj_state = if supports_syncobj_eventfd(&drm_device) {
++        let drm_syncobj_state = if let Some(drm_device) =
++            drm_device.filter(|device| supports_syncobj_eventfd(device))
++        {
+             info!("advertising linux-drm-syncobj-v1 explicit synchronization");
+             Some(DrmSyncobjState::new::<RuntimeState>(
+                 &display_handle,
+@@ -272,7 +274,9 @@
+                 "loaded saved window placements"
+             );
+         }
+-        let libinput = init_libinput(event_loop, session.clone(), seat_name)?;
++        let libinput = session.clone()
++            .map(|session| init_libinput(event_loop, session, seat_name))
++            .transpose()?;
+         Ok(Self {
+             start_time: Instant::now(),
+             socket_name,
+diff --git a/compositor/src/bin/deniald/wayland_frontend/text_input.rs b/compositor/src/bin/deniald/wayland_frontend/text_input.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/text_input.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/text_input.rs
+@@ -1111,10 +1111,128 @@
+     Some(actions)
+ }
+ 
++/// Strong resource identities captured before a possibly partial consumer
++/// payload. Equality includes Wayland serial/Flutter generation and lifecycle.
++#[cfg(feature = "external-output")]
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) enum ConsumerTextTarget {
++    Editor(EditorEndpoint, u64),
++    Keyboard {
++        surface: WlSurface,
++        enter_serial: smithay::utils::Serial,
++        epoch: u64,
++    },
++}
++#[cfg(feature = "external-output")]
++pub(crate) enum ConsumerTextDelivery {
++    Wayland,
++    Keyboard,
++    Flutter {
++        generation: u64,
++        lifecycle: u64,
++        client_id: i64,
++    },
++}
++
+ impl WaylandFrontend {
+     #[cfg(feature = "flutter")]
+     pub(in super::super) fn shell_captures_keyboard(&self) -> bool {
+         self.text_input.shell_captures_keyboard()
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn consumer_text_target(&self) -> Option<ConsumerTextTarget> {
++        if !self.input_method.consumer_available()
++            || self
++                .seat
++                .get_keyboard()
++                .is_some_and(|keyboard| keyboard.is_grabbed())
++        {
++            return None;
++        }
++        if let Some(editor) = self.text_input.input_method_snapshot() {
++            return editor
++                .permits_external_input_method()
++                .then_some(ConsumerTextTarget::Editor(
++                    editor.endpoint,
++                    self.input_method.consumer_epoch(),
++                ));
++        }
++        // Binding text-input-v3 is a client capability, not editor activation
++        // (terminals/toolkits can bind it without ever enabling it). Fall back
++        // only when no protocol editor is active. Rejected/secure editors and
++        // Flutter capture must never turn into global keyboard input.
++        if self.text_input.shell_captures_keyboard()
++            || self.text_input.sessions.active.is_some()
++            || self.text_input.sessions.instances.iter().any(|instance| {
++                instance.entered
++                    && instance
++                        .current
++                        .content_type
++                        .is_some_and(|(_, purpose)| matches!(purpose, 8 | 9))
++            })
++        {
++            return None;
++        }
++        let keyboard = self.seat.get_keyboard()?;
++        if !keyboard.pressed_keys().is_empty() {
++            return None;
++        }
++        use smithay::wayland::seat::WaylandFocus;
++        let focus = keyboard.current_focus()?;
++        let surface = focus.wl_surface()?.into_owned();
++        if !surface.is_alive() {
++            return None;
++        }
++        Some(ConsumerTextTarget::Keyboard {
++            surface,
++            enter_serial: keyboard.last_enter()?,
++            epoch: self.input_method.consumer_epoch(),
++        })
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn commit_consumer_text(
++        &mut self,
++        target: &ConsumerTextTarget,
++        text: &str,
++    ) -> Option<ConsumerTextDelivery> {
++        if !super::injected_text::valid_commit(text)
++            || self.consumer_text_target().as_ref() != Some(target)
++        {
++            return None;
++        }
++        let endpoint = match target {
++            ConsumerTextTarget::Editor(endpoint, _) => endpoint,
++            ConsumerTextTarget::Keyboard { .. } => return Some(ConsumerTextDelivery::Keyboard),
++        };
++        match endpoint {
++            EditorEndpoint::Wayland {
++                resource,
++                serial,
++                surface,
++            } => {
++                if !surface.is_alive() {
++                    return None;
++                }
++                let transaction = InputMethodTransaction {
++                    commit_string: Some(text.into()),
++                    ..Default::default()
++                };
++                self.text_input
++                    .apply_input_method(resource, *serial, &transaction, true)
++                    .then_some(ConsumerTextDelivery::Wayland)
++            }
++            EditorEndpoint::Flutter {
++                generation,
++                lifecycle,
++                client_id,
++            } => Some(ConsumerTextDelivery::Flutter {
++                generation: *generation,
++                lifecycle: *lifecycle,
++                client_id: *client_id,
++            }),
++        }
+     }
+ 
+     pub(super) fn synchronize_input_method(&mut self) -> bool {
+diff --git a/compositor/src/bin/deniald/wayland_frontend/topology.rs b/compositor/src/bin/deniald/wayland_frontend/topology.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/topology.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/topology.rs
+@@ -180,6 +180,51 @@
+         }
+         self.work_area = work_area;
+         self.arrange_layout_windows();
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn update_external_refresh(
++        &mut self,
++        output: OutputId,
++        refresh: u32,
++    ) -> Result<(), Box<dyn Error>> {
++        let refresh = i32::try_from(refresh)?;
++        if refresh <= 0 {
++            return Err("invalid external output refresh".into());
++        }
++        self.invalidate_frame_timeline();
++        let entry = self
++            .outputs
++            .iter()
++            .find(|entry| entry.id == output)
++            .ok_or("external output missing")?;
++        let mut mode = entry
++            .output
++            .current_mode()
++            .ok_or("external output mode missing")?;
++        mode.refresh = refresh;
++        for old in entry.output.modes() {
++            if old != mode {
++                entry.output.delete_mode(old);
++            }
++        }
++        entry
++            .output
++            .change_current_state(Some(mode), None, None, None);
++        entry.output.set_preferred(mode);
++        if let Some(mut atlas_mode) = self.atlas_output.current_mode() {
++            atlas_mode.refresh = refresh;
++            for old in self.atlas_output.modes() {
++                if old != atlas_mode {
++                    self.atlas_output.delete_mode(old);
++                }
++            }
++            self.atlas_output
++                .change_current_state(Some(atlas_mode), None, None, None);
++            self.atlas_output.set_preferred(atlas_mode);
++        }
++        self.display_handle.flush_clients()?;
++        Ok(())
+     }
+ 
+     pub fn update_topology(
+diff --git a/compositor/src/bin/deniald/wire.rs b/compositor/src/bin/deniald/wire.rs
+--- a/compositor/src/bin/deniald/wire.rs
++++ b/compositor/src/bin/deniald/wire.rs
+@@ -773,6 +773,11 @@
+             .map(|window| window.window_id)
+     }
+ 
++    #[cfg(feature = "anland")]
++    pub(crate) fn recovery_metadata_revision(&self) -> Option<u64> {
++        self.windows_revision
++    }
++
+     pub fn window_descriptions(&self) -> &[WindowDescription] {
+         &self.windows
+     }
+diff --git a/packages/denial_plugin_manager/lib/src/store.dart b/packages/denial_plugin_manager/lib/src/store.dart
+--- a/packages/denial_plugin_manager/lib/src/store.dart
++++ b/packages/denial_plugin_manager/lib/src/store.dart
+@@ -288,9 +288,18 @@
+     final canonical = file.resolveSymbolicLinksSync();
+     String stamp(FileStat stat) =>
+         '${stat.size}:${stat.modified.microsecondsSinceEpoch}:${stat.changed.microsecondsSinceEpoch}:${stat.mode}';
+-    final before = stamp(file.statSync());
++    final stat = file.statSync();
++    final before = stamp(stat);
+     final cached = entries[canonical] as Map?;
+-    if (cached?['stamp'] == before && cached?['digest'] is String) {
++    // Coarse filesystem clocks can hide multiple writes inside one clock tick.
++    // Rehash recent inputs until both timestamps are outside that window.
++    final stableBefore = DateTime.now().subtract(const Duration(seconds: 1));
++    final stable = stat.modified.isBefore(stableBefore) &&
++        stat.changed.isBefore(stableBefore);
++    if (stable &&
++        cached?['stable'] == true &&
++        cached?['stamp'] == before &&
++        cached?['digest'] is String) {
+       return cached!['digest'] as String;
+     }
+     final result = sha256.convert(file.readAsBytesSync()).toString();
+@@ -299,7 +308,7 @@
+         'Input changed while checking $canonical; try again',
+       );
+     }
+-    entries[canonical] = {'stamp': before, 'digest': result};
++    entries[canonical] = {'stamp': before, 'digest': result, 'stable': stable};
+     dirty = true;
+     return result;
+   }
+diff --git a/tools/denial-pc b/tools/denial-pc
+--- a/tools/denial-pc
++++ b/tools/denial-pc
+@@ -116,7 +116,7 @@
+ ENGINE_TEST_CURRENT="$ENGINE_TEST_STORE/current"
+ ENGINE_TEST_NEXT="$ENGINE_TEST_STORE/next-session"
+ ENGINE_TEST_SOURCE_ROOT="${DENIAL_FLUTTER_SOURCE_ROOT:-$CANONICAL_FLUTTER_SOURCE}"
+-ENGINE_TEST_NINJA_OUT="${DENIAL_PC_ENGINE_TEST_NINJA_OUT:-$ENGINE_TEST_SOURCE_ROOT/engine/src/out/denial_host_release}"
++ENGINE_TEST_NINJA_OUT="${DENIAL_PC_ENGINE_TEST_NINJA_OUT:-$ENGINE_TEST_SOURCE_ROOT/engine/src/out/$LOCAL_ENGINE_TARGET}"
+ SESSION_ENGINE_SHA256=""
+ BINARY="${DENIAL_PC_BINARY:-$RUST_TARGET/release/deniald}"
+ CONTROL_BINARY="${DENIAL_PC_CONTROL_BINARY:-$RUST_TARGET/release/denialctl}"
+diff --git a/compositor/src/bin/deniald/wayland_frontend/screencopy.rs b/compositor/src/bin/deniald/wayland_frontend/screencopy.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/screencopy.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/screencopy.rs
+@@ -2318,7 +2318,7 @@
+         }
+     }
+ 
+-    pub(super) fn fail_all_screencopies(&mut self) {
++    pub(crate) fn fail_all_screencopies(&mut self) {
+         let failed = !self.screencopy.pending.is_empty();
+         for request in self.screencopy.pending.drain(..) {
+             request.frame.release_buffer(&request.buffer);

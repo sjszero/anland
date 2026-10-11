@@ -1,0 +1,1422 @@
+diff --git a/compositor/Cargo.toml b/compositor/Cargo.toml
+--- a/compositor/Cargo.toml
++++ b/compositor/Cargo.toml
+@@ -13,6 +13,7 @@
+ 
+ [features]
+ default = ["xwayland"]
++external-output = ["flutter"]
+ flutter = [
+     "kms",
+     "control",
+diff --git a/compositor/flutter-engine/src/host.rs b/compositor/flutter-engine/src/host.rs
+--- a/compositor/flutter-engine/src/host.rs
++++ b/compositor/flutter-engine/src/host.rs
+@@ -729,6 +729,51 @@
+             .expect("Flutter engine is shut down")
+     }
+ 
++    /// Posts an owned operation behind previously queued raster work. Neither
++    /// callback nor completion channel borrows the caller's stack. The caller
++    /// polls without blocking; dropping the receiver is NOT task cancellation.
++    pub fn post_render_operation(
++        &self,
++        operation: impl FnOnce() -> RenderOperationResult + Send + 'static,
++    ) -> Result<std::sync::mpsc::Receiver<RenderOperationResult>, Box<dyn Error>> {
++        if thread::current().id()
++            != self
++                .state
++                .as_ref()
++                .ok_or("engine is shut down")?
++                ._callback_state
++                .platform_thread
++        {
++            return Err("render operation must originate on the platform thread".into());
++        }
++        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++        let task = Box::new(RenderOperation {
++            operation: Box::new(operation),
++            completed: sender,
++        });
++        let data = Box::into_raw(task).cast::<c_void>();
++        let state = self.state.as_ref().ok_or("engine is shut down")?;
++        // SAFETY: the task owns everything reachable from data until the
++        // render callback consumes it. On posting failure no callback is queued.
++        let result = unsafe {
++            (state._callback_state.post_render_thread_task)(
++                self.engine().raw_handle(),
++                Some(run_render_operation),
++                data,
++            )
++        };
++        if result != sys::FlutterEngineResult_kSuccess {
++            // SAFETY: failed posting retained no ownership of data.
++            unsafe { drop(Box::from_raw(data.cast::<RenderOperation>())) };
++            return Err(EngineError::Call {
++                operation: "PostRenderOperation",
++                result,
++            }
++            .into());
++        }
++        Ok(receiver)
++    }
++
+     pub fn run_scheduled_task(&self, task: ScheduledTask) -> Result<(), EngineError> {
+         self.engine().run_task(&task.as_flutter_task())
+     }
+@@ -769,6 +814,27 @@
+         }
+         release_or_leak(state, result)
+     }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum RenderOperationResult {
++    Completed,
++    Busy,
++    Rejected,
++    /// Callback panic, uncertain EGL state or other missing lifetime proof.
++    Uncertain,
++}
++struct RenderOperation {
++    operation: Box<dyn FnOnce() -> RenderOperationResult + Send>,
++    completed: std::sync::mpsc::SyncSender<RenderOperationResult>,
++}
++
++unsafe extern "C" fn run_render_operation(data: *mut c_void) {
++    // SAFETY: PostRenderThreadTask transfers one Box to this one-shot callback.
++    let task = unsafe { Box::from_raw(data.cast::<RenderOperation>()) };
++    let result =
++        catch_unwind(AssertUnwindSafe(task.operation)).unwrap_or(RenderOperationResult::Uncertain);
++    let _ = task.completed.send(result);
+ }
+ 
+ fn release_render_thread_resources_before_shutdown(
+diff --git a/compositor/flutter-engine/src/lib.rs b/compositor/flutter-engine/src/lib.rs
+--- a/compositor/flutter-engine/src/lib.rs
++++ b/compositor/flutter-engine/src/lib.rs
+@@ -41,7 +41,7 @@
+ pub use host::{
+     BackingStoreRequest, CompositorBackingStore, DartRuntimeMode, EngineEvent, EngineHost,
+     EngineProject, HostError, OpenGlHandler, ParseRendererBackendError, PlatformMessage,
+-    PresentFrame, PresentView, RendererBackend, ScheduledTask,
++    PresentFrame, PresentView, RenderOperationResult, RendererBackend, ScheduledTask,
+ };
+ 
+ #[derive(Clone, Copy, Debug, PartialEq)]
+diff --git a/compositor/src/bin/deniald.rs b/compositor/src/bin/deniald.rs
+--- a/compositor/src/bin/deniald.rs
++++ b/compositor/src/bin/deniald.rs
+@@ -38,6 +38,9 @@
+ mod flutter_settings_sync;
+ #[path = "deniald/frame_loop.rs"]
+ mod frame_loop;
++#[cfg(feature = "flutter")]
++#[path = "deniald/frame_request.rs"]
++mod frame_request;
+ #[cfg(feature = "flutter")]
+ #[path = "deniald/frame_scheduler.rs"]
+ mod frame_scheduler;
+diff --git a/compositor/src/bin/deniald/flutter_runtime.rs b/compositor/src/bin/deniald/flutter_runtime.rs
+--- a/compositor/src/bin/deniald/flutter_runtime.rs
++++ b/compositor/src/bin/deniald/flutter_runtime.rs
+@@ -77,10 +77,18 @@
+ pub(crate) use engine_session::PreparedFlutterRenderer;
+ #[path = "flutter_runtime/event_pipeline.rs"]
+ mod event_pipeline;
++#[path = "flutter_runtime/external_pool.rs"]
++mod external_pool;
+ #[path = "flutter_runtime/input.rs"]
+ mod input;
++pub(crate) use external_pool::ExternalPoolDescriptor;
++#[path = "flutter_runtime/pool_selection.rs"]
++mod pool_selection;
++pub(crate) use pool_selection::PoolSelection;
+ #[path = "flutter_runtime/output_pipeline.rs"]
+ mod output_pipeline;
++
++// Test descendants exercise the private broker without widening its runtime API.
+ #[path = "flutter_runtime/output_runtime.rs"]
+ mod output_runtime;
+ #[path = "flutter_runtime/platform_dispatch.rs"]
+@@ -158,13 +166,14 @@
+ const OUTPUT_ROTATION_RESIZE_PROGRESS: f64 = 0.78;
+ 
+ /// Borrowed native storage used only while constructing the Flutter EGL
+-/// target table. KMS keeps ownership of every DMA-BUF and framebuffer.
++/// target table. The display backend keeps ownership of the native storage.
++#[derive(Clone)]
+ pub(super) struct OutputRenderTargetPool<'a> {
+     pub output_id: OutputId,
+     pub render_view_id: RenderViewId,
+     pub configuration_generation: u64,
+     pub size: PixelSize,
+-    pub initial_scanout: usize,
++    pub selection: PoolSelection,
+     pub dmabufs: Vec<(&'a Dmabuf, Option<&'a Dmabuf>)>,
+ }
+ 
+@@ -551,7 +560,7 @@
+     key_event_scratch: Vec<u8>,
+     device_pixel_ratio: f64,
+     frame_interval: Duration,
+-    kms_frame_clock_enabled: bool,
++    native_frame_clock_enabled: bool,
+     outputs_visible: Option<bool>,
+     lock_frame_gate: lock_frame::LockFrameGate,
+     fingerprint_scene: fingerprint_scene::FingerprintScene,
+@@ -732,3 +741,6 @@
+ fn first_file(paths: &[PathBuf]) -> Option<PathBuf> {
+     paths.iter().find(|path| path.is_file()).cloned()
+ }
++
++// These contracts are descendants of the private native broker; no production
++// visibility is widened just to expose internals to a sibling test module.
+diff --git a/compositor/src/bin/deniald/flutter_runtime/engine_session.rs b/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/engine_session.rs
+@@ -20,7 +20,7 @@
+     render_view_id: RenderViewId,
+     configuration_generation: u64,
+     size: PixelSize,
+-    initial_scanout: usize,
++    selection: PoolSelection,
+     // Keep the native allocations alive and compare their identity, not just
+     // dimensions/format: a newly allocated pool requires newly imported FBOs.
+     dmabufs: Vec<(Dmabuf, Option<Dmabuf>)>,
+@@ -49,7 +49,7 @@
+                     render_view_id: pool.render_view_id,
+                     configuration_generation: pool.configuration_generation,
+                     size: pool.size,
+-                    initial_scanout: pool.initial_scanout,
++                    selection: pool.selection,
+                     dmabufs: pool
+                         .dmabufs
+                         .iter()
+@@ -316,7 +316,7 @@
+             key_event_scratch: Vec::with_capacity(160),
+             device_pixel_ratio,
+             frame_interval,
+-            kms_frame_clock_enabled: false,
++            native_frame_clock_enabled: false,
+             outputs_visible: None,
+             lock_frame_gate: lock_frame::LockFrameGate::default(),
+             fingerprint_scene: fingerprint_scene::FingerprintScene::default(),
+@@ -470,7 +470,7 @@
+                     generation,
+                     event: EngineEvent::Vsync(baton),
+                 } if generation == self.generation => {
+-                    if !self.kms_frame_clock_enabled {
++                    if !self.native_frame_clock_enabled {
+                         if !self.handler.try_request_frame() {
+                             return Err(
+                                 "Flutter requested a timed vsync while its producer was busy"
+@@ -584,7 +584,11 @@
+     }
+ 
+     pub fn enable_kms_frame_clock(&mut self) {
+-        self.kms_frame_clock_enabled = true;
++        self.enable_native_frame_clock();
++    }
++
++    pub(crate) fn enable_native_frame_clock(&mut self) {
++        self.native_frame_clock_enabled = true;
+     }
+ 
+     /// Mirrors physical desktop visibility into Flutter's standard lifecycle.
+diff --git a/compositor/src/bin/deniald/flutter_runtime/external_pool.rs b/compositor/src/bin/deniald/flutter_runtime/external_pool.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_runtime/external_pool.rs
+@@ -0,0 +1,12 @@
++//! Backend-independent identity for replacing an imported Flutter output pool.
++//! Storage ownership remains with the display backend until raster completion.
++use denial_core::topology::{OutputId, PixelSize, RenderViewId};
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct ExternalPoolDescriptor {
++    pub generation: u64,
++    pub configuration: u64,
++    pub output: OutputId,
++    pub view: RenderViewId,
++    pub size: PixelSize,
++}
+diff --git a/compositor/src/bin/deniald/flutter_runtime/input.rs b/compositor/src/bin/deniald/flutter_runtime/input.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/input.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/input.rs
+@@ -160,13 +160,16 @@
+         !self.events.is_empty()
+     }
+ 
+-    pub fn handle(&mut self, event: &SmithayInputEvent<LibinputInputBackend>) {
++    pub fn handle<B: smithay::backend::input::InputBackend>(
++        &mut self,
++        event: &SmithayInputEvent<B>,
++    ) {
+         self.handle_with_scroll_speed_factor(event, 1.0);
+     }
+ 
+-    pub fn handle_with_scroll_speed_factor(
++    pub fn handle_with_scroll_speed_factor<B: smithay::backend::input::InputBackend>(
+         &mut self,
+-        event: &SmithayInputEvent<LibinputInputBackend>,
++        event: &SmithayInputEvent<B>,
+         scroll_speed_factor: f64,
+     ) {
+         match event {
+@@ -296,9 +299,9 @@
+     /// desktop pixels. Output rotation is owned by the compositor, so passing
+     /// libinput's native-axis coordinates through `position_transformed`
+     /// would make Flutter disagree with Wayland hit testing.
+-    pub fn handle_touch_at(
++    pub fn handle_touch_at<B: smithay::backend::input::InputBackend>(
+         &mut self,
+-        event: &SmithayInputEvent<LibinputInputBackend>,
++        event: &SmithayInputEvent<B>,
+         x: f64,
+         y: f64,
+     ) {
+diff --git a/compositor/src/bin/deniald/flutter_runtime/output_pipeline.rs b/compositor/src/bin/deniald/flutter_runtime/output_pipeline.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/output_pipeline.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/output_pipeline.rs
+@@ -39,7 +39,7 @@
+     pub(super) render_view_id: RenderViewId,
+     pub(super) configuration_generation: u64,
+     pub(super) size: PixelSize,
+-    pub(super) initial_scanout: usize,
++    pub(super) selection: PoolSelection,
+     pub(super) framebuffers: &'a [u32],
+ }
+ 
+@@ -68,6 +68,7 @@
+     pub(super) configuration_generation: u64,
+     pub(super) size: PixelSize,
+     pub(super) slots: Vec<OutputBufferSlot>,
++    pub(super) selection: PoolSelection,
+     pub(super) authorized_request: Option<AuthorizedOutputRequest>,
+     capture_revision: u64,
+ }
+@@ -116,8 +117,7 @@
+                 || !render_view_ids.insert(descriptor.render_view_id)
+                 || descriptor.size.width == 0
+                 || descriptor.size.height == 0
+-                || descriptor.initial_scanout >= descriptor.framebuffers.len()
+-                || descriptor.framebuffers.len() < 3
++                || !descriptor.selection.valid(descriptor.framebuffers.len())
+                 || descriptor
+                     .framebuffers
+                     .iter()
+@@ -134,7 +134,7 @@
+                 .map(|(index, framebuffer)| OutputBufferSlot {
+                     framebuffer,
+                     state: BufferState::Free,
+-                    output_refs: usize::from(index == descriptor.initial_scanout),
++                    output_refs: usize::from(descriptor.selection.initially_held(index)),
+                     fence: None,
+                     ready_damage: None,
+                     damage: DamageRegion::full(descriptor.size.width, descriptor.size.height),
+@@ -151,6 +151,7 @@
+                 configuration_generation: descriptor.configuration_generation,
+                 size: descriptor.size,
+                 slots,
++                selection: descriptor.selection,
+                 authorized_request: None,
+                 capture_revision: next_capture_revision(),
+             });
+@@ -164,6 +165,23 @@
+             transaction: 0,
+             next_screenshot: None,
+         })
++    }
++
++    /// May replace only a fully revoked external table. References belong to
++    /// async captures/consumer releases and cannot be reset to make it idle.
++    pub(super) fn external_pool_retired(&self) -> bool {
++        self.next_screenshot.is_none()
++            && self.pools.iter().all(|pool| {
++                matches!(
++                    pool.selection,
++                    PoolSelection::External { selected: None, .. }
++                ) && pool.authorized_request.is_none()
++                    && pool.slots.iter().all(|slot| {
++                        slot.state == BufferState::Free
++                            && slot.output_refs == 0
++                            && slot.fence.is_none()
++                    })
++            })
+     }
+ 
+     pub(super) fn begin_transaction(&mut self) {
+@@ -195,10 +213,94 @@
+                         .iter()
+                         .any(|slot| slot.state != BufferState::Free)
+                     && pool
++                        .selection
++                        .available(pool.slots.len(), |index| {
++                            let slot = &pool.slots[index];
++                            slot.state == BufferState::Free && slot.output_refs == 0
++                        })
++                        .is_some()
++            })
++    }
++
++    pub(super) fn select_external_target(
++        &mut self,
++        output: OutputId,
++        generation: u64,
++        index: usize,
++        count: usize,
++    ) -> bool {
++        let Some(pool) = self.pools.iter_mut().find(|pool| pool.output_id == output) else {
++            return false;
++        };
++        if pool.authorized_request.is_some()
++            || pool
++                .slots
++                .iter()
++                .any(|slot| slot.state != BufferState::Free)
++        {
++            return false;
++        }
++        pool.selection
++            .select(generation, index, count, pool.slots.len())
++    }
++
++    pub(super) fn revoke_external_targets(&mut self) {
++        for pool in &mut self.pools {
++            if pool.selection.external() {
++                pool.selection.revoke();
++                pool.authorized_request = None;
++            }
++        }
++    }
++
++    /// Called under the broker lock. Expiring an unused authorization never
++    /// cancels a raster task that has already acquired a buffer. Pending handoff
++    /// also counts as work, even after its request moved into ReadyOutputFrame.
++    pub(super) fn external_work_pending(&mut self, output: OutputId, now: Instant) -> bool {
++        self.expire_authorizations(now);
++        self.pools
++            .iter()
++            .find(|pool| pool.output_id == output && pool.selection.external())
++            .is_none_or(|pool| {
++                pool.authorized_request.is_some()
++                    || pool
+                         .slots
+                         .iter()
+-                        .any(|slot| slot.state == BufferState::Free && slot.output_refs == 0)
++                        .any(|slot| slot.state != BufferState::Free)
+             })
++    }
++
++    /// Lifetime proof, not a frame scheduling predicate. Async captures and
++    /// consumer references must still pin a revoked pool during cold retirement.
++    pub(super) fn external_retirement_pending(&mut self, output: OutputId, now: Instant) -> bool {
++        self.expire_authorizations(now);
++        self.next_screenshot.is_some()
++            || self
++                .pools
++                .iter()
++                .find(|pool| pool.output_id == output && pool.selection.external())
++                .is_none_or(|pool| {
++                    !matches!(
++                        pool.selection,
++                        PoolSelection::External { selected: None, .. }
++                    ) || pool.authorized_request.is_some()
++                        || pool.slots.iter().any(|slot| {
++                            slot.state != BufferState::Free
++                                || slot.output_refs != 0
++                                || slot.fence.is_some()
++                        })
++                })
++    }
++
++    pub(super) fn external_authorization_deadline(&self, output: OutputId) -> Option<Instant> {
++        let authorization = self
++            .pools
++            .iter()
++            .find(|pool| pool.output_id == output && pool.selection.external())?
++            .authorized_request?;
++        authorization
++            .authorized_at
++            .checked_add(authorization.request.tick.interval.saturating_mul(2))
+     }
+ 
+     pub(super) fn authorize(&mut self, request: OutputFrameRequest, now: Instant) -> Option<i64> {
+@@ -220,6 +322,7 @@
+         for pool in &mut self.pools {
+             if render_view_ids.contains(&pool.render_view_id.get()) {
+                 pool.authorized_request = None;
++                pool.selection.revoke();
+             }
+         }
+     }
+@@ -233,6 +336,7 @@
+             });
+             if should_expire {
+                 pool.authorized_request = None;
++                pool.selection.revoke();
+                 expired += 1;
+             }
+         }
+@@ -266,15 +370,19 @@
+         {
+             return Err(RenderTargetBlocked::ReadyHandoff);
+         }
+-        let Some(slot_index) = pool
+-            .slots
+-            .iter()
+-            .position(|slot| slot.state == BufferState::Free && slot.output_refs == 0)
+-        else {
++        let Some(slot_index) = pool.selection.available(pool.slots.len(), |index| {
++            let slot = &pool.slots[index];
++            slot.state == BufferState::Free && slot.output_refs == 0
++        }) else {
+             return Err(RenderTargetBlocked::NoFreeSlot);
+         };
+         pool.authorized_request = None;
++        let full_repaint = pool.selection.external();
++        pool.selection.revoke();
+         let slot = &mut pool.slots[slot_index];
++        if full_repaint {
++            slot.damage.invalidate();
++        }
+         slot.state = BufferState::Rendering;
+         slot.fence = None;
+         slot.ready_damage = None;
+diff --git a/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs b/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/output_runtime.rs
+@@ -203,6 +203,91 @@
+         })
+     }
+ 
++    /// Consumer cadence update without replacing Flutter/EGL/pool owners.
++    pub(crate) fn update_external_refresh(
++        &mut self,
++        refresh: u32,
++        size: PixelSize,
++    ) -> Result<(), Box<dyn Error>> {
++        if refresh == 0 || refresh > i32::MAX as u32 {
++            return Err("invalid external output refresh".into());
++        }
++        self.host().engine().notify_displays(
++            sys::FlutterEngineDisplaysUpdateType_kFlutterEngineDisplaysUpdateTypeStartup,
++            &[sys::FlutterEngineDisplay {
++                struct_size: mem::size_of::<sys::FlutterEngineDisplay>(),
++                display_id: 0,
++                single_display: true,
++                refresh_rate: f64::from(refresh) / 1000.0,
++                width: size.width as usize,
++                height: size.height as usize,
++                device_pixel_ratio: self.device_pixel_ratio,
++            }],
++        )?;
++        self.frame_interval = Duration::from_nanos(1_000_000_000_000 / u64::from(refresh));
++        Ok(())
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn begin_external_pool_replacement(
++        &self,
++        pool: ExternalPoolDescriptor,
++        buffers: Vec<Dmabuf>,
++    ) -> Result<
++        std::sync::mpsc::Receiver<denial_flutter_engine::RenderOperationResult>,
++        Box<dyn Error>,
++    > {
++        let handler = Arc::clone(&self.handler);
++        self.host().post_render_operation(move || {
++            handler.replace_external_pool_on_render_thread(
++                pool.output,
++                pool.view,
++                pool.configuration,
++                pool.size,
++                pool.generation,
++                &buffers,
++            )
++        })
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(crate) fn finish_external_pool_replacement(
++        &mut self,
++        snapshot: &TopologySnapshot,
++        atlas: &AtlasPlan,
++        refresh: u32,
++    ) -> Result<(), Box<dyn Error>> {
++        self.reconfigure_output_geometry(snapshot, atlas, OutputGeometryTransition::Immediate)?;
++        self.update_external_refresh(refresh, atlas.pixel_size)
++    }
++
++    pub(crate) fn select_external_target(
++        &self,
++        output: OutputId,
++        generation: u64,
++        index: usize,
++        count: usize,
++    ) -> bool {
++        self.handler
++            .select_external_target(output, generation, index, count)
++    }
++
++    pub(crate) fn revoke_external_targets(&self) {
++        self.handler.revoke_external_targets();
++    }
++
++    pub(crate) fn external_work_pending(&self, output: OutputId, now: Instant) -> bool {
++        self.handler.external_work_pending(output, now)
++    }
++
++    pub(crate) fn external_retirement_pending(&self, output: OutputId, now: Instant) -> bool {
++        self.handler.external_retirement_pending(output, now)
++    }
++
++    pub(crate) fn external_authorization_deadline(&self, output: OutputId) -> Option<Instant> {
++        self.handler.external_authorization_deadline(output)
++    }
++
+     pub fn publish_output(&self, output: &ReadyOutputFrame) -> Result<(), Box<dyn Error>> {
+         self.handler.publish_output(output).map_err(Into::into)
+     }
+@@ -371,18 +456,30 @@
+         Ok(true)
+     }
+ 
+-    /// Execute exactly the output work authorized by the display clocks.
++    /// KMS compatibility: this boolean counts Flutter VSync batons, not raster work.
+     pub fn render_authorized_outputs(
+         &mut self,
+         requests: &[OutputFrameRequest],
+         texture_ids: impl IntoIterator<Item = i64>,
+         flutter_output: Option<OutputId>,
+     ) -> Result<bool, Box<dyn Error>> {
+-        if !self.kms_frame_clock_enabled {
+-            return Err("the KMS Flutter frame clock is not enabled".into());
++        Ok(self
++            .render_authorized_output_status(requests, texture_ids, flutter_output)?
++            .vsync_dispatched)
++    }
++
++    /// Keep authorization alive for asynchronous scene repaint without a baton.
++    pub(crate) fn render_authorized_output_status(
++        &mut self,
++        requests: &[OutputFrameRequest],
++        texture_ids: impl IntoIterator<Item = i64>,
++        flutter_output: Option<OutputId>,
++    ) -> Result<crate::frame_request::RenderDispatch, Box<dyn Error>> {
++        if !self.native_frame_clock_enabled {
++            return Err("the native Flutter frame clock is not enabled".into());
+         }
+         if requests.is_empty() {
+-            return Ok(false);
++            return Ok(crate::frame_request::RenderDispatch::default());
+         }
+ 
+         let mut tagged_requests = requests.to_vec();
+@@ -396,7 +493,7 @@
+                 .render_token(self.authentication.locked_epoch()),
+         );
+         if self.render_view_scratch.is_empty() {
+-            return Ok(false);
++            return Ok(crate::frame_request::RenderDispatch::default());
+         }
+ 
+         let flutter_tick = flutter_output.and_then(|output_id| {
+@@ -449,7 +546,7 @@
+             let Some(baton) = baton else {
+                 self.handler
+                     .cancel_output_authorizations(&self.render_view_scratch);
+-                return Err("a KMS-authorized Flutter frame has no AwaitVSync baton".into());
++                return Err("a display-authorized Flutter frame has no AwaitVSync baton".into());
+             };
+             Some(baton)
+         } else {
+@@ -529,7 +626,10 @@
+                 .cancel_output_authorizations(&self.render_view_scratch);
+             return Err(error.into());
+         }
+-        Ok(baton.is_some())
++        Ok(crate::frame_request::RenderDispatch {
++            authorized: true,
++            vsync_dispatched: baton.is_some(),
++        })
+     }
+ }
+ 
+diff --git a/compositor/src/bin/deniald/flutter_runtime/pool_selection.rs b/compositor/src/bin/deniald/flutter_runtime/pool_selection.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/flutter_runtime/pool_selection.rs
+@@ -0,0 +1,69 @@
++//! Native target selection policy; no transport state or FD ownership.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PoolSelection {
++    Automatic {
++        initial_scanout: usize,
++    },
++    External {
++        generation: u64,
++        selected: Option<usize>,
++    },
++}
++
++impl PoolSelection {
++    pub fn valid(self, count: usize) -> bool {
++        match self {
++            Self::Automatic { initial_scanout } => count >= 3 && initial_scanout < count,
++            Self::External {
++                generation,
++                selected,
++            } => generation != 0 && count > 0 && selected.is_none(),
++        }
++    }
++
++    pub fn initially_held(self, index: usize) -> bool {
++        matches!(self, Self::Automatic { initial_scanout } if initial_scanout == index)
++    }
++
++    pub fn external(self) -> bool {
++        matches!(self, Self::External { .. })
++    }
++
++    pub fn select(
++        &mut self,
++        generation: u64,
++        index: usize,
++        count: usize,
++        actual_count: usize,
++    ) -> bool {
++        match self {
++            Self::External {
++                generation: expected,
++                selected,
++            } if *expected == generation
++                && count == actual_count
++                && index < count
++                && selected.is_none() =>
++            {
++                *selected = Some(index);
++                true
++            }
++            _ => false,
++        }
++    }
++
++    pub fn available(self, count: usize, mut free: impl FnMut(usize) -> bool) -> Option<usize> {
++        match self {
++            Self::Automatic { .. } => (0..count).find(|&index| free(index)),
++            Self::External { selected, .. } => {
++                selected.filter(|&index| index < count && free(index))
++            }
++        }
++    }
++
++    pub fn revoke(&mut self) {
++        if let Self::External { selected, .. } = self {
++            *selected = None;
++        }
++    }
++}
+diff --git a/compositor/src/bin/deniald/flutter_runtime/renderer/handler.rs b/compositor/src/bin/deniald/flutter_runtime/renderer/handler.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/renderer/handler.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/renderer/handler.rs
+@@ -50,6 +50,8 @@
+     desktop_size: PixelSize,
+     producer: ProducerArbiter,
+     shutdown_started: AtomicBool,
++    backing_store_borrows: std::sync::atomic::AtomicUsize,
++    renderer_backend: RendererBackend,
+ }
+ 
+ impl FlutterGlHandler {
+@@ -76,15 +78,100 @@
+         let render_audit_active = render_audit_enabled();
+         let gpu_timing = render_audit_active.then(GpuTimingState::load).flatten();
+         let needs_depth_stencil = renderer_backend == RendererBackend::ImpellerGles;
+-        let mut depth_stencils = Vec::new();
+         info!(
+             %renderer_backend,
+             offscreen_blit,
+             "creating Flutter physical-output texture targets"
+         );
++
++        let imported = Self::import_output_targets(
++            &render_context,
++            output_pools,
++            gl,
++            needs_depth_stencil,
++            offscreen_blit,
++        );
++        render_context.unbind()?;
++        let (targets, depth_stencils, shader_blit, broker) = imported?;
++        let render_audit = render_audit_active.then(|| {
++            info!(
++                target: "deniald::render_audit",
++                width = desktop_size.width,
++                height = desktop_size.height,
++                gpu_timestamps = gpu_timing.is_some(),
++                "Flutter physical-output render audit enabled"
++            );
++            Mutex::new(RenderDamageAudit::new())
++        });
++
++        Ok(Arc::new(Self {
++            render_context: Mutex::new(ContextBinding::new(render_context)),
++            resource_context: Mutex::new(ContextBinding::new(resource_context)),
++            display,
++            gl,
++            targets: Mutex::new(targets),
++            shader_blit: Mutex::new(shader_blit),
++            depth_stencils: Mutex::new(depth_stencils),
++            broker: Mutex::new(broker),
++            pending_output_presentation: Mutex::new(None),
++            gpu_deadline_hints: gpu_deadline::GpuDeadlineHints::default(),
++            external_texture_sources: Mutex::new(HashMap::new()),
++            raster_sampled_buffers: Mutex::new(Vec::new()),
++            raster_sampled_feedback: Mutex::new(Vec::new()),
++            sampled_buffer_release_fence: Mutex::new(None),
++            sampled_buffer_batch_pool: Arc::new(Mutex::new(Vec::with_capacity(
++                MAX_RECYCLED_SAMPLED_BUFFER_BATCHES,
++            ))),
++            dmabuf_texture_cache: Mutex::new(PartitionedRecencyCache::new(
++                MAX_CACHED_DMABUF_BINDINGS_PER_TEXTURE,
++            )),
++            shm_texture_cache: Mutex::new(RecencyCache::new(MAX_CACHED_SHM_BINDINGS)),
++            retired_external_bindings: Arc::new(RetiredExternalBindingQueue::new()),
++            retired_external_binding_scratch: Mutex::new(Vec::new()),
++            external_texture_lease_pool: Arc::new(Mutex::new(Vec::with_capacity(
++                MAX_CACHED_EXTERNAL_TEXTURE_LEASES,
++            ))),
++            prepared_external_texture: Mutex::new(None),
++            external_texture_resource_budget: Arc::new(ExternalTextureResourceBudget::default()),
++            pending_vsync_batons: Mutex::new(PendingVsyncBatons::default()),
++            platform_task_budget: Arc::new(PlatformTaskBudget::default()),
++            platform_tasks: CoalescedInbox::with_capacity(INITIAL_PLATFORM_TASK_BATCH_CAPACITY),
++            ready_frames: Mutex::new(VecDeque::with_capacity(8)),
++            frame_ready_wakeup: CoalescedWakeup::default(),
++            queue_overflow_wakeup: CoalescedWakeup::default(),
++            render_audit,
++            gpu_timing: gpu_timing.map(Mutex::new),
++            events,
++            generation,
++            desktop_size,
++            producer: ProducerArbiter::new(),
++            shutdown_started: AtomicBool::new(false),
++            backing_store_borrows: std::sync::atomic::AtomicUsize::new(0),
++            renderer_backend,
++        }))
++    }
++
++    /// Caller owns the current raster context. This importer is shared by
++    /// startup and the render-thread replacement path, not a second renderer.
++    fn import_output_targets<'a>(
++        render_context: &egl_context::SharedEglContext,
++        output_pools: impl IntoIterator<Item = OutputRenderTargetPool<'a>>,
++        gl: GlApi,
++        needs_depth_stencil: bool,
++        offscreen_blit: bool,
++    ) -> Result<
++        (
++            Vec<GlTarget>,
++            Vec<u32>,
++            Option<ShaderBlit>,
++            OutputBufferBroker,
++        ),
++        Box<dyn Error>,
++    > {
++        let display = render_context.display().get_display_handle();
++        let mut depth_stencils = Vec::new();
+         let mut targets = Vec::new();
+         let mut broker_descriptors = Vec::new();
+-
+         for pool in output_pools {
+             let width =
+                 i32::try_from(pool.size.width).map_err(|_| "Flutter output width exceeds GLES")?;
+@@ -119,7 +206,6 @@
+                     );
+                     destroy_depth_stencils(gl, &mut depth_stencils);
+                     destroy_targets(gl, &display, &mut targets);
+-                    render_context.unbind()?;
+                     return Err("could not allocate Impeller GLES depth/stencil storage".into());
+                 }
+             }
+@@ -136,7 +222,6 @@
+                     Err(error) => {
+                         destroy_targets(gl, &display, &mut targets);
+                         destroy_depth_stencils(gl, &mut depth_stencils);
+-                        render_context.unbind()?;
+                         return Err(error.into());
+                     }
+                 };
+@@ -246,7 +331,6 @@
+                     destroy_targets(gl, &display, &mut failed);
+                     destroy_targets(gl, &display, &mut targets);
+                     destroy_depth_stencils(gl, &mut depth_stencils);
+-                    render_context.unbind()?;
+                     return Err(format!(
+                         "Flutter output {:?} buffer {buffer_index} ({width}x{height}, {:?}) scanout framebuffer failed: status={framebuffer_status:#x}, import_error={import_error:#x}, attachment_error={attachment_error:#x}",
+                         pool.output_id, scanout_dmabuf.format(),
+@@ -259,7 +343,6 @@
+                         destroy_targets(gl, &display, &mut failed);
+                         destroy_targets(gl, &display, &mut targets);
+                         destroy_depth_stencils(gl, &mut depth_stencils);
+-                        render_context.unbind()?;
+                         return Err(
+                             "offscreen blit target is missing its linear render DMA-BUF".into()
+                         );
+@@ -272,7 +355,6 @@
+                         destroy_targets(gl, &display, &mut failed);
+                         destroy_targets(gl, &display, &mut targets);
+                         destroy_depth_stencils(gl, &mut depth_stencils);
+-                        render_context.unbind()?;
+                         return Err(format!(
+                             "offscreen Flutter render target is not linear XR24: {render_format:?}"
+                         )
+@@ -288,7 +370,6 @@
+                             destroy_targets(gl, &display, &mut failed);
+                             destroy_targets(gl, &display, &mut targets);
+                             destroy_depth_stencils(gl, &mut depth_stencils);
+-                            render_context.unbind()?;
+                             return Err(error.into());
+                         }
+                     };
+@@ -376,7 +457,6 @@
+                         destroy_targets(gl, &display, &mut failed);
+                         destroy_targets(gl, &display, &mut targets);
+                         destroy_depth_stencils(gl, &mut depth_stencils);
+-                        render_context.unbind()?;
+                         return Err("a Flutter offscreen output framebuffer is incomplete".into());
+                     }
+                 } else {
+@@ -393,7 +473,7 @@
+                 pool.render_view_id,
+                 pool.configuration_generation,
+                 pool.size,
+-                pool.initial_scanout,
++                pool.selection,
+                 framebuffers,
+             ));
+         }
+@@ -402,7 +482,6 @@
+             Err(error) => {
+                 destroy_targets(gl, &display, &mut targets);
+                 destroy_depth_stencils(gl, &mut depth_stencils);
+-                render_context.unbind()?;
+                 return Err(error);
+             }
+         };
+@@ -413,15 +492,11 @@
+             (gl.bind_texture)(gl::TEXTURE_2D, 0);
+             (gl.bind_renderbuffer)(gl::RENDERBUFFER, 0);
+         }
+-        render_context.unbind()?;
+-
+-        if targets.len() < 3 {
+-            // SAFETY: Flutter does not own this context yet.
+-            unsafe { render_context.make_current()? };
++
++        if targets.is_empty() {
+             destroy_shader_blit(gl, &mut shader_blit);
+             destroy_targets(gl, &display, &mut targets);
+             destroy_depth_stencils(gl, &mut depth_stencils);
+-            render_context.unbind()?;
+             return Err("Flutter presentation needs physical output buffer pools".into());
+         }
+         let broker = match OutputBufferBroker::new(broker_descriptors.iter().map(
+@@ -431,7 +506,7 @@
+                     render_view_id: *render_view_id,
+                     configuration_generation: *configuration_generation,
+                     size: *size,
+-                    initial_scanout: *initial,
++                    selection: *initial,
+                     framebuffers,
+                 }
+             },
+@@ -440,13 +515,9 @@
+             Err(error) => {
+                 // Keep the constructor's new validation path leak-free: GL
+                 // targets do not own automatic destructors.
+-                // SAFETY: target construction has finished, the render
+-                // context is unbound, and Flutter does not own it yet.
+-                unsafe { render_context.make_current()? };
+                 destroy_shader_blit(gl, &mut shader_blit);
+                 destroy_targets(gl, &display, &mut targets);
+                 destroy_depth_stencils(gl, &mut depth_stencils);
+-                render_context.unbind()?;
+                 return Err(error.into());
+             }
+         };
+@@ -457,60 +528,92 @@
+             render_modifier = ?offscreen_blit.then_some(Modifier::Linear),
+             "imported native output pools into Flutter EGL context"
+         );
+-        let render_audit = render_audit_active.then(|| {
+-            info!(
+-                target: "deniald::render_audit",
+-                width = desktop_size.width,
+-                height = desktop_size.height,
+-                gpu_timestamps = gpu_timing.is_some(),
+-                "Flutter physical-output render audit enabled"
+-            );
+-            Mutex::new(RenderDamageAudit::new())
+-        });
+-
+-        Ok(Arc::new(Self {
+-            render_context: Mutex::new(ContextBinding::new(render_context)),
+-            resource_context: Mutex::new(ContextBinding::new(resource_context)),
+-            display,
+-            gl,
+-            targets: Mutex::new(targets),
+-            shader_blit: Mutex::new(shader_blit),
+-            depth_stencils: Mutex::new(depth_stencils),
+-            broker: Mutex::new(broker),
+-            pending_output_presentation: Mutex::new(None),
+-            gpu_deadline_hints: gpu_deadline::GpuDeadlineHints::default(),
+-            external_texture_sources: Mutex::new(HashMap::new()),
+-            raster_sampled_buffers: Mutex::new(Vec::new()),
+-            raster_sampled_feedback: Mutex::new(Vec::new()),
+-            sampled_buffer_release_fence: Mutex::new(None),
+-            sampled_buffer_batch_pool: Arc::new(Mutex::new(Vec::with_capacity(
+-                MAX_RECYCLED_SAMPLED_BUFFER_BATCHES,
+-            ))),
+-            dmabuf_texture_cache: Mutex::new(PartitionedRecencyCache::new(
+-                MAX_CACHED_DMABUF_BINDINGS_PER_TEXTURE,
+-            )),
+-            shm_texture_cache: Mutex::new(RecencyCache::new(MAX_CACHED_SHM_BINDINGS)),
+-            retired_external_bindings: Arc::new(RetiredExternalBindingQueue::new()),
+-            retired_external_binding_scratch: Mutex::new(Vec::new()),
+-            external_texture_lease_pool: Arc::new(Mutex::new(Vec::with_capacity(
+-                MAX_CACHED_EXTERNAL_TEXTURE_LEASES,
+-            ))),
+-            prepared_external_texture: Mutex::new(None),
+-            external_texture_resource_budget: Arc::new(ExternalTextureResourceBudget::default()),
+-            pending_vsync_batons: Mutex::new(PendingVsyncBatons::default()),
+-            platform_task_budget: Arc::new(PlatformTaskBudget::default()),
+-            platform_tasks: CoalescedInbox::with_capacity(INITIAL_PLATFORM_TASK_BATCH_CAPACITY),
+-            ready_frames: Mutex::new(VecDeque::with_capacity(8)),
+-            frame_ready_wakeup: CoalescedWakeup::default(),
+-            queue_overflow_wakeup: CoalescedWakeup::default(),
+-            render_audit,
+-            gpu_timing: gpu_timing.map(Mutex::new),
+-            events,
+-            generation,
+-            desktop_size,
+-            producer: ProducerArbiter::new(),
+-            shutdown_started: AtomicBool::new(false),
+-        }))
++        Ok((targets, depth_stencils, shader_blit, broker))
++    }
++
++    #[cfg(feature = "external-output")]
++    pub(in crate::flutter_runtime) fn replace_external_pool_on_render_thread(
++        &self,
++        output: OutputId,
++        view: RenderViewId,
++        configuration: u64,
++        size: PixelSize,
++        generation: u64,
++        buffers: &[Dmabuf],
++    ) -> denial_flutter_engine::RenderOperationResult {
++        use denial_flutter_engine::RenderOperationResult::{Busy, Completed, Rejected, Uncertain};
++        if self.shutdown_started.load(Ordering::Acquire) {
++            return Uncertain;
++        }
++        if !lock(&self.broker).external_pool_retired()
++            || self.backing_store_borrows.load(Ordering::Acquire) != 0
++            || !lock(&self.ready_frames).is_empty()
++            || lock(&self.pending_output_presentation).is_some()
++            || !lock(&self.raster_sampled_buffers).is_empty()
++            || lock(&self.sampled_buffer_release_fence).is_some()
++        {
++            return Busy;
++        }
++        let mut context = lock(&self.render_context);
++        if !context.make_current() {
++            return Uncertain;
++        }
++        // SAFETY: this operation runs on the serial raster runner behind all
++        // previous render tasks, with public/sample/release ownership drained.
++        unsafe { (self.gl.finish)() };
++        let imported = Self::import_output_targets(
++            &context.context,
++            [OutputRenderTargetPool {
++                output_id: output,
++                render_view_id: view,
++                configuration_generation: configuration,
++                size,
++                selection: PoolSelection::External {
++                    generation,
++                    selected: None,
++                },
++                dmabufs: buffers.iter().map(|b| (b, None)).collect(),
++            }],
++            self.gl,
++            self.renderer_backend == RendererBackend::ImpellerGles,
++            false,
++        );
++        let Ok((mut targets, mut depth_stencils, mut shader_blit, broker)) = imported else {
++            return if context.clear_current() {
++                Rejected
++            } else {
++                Uncertain
++            };
++        };
++        // Revalidate under the owner lock. No selected slot/authorization is
++        // carried across the swap. New imports exist before old FBO IDs vanish.
++        let mut owner = lock(&self.broker);
++        if !owner.external_pool_retired() {
++            destroy_targets(self.gl, &self.display, &mut targets);
++            destroy_depth_stencils(self.gl, &mut depth_stencils);
++            destroy_shader_blit(self.gl, &mut shader_blit);
++            return if context.clear_current() {
++                Busy
++            } else {
++                Uncertain
++            };
++        }
++        mem::swap(&mut *lock(&self.targets), &mut targets);
++        mem::swap(&mut *lock(&self.depth_stencils), &mut depth_stencils);
++        mem::swap(&mut *lock(&self.shader_blit), &mut shader_blit);
++        *owner = broker;
++        drop(owner);
++        if let Some(timing) = &self.gpu_timing {
++            lock(timing).clear();
++        }
++        destroy_targets(self.gl, &self.display, &mut targets);
++        destroy_depth_stencils(self.gl, &mut depth_stencils);
++        destroy_shader_blit(self.gl, &mut shader_blit);
++        if context.clear_current() {
++            Completed
++        } else {
++            Uncertain
++        }
+     }
+ 
+     pub(in crate::flutter_runtime) fn take_ready_frame(
+@@ -570,6 +673,43 @@
+ 
+     pub(in crate::flutter_runtime) fn cancel_output_authorizations(&self, render_view_ids: &[i64]) {
+         lock(&self.broker).cancel_authorizations(render_view_ids);
++    }
++
++    pub(in crate::flutter_runtime) fn select_external_target(
++        &self,
++        output: OutputId,
++        generation: u64,
++        index: usize,
++        count: usize,
++    ) -> bool {
++        lock(&self.broker).select_external_target(output, generation, index, count)
++    }
++
++    pub(in crate::flutter_runtime) fn revoke_external_targets(&self) {
++        lock(&self.broker).revoke_external_targets();
++    }
++
++    pub(in crate::flutter_runtime) fn external_work_pending(
++        &self,
++        output: OutputId,
++        now: Instant,
++    ) -> bool {
++        lock(&self.broker).external_work_pending(output, now)
++    }
++
++    pub(in crate::flutter_runtime) fn external_retirement_pending(
++        &self,
++        output: OutputId,
++        now: Instant,
++    ) -> bool {
++        lock(&self.broker).external_retirement_pending(output, now)
++    }
++
++    pub(in crate::flutter_runtime) fn external_authorization_deadline(
++        &self,
++        output: OutputId,
++    ) -> Option<Instant> {
++        lock(&self.broker).external_authorization_deadline(output)
+     }
+ 
+     pub(in crate::flutter_runtime) fn release_output(
+diff --git a/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs b/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
+--- a/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
+@@ -217,6 +217,7 @@
+         if let Some(gpu_timing) = &self.gpu_timing {
+             lock(gpu_timing).begin(framebuffer);
+         }
++        self.backing_store_borrows.fetch_add(1, Ordering::AcqRel);
+         Some(CompositorBackingStore {
+             framebuffer,
+             format: gl::RGBA8,
+@@ -231,10 +232,17 @@
+         // Flutter returns only its temporary render-target borrow. The native
+         // target stays in OutputBufferBroker and is recycled after KMS ownership is
+         // released, not when the engine destroys its wrapper.
+-        lock(&self.targets).iter().any(|target| {
++        let valid = lock(&self.targets).iter().any(|target| {
+             target.render_framebuffer == backing_store.framebuffer
+                 && backing_store.user_data == backing_store.framebuffer as usize
+-        })
++        });
++        valid
++            && self
++                .backing_store_borrows
++                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
++                    count.checked_sub(1)
++                })
++                .is_ok()
+     }
+ 
+     fn present_view(&self, view: PresentView<'_>) -> bool {
+diff --git a/compositor/src/bin/deniald/frame_request.rs b/compositor/src/bin/deniald/frame_request.rs
+new file mode 100644
+--- /dev/null
++++ b/compositor/src/bin/deniald/frame_request.rs
+@@ -0,0 +1,43 @@
++//! Backend-independent native render request and timeline values.
++use denial_core::topology::OutputId;
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) struct FrameTick {
++    pub(super) output: OutputId,
++    pub(super) sequence: u64,
++    /// Stable period derived from the configured output mode. Phase locking
++    /// moves presentation targets but never changes this cadence identity.
++    pub(super) nominal_interval: Duration,
++    /// Phase-corrected duration from this render deadline to its target.
++    pub(super) interval: Duration,
++    pub(super) render_deadline: Instant,
++    pub(super) presentation_target: Instant,
++}
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(super) struct PendingFrame {
++    pub(super) flutter_requested: bool,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum FrameAction {
++    Skip,
++    Render { flutter_output: Option<OutputId> },
++}
++
++/// Successful dispatch is not the same as forwarding a Flutter VSync baton.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(crate) struct RenderDispatch {
++    pub authorized: bool,
++    pub vsync_dispatched: bool,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) struct OutputFrameRequest {
++    pub(super) tick: FrameTick,
++    pub(super) dirty_serial: u64,
++    pub(super) lock_frame_token: u64,
++    pub(super) fingerprint_epoch: u64,
++    pub(super) scene_recovery_token: u64,
++}
+diff --git a/packages/denial_flutter_sdk/lib/src/platform/bridge/events_client.dart b/packages/denial_flutter_sdk/lib/src/platform/bridge/events_client.dart
+--- a/packages/denial_flutter_sdk/lib/src/platform/bridge/events_client.dart
++++ b/packages/denial_flutter_sdk/lib/src/platform/bridge/events_client.dart
+@@ -1,4 +1,5 @@
+ import 'dart:async';
++import 'dart:convert';
+ 
+ import 'package:flutter/services.dart';
+ 
+@@ -50,7 +51,23 @@
+   final StreamController<DenialTextInputState> _textInputStates =
+       StreamController<DenialTextInputState>.broadcast(sync: true);
+ 
++  final _sceneRecoveryRequests = StreamController<String>.broadcast(sync: true);
++  Stream<String> get sceneRecoveryRequests => _sceneRecoveryRequests.stream;
++
+   Future<ByteData?> handleMessage(ByteData? data) async {
++    if (data != null && data.lengthInBytes <= 110) {
++      final bytes = data.buffer.asUint8List(
++        data.offsetInBytes,
++        data.lengthInBytes,
++      );
++      final packet = utf8.decode(bytes, allowMalformed: true);
++      if (RegExp(r'^DENIAL_RECOVERY:[0-9]+:[0-9]+:[0-9]+:[0-9]+$')
++          .hasMatch(packet)) {
++        if (!_sceneRecoveryRequests.isClosed)
++          _sceneRecoveryRequests.add(packet);
++        return null;
++      }
++    }
+     if (wire.isDenialPlacementPacket(data)) {
+       final event = _context.codec.decodePlacement(data);
+       if (event != null && !_windows.eventsClosed) {
+@@ -318,6 +335,7 @@
+ 
+   Stream<DenialTextInputState> get textInputStates => _textInputStates.stream;
+   void dispose() {
++    unawaited(_sceneRecoveryRequests.close());
+     unawaited(_shellActions.close());
+     unawaited(_pluginActions.close());
+     unawaited(_cursorShapes.close());
+diff --git a/packages/denial_flutter_sdk/lib/src/platform/denial_bridge.dart b/packages/denial_flutter_sdk/lib/src/platform/denial_bridge.dart
+--- a/packages/denial_flutter_sdk/lib/src/platform/denial_bridge.dart
++++ b/packages/denial_flutter_sdk/lib/src/platform/denial_bridge.dart
+@@ -99,6 +99,9 @@
+ 
+   Stream<DenialShellActionEvent> get shellActions => _events.shellActions;
+ 
++  /// Embedded-shell cold-recovery barrier on the ordered scene stream.
++  Stream<String> get sceneRecoveryRequests => _events.sceneRecoveryRequests;
++
+   Stream<({int generation, String id, int? monitorId})> get pluginActions =>
+       _events.pluginActions;
+ 
+diff --git a/plugins/denial_desktop/lib/src/core/scene_recovery_binding.dart b/plugins/denial_desktop/lib/src/core/scene_recovery_binding.dart
+new file mode 100644
+--- /dev/null
++++ b/plugins/denial_desktop/lib/src/core/scene_recovery_binding.dart
+@@ -0,0 +1,55 @@
++import 'dart:async';
++
++import 'package:flutter/services.dart';
++import 'package:flutter/widgets.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:denial_flutter_sdk/state.dart';
++
++final sceneRecoveryRequestProvider =
++    NotifierProvider<SceneRecoveryRequest, String>(SceneRecoveryRequest.new);
++
++/// Native sends this marker AFTER texture registration, window/workspace/focus
++/// replay. Input publishers watch it so even an unchanged empty layout rebuilds.
++class SceneRecoveryRequest extends Notifier<String> {
++  static const _channel = BasicMessageChannel<String>(
++    'denial/scene_recovery',
++    StringCodec(),
++  );
++  int _lifecycle = 0;
++  @override
++  String build() {
++    final lifecycle = ++_lifecycle;
++    final subscription = ref
++        .watch(denialBridgeProvider)
++        .sceneRecoveryRequests
++        .listen((packet) {
++          state = packet;
++          _settle(packet, lifecycle, 2);
++        });
++    ref.onDispose(() {
++      ++_lifecycle;
++      unawaited(subscription.cancel());
++    });
++    return '';
++  }
++
++  void _settle(String packet, int lifecycle, int frames) {
++    WidgetsBinding.instance.addPostFrameCallback((_) {
++      if (_lifecycle != lifecycle || state != packet) return;
++      if (frames > 1) {
++        _settle(packet, lifecycle, frames - 1);
++        return;
++      }
++      // Frame-batched focus and layout callbacks from the first frame have now
++      // been reduced. Native still requires a separately authorized raster frame.
++      unawaited(
++        _channel.send(packet).then((_) {
++          if (_lifecycle == lifecycle && state == packet) {
++            WidgetsBinding.instance.scheduleFrame();
++          }
++        }),
++      );
++    });
++    WidgetsBinding.instance.scheduleFrame();
++  }
++}
+diff --git a/plugins/denial_desktop/lib/src/core/shell_runtime_bindings.dart b/plugins/denial_desktop/lib/src/core/shell_runtime_bindings.dart
+--- a/plugins/denial_desktop/lib/src/core/shell_runtime_bindings.dart
++++ b/plugins/denial_desktop/lib/src/core/shell_runtime_bindings.dart
+@@ -1,6 +1,8 @@
+ import 'package:denial_desktop/src/state/reference_shell_controller.dart';
+ 
+ import 'dart:async';
++
++import 'scene_recovery_binding.dart';
+ 
+ import 'package:denial_flutter_sdk/popups.dart';
+ import 'package:denial_flutter_sdk/surfaces.dart';
+@@ -71,6 +73,7 @@
+     // These providers own process-lifetime integrations. Keeping the eager
+     // subscriptions here makes that runtime contract explicit.
+     ref.watch(referenceShellProvider.select((_) => null));
++    ref.watch(sceneRecoveryRequestProvider);
+     ref.watch(desktopNotificationsProvider.select((_) => null));
+     ref.listen<bool>(
+       referenceShellProvider.select((state) => state.lockLayerVisible),
+diff --git a/plugins/denial_desktop/lib/src/desktop/desktop_input_layout_publisher.dart b/plugins/denial_desktop/lib/src/desktop/desktop_input_layout_publisher.dart
+--- a/plugins/denial_desktop/lib/src/desktop/desktop_input_layout_publisher.dart
++++ b/plugins/denial_desktop/lib/src/desktop/desktop_input_layout_publisher.dart
+@@ -1,3 +1,5 @@
++import '../core/scene_recovery_binding.dart';
++
+ import 'package:denial_desktop/src/state/reference_shell_controller.dart';
+ 
+ import 'dart:math' as math;
+@@ -33,6 +35,7 @@
+       DesktopWindowConfigureTracker();
+   bool _scheduled = false;
+   int _epoch = 0;
++  String _recoveryRequest = "";
+   InputLayoutSnapshot? _lastSnapshot;
+   _DesktopInputLayoutSource? _lastSource;
+   DesktopInputSurfaceIndex? _surfaceIndex;
+@@ -40,6 +43,12 @@
+ 
+   @override
+   Widget build(BuildContext context) {
++    final recovery = ref.watch(sceneRecoveryRequestProvider);
++    if (recovery != _recoveryRequest) {
++      _recoveryRequest = recovery;
++      _lastSource = null;
++      _lastSnapshot = null;
++    }
+     ref.watch(
+       referenceShellProvider.select(
+         (state) =>
+diff --git a/plugins/denial_desktop/lib/src/state/reference_shell_controller.dart b/plugins/denial_desktop/lib/src/state/reference_shell_controller.dart
+--- a/plugins/denial_desktop/lib/src/state/reference_shell_controller.dart
++++ b/plugins/denial_desktop/lib/src/state/reference_shell_controller.dart
+@@ -165,6 +165,10 @@
+     _platform.requestUnlock();
+   }
+ 
++  void invalidateRecoveryInputLayout() {
++    _inputLayoutCoordinator.invalidate();
++  }
++
+   void completeUnlockTransition() {
+     if (state.locked || !state.lockLayerVisible) {
+       return;
+diff --git a/plugins/denial_desktop/lib/src/widgets/input_layout_publisher.dart b/plugins/denial_desktop/lib/src/widgets/input_layout_publisher.dart
+--- a/plugins/denial_desktop/lib/src/widgets/input_layout_publisher.dart
++++ b/plugins/denial_desktop/lib/src/widgets/input_layout_publisher.dart
+@@ -1,3 +1,5 @@
++import '../core/scene_recovery_binding.dart';
++
+ import 'package:denial_desktop/src/state/reference_shell_controller.dart';
+ 
+ import 'package:flutter/widgets.dart';
+@@ -17,9 +19,15 @@
+ 
+ class _InputLayoutPublisherState extends ConsumerState<InputLayoutPublisher> {
+   bool _scheduled = false;
++  String _recoveryRequest = "";
+ 
+   @override
+   Widget build(BuildContext context) {
++    final recovery = ref.watch(sceneRecoveryRequestProvider);
++    if (recovery != _recoveryRequest) {
++      _recoveryRequest = recovery;
++      ref.read(referenceShellProvider.notifier).invalidateRecoveryInputLayout();
++    }
+     ref.watch(
+       referenceShellProvider.select(
+         (state) => (

@@ -20,14 +20,17 @@ typedef struct display_ctx display_ctx;
  */
 
 /* Connect to the daemon and fetch screen info only. Leaves the context in
- * fallback: it does NOT pick up consumer fds or dmabufs. Returns 0 / -1. */
+ * fallback: it does NOT pick up consumer fds or dmabufs. Waits without a
+ * consumer-arrival deadline; use the deferred variant in an event loop.
+ * Returns 0 / -1 on readiness / transport or protocol failure. */
 int  connect_to_deamon(display_ctx **ctx, const char *socket_path);
 
 /* Tear down everything and disconnect from the daemon. */
 void disconnect(display_ctx *ctx);
 
 /* Opt-in deferred connector discovery: returns after HELLO; screen geometry
- * may be zero until try_exit_fallback observes the consumer. No fake mode. */
+ * may be zero until try_exit_fallback observes the consumer. No fake mode.
+ * Partial screen/pickup/pool records survive arbitrarily delayed consumers. */
 int connect_to_deamon_deferred(display_ctx **out, const char *socket_path);
 
 int  get_screen_info(display_ctx *ctx, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *refresh);
@@ -113,11 +116,12 @@ bool is_daemon_alive(display_ctx *ctx);
  * received dmabuf set; the caller can then use try_exit_fallback() to retry. */
 void force_fallback(display_ctx *ctx);
 
-/* Attempt to leave fallback: pick up the consumer fds and immediately receive the
- * dmabuf set (the consumer sends the dmabufs right after the fd handshake). Clears
- * fallback only when BOTH the fds and the dmabufs are in hand, so on a 0 return the
- * dmabufs are ready to import right away. Returns 0 on success, -1 if there is
- * still no consumer (stays in fallback; safe to retry on the next tick). */
+/* Nonblocking staged handshake. Returns 0 when pool metadata is ready, -1 with
+ * EAGAIN while pending: retain all partial bytes/FDs and retry on readiness or a
+ * bounded timer. One 3s total deadline covers pickup through metadata, not each
+ * read. EOF/protocol/deadline errors release partial resources. An ambiguous
+ * control response also closes the daemon connection (caller must reopen).
+ * Success does NOT prove a writable slot; scene waits for buffer-ready. */
 int  try_exit_fallback(display_ctx *ctx);
 
 int  get_data_fd(display_ctx *ctx);

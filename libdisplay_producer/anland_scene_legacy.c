@@ -74,6 +74,7 @@ struct anland_scene_legacy {
     /* True between a successful connect and the next session teardown. Keeps
      * drop_session() from invalidating an already-dead session over and over. */
     bool session_valid;
+    bool target_selected; /* set only by a real buffer-ready notification */
     /* Old identities/events must retire before a handshake can reuse buffer ids. */
     bool retirement_pending;
     /* eventfd ACK was consumed, but slot release/publication may need a retry. */
@@ -96,7 +97,7 @@ static int legacy_submit(void *ud, const anland_scene_snapshot_t *snap)
 
     /* No consumer: there is nobody to present to. Rejecting here is what turns
      * into COMMIT_DROPPED(BACKEND_ERROR) for the DE. */
-    if (!b->session_valid || b->ready_pending || b->retirement_pending ||
+    if (!b->session_valid || !b->target_selected || b->ready_pending || b->retirement_pending ||
         !anland_device_is_connected(b->dev))
         return -1;
 
@@ -184,7 +185,7 @@ static bool refresh_output(struct anland_scene_legacy *b)
 /* Publish the buffer slot the consumer wants the producer to render into next.
  *
  * This is the RENDER TARGET signal, and it is what a DE's frame loop waits for:
- * the handshake publishes a selection before any frame has been flipped, so the
+ * a real buffer-ready notification publishes the selection before the first flip, so the
  * first publication starts rendering without ever claiming a presentation.
  *
  * An index outside the consumer's own buffer set means the session is corrupt;
@@ -292,6 +293,7 @@ static void drop_session(struct anland_scene_legacy *b)
         b->inflight_commit = 0;
         b->inflight_buffer_count = 0;
         b->session_valid = false;
+        b->target_selected = false;
         b->retirement_pending = true;
         b->ready_pending = false;
         b->have_output = false;
@@ -364,7 +366,7 @@ bool anland_scene_legacy_connected(anland_scene_legacy *b)
 
 bool anland_scene_legacy_target_available(anland_scene_legacy *b)
 {
-    return b && b->session_valid && !b->ready_pending &&
+    return b && b->session_valid && b->target_selected && !b->ready_pending &&
            !b->retirement_pending && anland_device_is_connected(b->dev);
 }
 
@@ -407,6 +409,7 @@ int anland_scene_legacy_reconnect(anland_scene_legacy *b)
      * publication from a session that has already ended is refused by the scene. */
     b->session_generation = anland_scene_generation(b->scene);
     b->session_valid = true;
+    b->target_selected = false;
 
     if (!refresh_output(b)) {
         drop_session(b);
@@ -414,17 +417,9 @@ int anland_scene_legacy_reconnect(anland_scene_legacy *b)
         return -1;
     }
 
-    /* The handshake already published which buffer the consumer wants first, so
-     * announce the render target now: this is what lets a DE start (or resume)
-     * its frame loop. It is not a presentation — nothing has been flipped yet. */
-    if (publish_target_ready(b) != 0) {
-        /* An unusable selection is not a usable session: detach so the caller's
-         * next reconnect() runs a fresh handshake instead of rendering blind. */
-        drop_session(b);
-        anland_device_force_fallback(b->dev);
-        return -1;
-    }
-    return 0;
+    /* Pool metadata is not a slot selection. Consume an already pending real
+     * signal, otherwise keep the session and let the event loop pump it later. */
+    return anland_scene_legacy_pump(b, 0);
 }
 
 int anland_scene_legacy_reopen(anland_scene_legacy *b, const char *socket_path)
@@ -465,7 +460,7 @@ int anland_scene_legacy_present(anland_scene_legacy *b)
         return -1;
     if (b->pending_commit == 0)
         return -1; /* nothing accepted, or already flipped */
-    if (!b->session_valid || b->ready_pending ||
+    if (!b->session_valid || !b->target_selected || b->ready_pending ||
         !anland_device_is_connected(b->dev))
         return -1;
 
@@ -531,6 +526,8 @@ int anland_scene_legacy_pump(anland_scene_legacy *b, int timeout_ms)
         return 0;
     }
 
+    /* A connected consumer may take any amount of time to select its first
+     * slot. Do not fabricate slot zero or detach it because time passed. */
     if (!b->ready_pending) {
         const int fd = anland_device_buffer_ready_fd(b->dev);
         if (fd < 0)
@@ -573,6 +570,7 @@ int anland_scene_legacy_pump(anland_scene_legacy *b, int timeout_ms)
         anland_device_force_fallback(b->dev);
         return -1;
     }
+    b->target_selected = true;
     b->ready_pending = false;
     return 0;
 }
