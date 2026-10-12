@@ -434,6 +434,11 @@ verify_engine_symbols() {
     done
 }
 build_flutter_engine() {
+    # The locked depot_tools ninja wrapper imports pipes, removed in Python 3.13.
+    # Use Arch's native binary, not the Python wrapper selected by the depot PATH.
+    local native_ninja=/usr/bin/ninja
+    [[ -x $native_ninja ]] || die 'native Ninja missing (install the Arch ninja package)'
+    run "$native_ninja" --version
     local identity generated_source="$FLUTTER/engine/src" rc
     local checkout_depot="$FLUTTER/engine/src/flutter/third_party/depot_tools"
     local engine_build="$WORKDIR/engine/build" target=${ENGINE##*/} policy expected actual
@@ -468,7 +473,7 @@ build_flutter_engine() {
         DEPOT_TOOLS_UPDATE=0 VPYTHON_VIRTUALENV_ROOT="$WORKDIR/engine/vpython" \
         ./flutter/third_party/gn/gn gen --check "$ENGINE"
     run env PATH="$checkout_depot/.cipd_bin:$checkout_depot:$PATH" DEPOT_TOOLS_UPDATE=0 \
-        VPYTHON_VIRTUALENV_ROOT="$WORKDIR/engine/vpython" ninja -C "$ENGINE" -j "$JOBS" \
+        VPYTHON_VIRTUALENV_ROOT="$WORKDIR/engine/vpython" "$native_ninja" -C "$ENGINE" -j "$JOBS" \
         libflutter_engine.so dart_sdk flutter/sky/packages/sky_engine:sky_engine \
         flutter_patched_sdk/platform_strong.dill gen_snapshot \
         flutter/tools/const_finder:const_finder flutter/tools/font_subset:font_subset flutter/impeller/compiler:impellerc
@@ -821,13 +826,22 @@ package_all() {
     log "Done. Signed packages: $ARTIFACTS_DIR (DE=$ANLAND_WITH_DE, installed=$ANLAND_INSTALL; no graphical test)"
 }
 
+# Declare host tools and runtime libraries explicitly: prepared-engine builds
+# also need archive tools, and deniald dlopens libpulse.so.0 for audio controls.
 build_deps=(base-devel cmake ninja rust python git curl jq pkgconf binutils libarchive gnupg dbus
-            libpipewire libglvnd mesa libdrm libinput seatd libxkbcommon systemd-libs pam polkit fontconfig wayland)
+            bash coreutils util-linux procps-ng ca-certificates glibc gcc-libs tar unzip zip xz zlib
+            libpipewire libpulse libglvnd mesa libdrm libinput seatd libxkbcommon xkeyboard-config
+            systemd-libs pam polkit fontconfig freetype2 wayland)
 # Dependencies of the KDE Arch Xwayland recipe (makepkg does not install them).
 build_deps+=(meson xorgproto xtrans libxkbfile xorg-font-util wayland-protocols mesa-libgl systemd
              nettle libepoxy libxfont2 pixman xorg-server-common libxcvt libxau libtirpc libei libxshmfence libdecor)
 # Clean ARM64 CI workers can build missing engine inputs from pinned sources.
-[[ $ANLAND_ENGINE_MODE == prepared ]] || build_deps+=(clang lld llvm glib2 libunwind unzip zip xz)
+[[ $ANLAND_ENGINE_MODE == prepared ]] || build_deps+=(clang lld llvm glib2 libunwind libffi)
+# Keep full-desktop packages' external dependencies available on clean workers;
+# installing them never implies enabling/restarting any desktop service.
+if [[ $ANLAND_WITH_DE == 1 ]]; then
+    build_deps+=(xdg-utils zenity xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr)
+fi
 if [[ $ANLAND_WITH_DEPS == 1 ]]; then
     [[ $ANLAND_OFFLINE == 0 ]] || die 'dependency installation conflicts with ANLAND_OFFLINE=1'
     run sudo pacman -S --needed --noconfirm "${build_deps[@]}"

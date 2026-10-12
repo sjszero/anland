@@ -23,7 +23,8 @@ case $_kind in
     wm)
         pkgname=denial
         pkgdesc='Denial Anland compositor and embedded Flutter desktop shell'
-        depends=("denial-anland-engine=$ENGINE_VERSION" glibc gcc-libs libglvnd mesa libdrm libinput seatd libxkbcommon xkeyboard-config wayland systemd-libs libpipewire pam dbus bash coreutils util-linux procps-ng binutils)
+        # Audio controls load libpulse.so.0 dynamically, so ELF NEEDED cannot infer it.
+        depends=("denial-anland-engine=$ENGINE_VERSION" glibc gcc-libs libglvnd mesa libdrm libinput seatd libxkbcommon xkeyboard-config wayland systemd-libs libpipewire libpulse pam dbus bash coreutils util-linux procps-ng binutils)
         optdepends=('denial-desktop: full desktop session, applications, Polkit and portals' 'xorg-xwayland: X11 applications')
         provides=("denial-anland-wm=$pkgver-$pkgrel")
         conflicts=(denial-anland-wm denial-git)
