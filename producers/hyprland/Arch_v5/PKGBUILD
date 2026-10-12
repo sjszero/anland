@@ -1,0 +1,159 @@
+# Based on Arch Linux ARM extra/hyprland 0.56.2-4 (hyprland + hyprpm).
+# Keep the complete /usr SDK and runtime layout; only the ABI-patched
+# Aquamarine is renamed, so system Aquamarine and its consumers stay intact.
+pkgbase=hyprland-anland
+pkgname=(hyprland-anland hyprpm-anland)
+pkgver=0.56.2
+pkgrel=4.1
+pkgdesc='Hyprland with Anland v5, Arch Linux ARM runtime and plugin SDK layout'
+arch=(aarch64)
+url=https://github.com/hyprwm/Hyprland
+license=(BSD-3-Clause)
+_hyprland_depends=(
+    cairo libgcc libstdc++ glibc glib2 libgio-2.0.so libgobject-2.0.so glslang
+    hyprcursor libhyprcursor.so hyprgraphics libhyprgraphics.so hyprland-guiutils
+    hyprlang libhyprlang.so 'hyprutils>=0.14' 'libhyprutils.so=13-64' hyprwire libhyprwire.so
+    lcms2 liblcms2.so libdrm libglvnd libEGL.so libGLESv2.so libinput libx11 libxcb
+    libxcomposite libxcursor libxfixes 'libxkbcommon>=1.11' libxkbcommon.so libxrender
+    'lua>=5.5' 'lua<5.6' mesa muparser opengl-driver pango libpango-1.0.so
+    libpangocairo-1.0.so pixman libpixman-1.so re2 libre2.so tomlplusplus
+    libtomlplusplus.so util-linux-libs libuuid.so wayland libwayland-server.so
+    'wayland-protocols>=1.49' xcb-proto xcb-util xcb-util-errors xcb-util-image
+    xcb-util-keysyms xcb-util-renderutil xcb-util-wm xorg-xwayland)
+# Dependencies for the renamed bundled Aquamarine and explicit Anland launcher.
+_anland_depends=(libpipewire libdisplay-info libdisplay-info.so hwdata seatd
+    libseat.so systemd-libs libudev.so libei readline procps-ng util-linux bash)
+depends=("${_hyprland_depends[@]}" "${_anland_depends[@]}")
+makedepends=(cmake 'gcc>=15' glaze hyprland-protocols hyprwayland-scanner meson
+    ninja xorgproto python git pkgconf patchelf glm cpio)
+checkdepends=(doctest)
+optdepends=('hyprpm: build and install plugins'
+    'hyprshutdown: clean logout and shutdown helper'
+    'xdg-desktop-portal-hyprland: xdg-desktop-portal backend for hyprland'
+    'polkit: authentication')
+source=(
+ 'hyprland-0.56.2.tar.gz::https://github.com/hyprwm/Hyprland/releases/download/v0.56.2/source-v0.56.2.tar.gz'
+ 'aquamarine-0.15.1.tar.gz::https://deb.debian.org/debian/pool/main/a/aquamarine/aquamarine_0.15.1.orig.tar.gz'
+ 'hyprgrass-0e8e3c09.tar.gz::https://codeload.github.com/horriblename/hyprgrass/tar.gz/0e8e3c09b805e5f8f7cedde7546e58c504682c31'
+ 'wf-touch-8974eb0.tar.gz::https://codeload.github.com/WayfireWM/wf-touch/tar.gz/8974eb0f6a65464b63dd03b842795cb441fb6403'
+ 'anland-inputs.tar.gz')
+sha256sums=(
+ '03ad3f5ef152ff44116ffd56fcf808486211ecabf4f0ba567108ee746ba5cd2e'
+ '5de0842f2ccb8b242baa801f553e8cdc7689ef7b882675d1b671f77928225857'
+ '4ea3018cab0e6a4d3b6d265af52c58df7de98733eec2d2921785bf9500863bc3'
+ '09061c8a4d3d964e8dcfd1a7b97f7dc43d0fc30743b0993585439c6923ce422f'
+ '@INPUT_SHA256@')
+noextract=(hyprland-0.56.2.tar.gz aquamarine-0.15.1.tar.gz hyprgrass-0e8e3c09.tar.gz wf-touch-8974eb0.tar.gz)
+_prefix=/usr
+_commit=efb50993780079460b0cbed1363e2166a2de1d9f
+options=(!lto)
+_stage_env() {
+    export PATH="$srcdir/stage$_prefix/bin:$PATH"
+    export PKG_CONFIG_PATH="$srcdir/stage$_prefix/lib/pkgconfig:$srcdir/stage$_prefix/share/pkgconfig"
+    export CMAKE_PREFIX_PATH="$srcdir/stage$_prefix"
+    export LD_LIBRARY_PATH="$srcdir/stage$_prefix/lib"
+}
+_stage_pc() {
+    local file
+    while IFS= read -r -d '' file; do
+        sed -i "s|=\($_prefix\)|=$srcdir/stage\1|g" "$file"
+    done < <(find "$srcdir/stage$_prefix" -name '*.pc' -print0)
+}
+_cmake() {
+    local name=$1; shift
+    local launchers=()
+    if command -v ccache >/dev/null; then
+        launchers=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    fi
+    cmake -S "$srcdir/trees/$name" -B "$srcdir/build-$name" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$_prefix" \
+        -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_INCLUDEDIR=include \
+        -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DBUILD_TESTING=OFF \
+        -DCMAKE_SKIP_RPATH=ON -DCMAKE_INSTALL_RPATH= \
+        -DCMAKE_C_FLAGS="$CFLAGS" -DCMAKE_CXX_FLAGS="$CXXFLAGS" "${launchers[@]}" "$@"
+    cmake --build "$srcdir/build-$name" --parallel "${JOBS:-2}"
+    DESTDIR="$srcdir/stage" cmake --install "$srcdir/build-$name"
+    _stage_pc
+}
+_validate_elf() {
+    local file linkage
+    while IFS= read -r -d '' file; do
+        [[ $(head -c4 "$file") == $'\x7fELF' ]] || continue
+        patchelf --remove-rpath "$file"
+        readelf -h "$file" | grep -q 'Machine:.*AArch64' || return 1
+        linkage=$(env -u LD_PRELOAD LD_LIBRARY_PATH="$pkgdir/usr/lib:$srcdir/stage/usr/lib" ldd "$file") || return 1
+        [[ $linkage != *'not found'* ]] || { printf '%s\n' "$linkage" >&2; return 1; }
+        if readelf -d "$file" | grep -Eq '(RPATH|RUNPATH)'; then
+            printf 'Unexpected RPATH: %s\n' "$file" >&2; return 1
+        fi
+    done < <(find "$pkgdir/usr" -type f -print0)
+}
+prepare() {
+    mkdir -p "$srcdir/trees/"{hyprland,aquamarine,hyprgrass,wf-touch}
+    tar -xf "$srcdir/hyprland-0.56.2.tar.gz" -C "$srcdir/trees/hyprland" --strip-components=1
+    tar -xf "$srcdir/aquamarine-0.15.1.tar.gz" -C "$srcdir/trees/aquamarine" --strip-components=1
+    tar -xf "$srcdir/hyprgrass-0e8e3c09.tar.gz" -C "$srcdir/trees/hyprgrass" --strip-components=1
+    tar -xf "$srcdir/wf-touch-8974eb0.tar.gz" -C "$srcdir/trees/wf-touch" --strip-components=1
+    cp -aL "$srcdir/anland-inputs/backend/aquamarine/." "$srcdir/trees/aquamarine/"
+    mkdir -p "$srcdir/trees/aquamarine/src/backend/anland/public"
+    cp -aL "$srcdir/anland-inputs/"{common,libdisplay_producer} "$srcdir/trees/aquamarine/src/backend/anland/public/"
+    cp -aL "$srcdir/anland-inputs/backend/hyprland/." "$srcdir/trees/hyprland/"
+    for name in aquamarine hyprland hyprgrass; do
+        patch --batch --fuzz=0 -Np1 -d "$srcdir/trees/$name" -i "$srcdir/anland-inputs/patches/$name.patch"
+    done
+    rm -rf "$srcdir/trees/hyprgrass/subprojects/wf-touch"
+    mv "$srcdir/trees/wf-touch" "$srcdir/trees/hyprgrass/subprojects/wf-touch"
+}
+build() {
+    mkdir -p "$srcdir/stage"
+    _stage_env
+    export CFLAGS="$CFLAGS -ffile-prefix-map=$srcdir=/usr/src/hyprland-anland"
+    export CXXFLAGS="$CXXFLAGS -ffile-prefix-map=$srcdir=/usr/src/hyprland-anland"
+    export GIT_COMMIT_HASH=$_commit GIT_TAG=v0.56.2
+    _cmake aquamarine -DCMAKE_INSTALL_INCLUDEDIR=include/aquamarine-anland
+    _cmake hyprland -DNO_HYPRPM=OFF -DNO_UWSM=OFF -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+    meson setup --reconfigure "$srcdir/build-hyprgrass" "$srcdir/trees/hyprgrass" --prefix="$_prefix" \
+        --libdir=lib/hyprland/plugins --buildtype=release --wrap-mode=nodownload -Dtests=auto
+    meson compile -C "$srcdir/build-hyprgrass" -j "${JOBS:-2}"
+}
+check() {
+    meson test -C "$srcdir/build-hyprgrass" --print-errorlogs --num-processes "${JOBS:-2}"
+}
+package_hyprland-anland() {
+    depends=("${_hyprland_depends[@]}" "${_anland_depends[@]}")
+    provides=("hyprland=$pkgver" wayland-compositor 'aquamarine-anland=0.15.1' libaquamarine-anland.so)
+    conflicts=(hyprland hyprland-git)
+    for name in aquamarine hyprland; do
+        DESTDIR="$pkgdir" cmake --install "$srcdir/build-$name"
+    done
+    # Same hyprland/hyprpm split and full SDK as the Arch Linux ARM recipe.
+    rm -f "$pkgdir/usr/include/hyprland/src/version.h.in"
+    find "$pkgdir" -name '*hyprpm*' -delete
+    DESTDIR="$pkgdir" meson install -C "$srcdir/build-hyprgrass" --no-rebuild
+    rm -f "$pkgdir/usr/lib/hyprland/plugins/libwftouch.a"
+    install -Dm755 "$srcdir/anland-inputs/startup.sh" "$pkgdir/usr/bin/hyprland-anland"
+    ln -s hyprctl "$pkgdir/usr/bin/hyprctl-anland"
+    install -d "$pkgdir/usr/share/hypr"
+    printf 'version=%s\nrevision=%s\n' "$pkgver" "$_commit" > "$pkgdir/usr/share/hypr/hyprland-anland-sdk"
+    install -Dm644 "$srcdir/trees/hyprland/LICENSE" "$pkgdir/usr/share/licenses/hyprland/LICENSE"
+    install -Dm644 "$srcdir/anland-inputs/LICENSE" "$pkgdir/usr/share/licenses/hyprland/anland-LICENSE"
+    install -Dm644 "$srcdir/trees/aquamarine/LICENSE" "$pkgdir/usr/share/licenses/aquamarine-anland/LICENSE"
+    install -Dm644 "$srcdir/trees/hyprgrass/LICENSE" "$pkgdir/usr/share/licenses/hyprgrass/LICENSE"
+    install -Dm644 "$srcdir/trees/hyprgrass/subprojects/wf-touch/LICENSE" "$pkgdir/usr/share/licenses/wf-touch/LICENSE"
+    install -Dm644 "$srcdir/anland-inputs/dependencies.lock" "$pkgdir/usr/share/doc/$pkgname/dependencies.lock"
+    _validate_elf
+}
+package_hyprpm-anland() {
+    pkgdesc='Hyprland plugin manager using the matching package-managed Anland SDK'
+    depends=(cmake cpio glaze "hyprland-anland=$pkgver-$pkgrel" hyprland-protocols
+        hyprwayland-scanner meson gcc git pkgconf ninja)
+    optdepends=()
+    provides=("hyprpm=$pkgver")
+    conflicts=(hyprpm hyprpm-git)
+    DESTDIR="$pkgdir" cmake --install "$srcdir/build-hyprland"
+    find "$pkgdir" -type f,l -not -name '*hyprpm*' -delete
+    find "$pkgdir" -type d -empty -delete
+    install -Dm644 "$srcdir/trees/hyprland/LICENSE" "$pkgdir/usr/share/licenses/hyprpm/LICENSE"
+    ln -s hyprpm "$pkgdir/usr/bin/hyprpm-anland"
+    _validate_elf
+}

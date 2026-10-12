@@ -88,9 +88,11 @@ static void announce_devices(struct anland_backend *b) {
 static int reconnect(void *data) {
     struct anland_backend *b=data;
     if (b->destroying) return 0;
-    if (b->session_lost || !anland_device_is_connected(b->device))
+    if (!b->session_lost && anland_device_is_connected(b->device)) return 0;
+    /* Retire an old imported session once, not an in-progress handshake:
+     * reconnect preserves partial replies and borrowed fds across EAGAIN. */
+    if (!b->session_lost || b->output.swapchain)
         mango_private_drop_session(b);
-    else return 0;
     if (!anland_device_is_daemon_alive(b->device) &&
         anland_de_backend_reopen(b->de, b->socket_path) != 0) goto retry;
     if (anland_de_backend_reconnect(b->de) != 0) {
@@ -100,7 +102,12 @@ static int reconnect(void *data) {
     anland_device_output_t info;
     if (anland_de_backend_get_output(b->de,&info) != 0) goto unusable;
     b->width=info.width; b->height=info.height; b->format=info.format; b->refresh=info.refresh_mhz;
-    if (!mango_private_import_buffers(b) || !attach_sources(b)) goto unusable;
+    /* Pool arrival need not include the first buffer-ready notification.
+     * Listen before waiting for a real target; keep this session on retries. */
+    if (!b->ready_source && !attach_sources(b)) goto unusable;
+    anland_de_target_t target;
+    if (anland_de_backend_get_writable_target(b->de, &target) != 0) goto retry;
+    if (!mango_private_import_buffers(b)) goto unusable;
     b->session_lost=false;
     anland_audio_set_fd(anland_device_audio_fd(b->device));
     struct wlr_output_state state;

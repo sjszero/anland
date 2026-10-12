@@ -1,0 +1,62 @@
+{
+  "suite": "Arch Linux ARM",
+  "sources": {
+    "hyprland": {
+      "version": "0.56.2",
+      "revision": "efb50993780079460b0cbed1363e2166a2de1d9f",
+      "url": "https://github.com/hyprwm/Hyprland/releases/download/v0.56.2/source-v0.56.2.tar.gz",
+      "sha256": "03ad3f5ef152ff44116ffd56fcf808486211ecabf4f0ba567108ee746ba5cd2e"
+    },
+    "aquamarine": {
+      "version": "0.15.1-1~bpo13+1",
+      "directory": "aquamarine-0.15.1",
+      "url": "https://deb.debian.org/debian/pool/main/a/aquamarine/",
+      "files": {
+        "aquamarine_0.15.1-1~bpo13+1.dsc": "5e839cf48d627ff3a9408b03fb3a892ab9c5e019d885ad7a81aa227d405aadcc",
+        "aquamarine_0.15.1.orig.tar.gz": "5de0842f2ccb8b242baa801f553e8cdc7689ef7b882675d1b671f77928225857",
+        "aquamarine_0.15.1-1~bpo13+1.debian.tar.xz": "46c03da6d68aa81743dbe00f2e506a0df9d77fd8819486b33ded215fd2f5a9f9"
+      }
+    }
+  },
+  "patches": {
+    "hyprland.patch": "03db70a0eaefee4f2a18a5dc3d8b0f5ac0e17710669f50fee0985f0966903c5a",
+    "aquamarine.patch": "7a80db73559a345340facf190048437172c41724abe5cbb7064fc52a32e8f66a",
+    "hyprgrass.patch": "78e8aac8a504caa1b4c79688722e08fa2b47ddfeb53d437d961866b6718bd92b"
+  },
+  "plugins": {
+    "hyprgrass": {
+      "revision": "0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "url": "https://codeload.github.com/horriblename/hyprgrass/tar.gz/0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "archive": "hyprgrass-0e8e3c09b805e5f8f7cedde7546e58c504682c31.tar.gz",
+      "sha256": "4ea3018cab0e6a4d3b6d265af52c58df7de98733eec2d2921785bf9500863bc3"
+    },
+    "wf-touch": {
+      "revision": "8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "url": "https://codeload.github.com/WayfireWM/wf-touch/tar.gz/8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "archive": "wf-touch-8974eb0f6a65464b63dd03b842795cb441fb6403.tar.gz",
+      "sha256": "09061c8a4d3d964e8dcfd1a7b97f7dc43d0fc30743b0993585439c6923ce422f"
+    },
+    "hyprland_revision": "efb50993780079460b0cbed1363e2166a2de1d9f"
+  },
+  "xwayland": {
+    "version": "24.1.13",
+    "recipe_sha256": "09904271c7682cd1c8fb50bba86059dc2cf2648175a274f35dc65edb83a48118",
+    "patch_sha256": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+  },
+  "public_linkage": "built-in-once-in-renamed-aquamarine-anland",
+  "lua": "5.5 (Arch lua)",
+  "hyprutils": "system >=0.14 / SONAME 13",
+  "arch_package_baseline": {
+    "repository": "extra",
+    "architecture": "aarch64",
+    "hyprland_version": "0.56.2-4",
+    "hyprland_package_sha256": "4183f5212200625c278eefbbf70c912f1e8803df7ed99a8a2988beb4f4c74e04",
+    "hyprpm_package_sha256": "47f7e91bac720ce3eedc80b6fb1ac7e89d6afed59018eb37151bd440f2e9e15b",
+    "source_recipe_reference": "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/extra/hyprland/PKGBUILD",
+    "package_prefix": "/usr",
+    "sdk_pkgconfig": "/usr/share/pkgconfig/hyprland.pc",
+    "patched_aquamarine_pkgconfig": "/usr/lib/pkgconfig/aquamarine-anland.pc",
+    "patched_aquamarine_soname": "libaquamarine-anland.so.14",
+    "hyprpm_headers": "matching package-owned SDK; no unpatched upstream header checkout"
+  }
+}
