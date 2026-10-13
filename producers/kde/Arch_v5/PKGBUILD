@@ -1,8 +1,8 @@
 # Maintainer: anland contributors
-# KWin 6.7.4 rebuilt with the native anland output/input backend.
+# KWin 6.7.5 rebuilt with the native anland output/input backend.
 
 pkgname=kwin
-pkgver=6.7.4
+pkgver=6.7.5
 pkgrel=1.1
 pkgdesc='An easy to use, but flexible, Wayland compositor (anland backend)'
 arch=('aarch64')
@@ -33,7 +33,7 @@ source=(
 )
 noextract=('anland-overlay.tar')
 sha256sums=(
-  'db7a7dba71aaca1e5218733b80f90a998d84e2ab36e4d62d0e3ea00376c5802d'
+  '6baa910b732d93c48c90f9c1cc685cc93d0b8de0cdf138c24192c045bc3a48e2'
   'SKIP'
   'SKIP'
 )

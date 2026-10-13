@@ -9,7 +9,7 @@ diff --git a/src/backends/CMakeLists.txt b/src/backends/CMakeLists.txt
 diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
 --- a/src/inputmethod.cpp	2026-07-14 18:56:10.000000000 +0800
 +++ b/src/inputmethod.cpp	2026-07-21 18:11:01.669831501 +0800
-@@ -502,6 +502,16 @@
+@@ -503,6 +503,16 @@
      }
  }
  

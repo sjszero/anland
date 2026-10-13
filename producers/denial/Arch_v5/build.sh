@@ -2,7 +2,7 @@
 # Arch Linux ARM: one entry builds/reuses Flutter, then Denial and desktop packages.
 # Usage: [ANLAND_WITH_DEPS=1] [ANLAND_ENGINE_MODE=auto|build|prepared] bash build.sh [--noconfirm]
 # Cache: WORKDIR / DENIAL_CACHE; packages: ARTIFACTS_DIR (default $WORKDIR/packages).
-# auto verifies prepared inputs or builds missing ones; build selects Vulkan/no-LTO/no-GTK.
+# auto verifies prepared inputs or builds missing ones; build selects Impeller+Ganesh/Vulkan/no-LTO/no-GTK.
 # prepared never compiles an engine; ANLAND_OFFLINE=1 requires synchronized source/dependency caches.
 # ANLAND_WITH_DE=0 omits desktop; JOBS=2 limits builds; ANLAND_INSTALL=1 explicitly installs packages.
 # Signed packages, packages.list and manifest.env are emitted; no desktop is started/restarted.
@@ -37,7 +37,7 @@ case $ANLAND_ENGINE_MODE in auto|build|prepared) ;; *) die 'ANLAND_ENGINE_MODE m
 LOCKED_ENGINE_SHA256=$ENGINE_SHA256
 LOCKED_ENGINE_ICU_SHA256=$ENGINE_ICU_SHA256
 LOCKED_ENGINE_VERSION=$ENGINE_VERSION
-ENGINE_POLICY='release-arm64-slimpeller-vulkan-nolto-no-gtk-v1'
+ENGINE_POLICY='release-arm64-impeller-ganesh-vulkan-nolto-no-gtk-v2'
 for flag in ANLAND_WITH_DE ANLAND_WITH_DEPS ANLAND_OFFLINE ANLAND_INSTALL; do
     [[ ${!flag} == 0 || ${!flag} == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -423,7 +423,7 @@ use_engine_receipt() {
     ENGINE_VERSION=$(jq -er .package_version "$ENGINE/.anland-engine.json") || die 'missing engine package identity'
     ENGINE_SHA256=$(jq -er .engine_sha256 "$ENGINE/.anland-engine.json") || die 'missing engine hash'
     ENGINE_ICU_SHA256=$(jq -er .icu_sha256 "$ENGINE/.anland-engine.json") || die 'missing engine ICU hash'
-    DENIAL_ENGINE_POLICY='Slimpeller GLES/Vulkan, no-LTO, no-GTK'
+    DENIAL_ENGINE_POLICY='Impeller + Ganesh GLES/Vulkan, no-LTO, no-GTK'
 }
 verify_engine_symbols() {
     local exports symbol
@@ -443,13 +443,16 @@ build_flutter_engine() {
     local checkout_depot="$FLUTTER/engine/src/flutter/third_party/depot_tools"
     local engine_build="$WORKDIR/engine/build" target=${ENGINE##*/} policy expected actual
     identity=$(engine_policy_id) || die 'cannot identify engine policy'
-    [[ $ENGINE == "$engine_build/out/$target" && $target == denial_host_release_arm64_anland ]] ||
-        die 'compilation uses WORKDIR/engine/build/out/denial_host_release_arm64_anland; prepared overrides are read-only'
+    [[ $ENGINE == "$engine_build/out/$target" && $target == denial_host_release_arm64_anland_ganesh ]] ||
+        die 'compilation uses WORKDIR/engine/build/out/denial_host_release_arm64_anland_ganesh; prepared overrides are read-only'
     if [[ -f $ENGINE/libflutter_engine.so ]]; then
         [[ -f $ENGINE/.anland-engine-policy && $(cat "$ENGINE/.anland-engine-policy") == "$identity" ]] ||
             die 'unrecognized engine output preserved; use a separate WORKDIR rather than overwrite it'
     fi
-    log 'Build locked Flutter release engine and AOT tools (Vulkan/no-LTO/no-GTK)'
+    log 'Build locked Flutter release engine and AOT tools (Impeller+Ganesh/Vulkan/no-LTO/no-GTK)'
+    # This pinned Flutter embedder still compiles the Ganesh Vulkan path. Slimpeller
+    # removes ContextType/context options and Ganesh symbols, so keep Ganesh enabled
+    # rather than disabling Vulkan or rewriting the locked upstream checkout.
     # Keep this a simple command: an OR-list would disable errexit in its isolated subshell.
     prepare_engine_sources
     rc=$?
@@ -458,12 +461,13 @@ build_flutter_engine() {
     printf '%s\n' "$identity" > "$ENGINE/.anland-engine-policy" || die 'cannot write engine preparation identity'
     in_dir "$generated_source" env PATH="$checkout_depot/.cipd_bin:$checkout_depot:$PATH" \
         DEPOT_TOOLS_UPDATE=0 VPYTHON_VIRTUALENV_ROOT="$WORKDIR/engine/vpython" \
-        ./flutter/tools/gn --linux --linux-cpu=arm64 --runtime-mode=release --slimpeller --enable-fontconfig \
+        ./flutter/tools/gn --linux --linux-cpu=arm64 --runtime-mode=release --enable-fontconfig \
         --no-lto --disable-desktop-embeddings --gn-args=shell_enable_vulkan=true \
         --gn-args=test_enable_vulkan=false --gn-args=skia_use_vulkan=true \
+        --gn-args=slimpeller=false --gn-args=skia_enable_ganesh=true --gn-args=skia_enable_graphite=false \
         --out-dir="$engine_build" --target-dir="$target"
     for policy in enable_lto:false enable_desktop_embeddings:false shell_enable_vulkan:true skia_use_vulkan:true \
-                  test_enable_vulkan:false slimpeller:true host_cpu:arm64; do
+                  test_enable_vulkan:false slimpeller:false skia_enable_ganesh:true skia_enable_graphite:false host_cpu:arm64; do
         expected=${policy#*:}
         actual=$(awk -v key="${policy%%:*}" '$1 == key && $2 == "=" {value=$3} END {gsub(/"/, "", value); print value}' "$ENGINE/args.gn") ||
             die 'cannot read generated engine configuration'
@@ -482,8 +486,8 @@ build_flutter_engine() {
     check_elf "$ENGINE/libflutter_engine.so"
     ENGINE_SHA256=$(sha256sum "$ENGINE/libflutter_engine.so" | awk '{print $1}') || die 'cannot hash engine'
     ENGINE_ICU_SHA256=$(sha256sum "$ENGINE/icudtl.dat" | awk '{print $1}') || die 'cannot hash engine ICU'
-    ENGINE_VERSION="$FLUTTER_VERSION.r1.g${FLUTTER_REV:0:12}.vknolto.h${ENGINE_SHA256:0:12}-1"
-    DENIAL_ENGINE_POLICY='Slimpeller GLES/Vulkan, no-LTO, no-GTK'
+    ENGINE_VERSION="$FLUTTER_VERSION.r1.g${FLUTTER_REV:0:12}.vknolto.ganesh.h${ENGINE_SHA256:0:12}-1"
+    DENIAL_ENGINE_POLICY='Impeller + Ganesh GLES/Vulkan, no-LTO, no-GTK'
     # New policy uses a new package identity, never the locked legacy hash/version.
     in_dir "$ENGINE" sha256sum libflutter_engine.so icudtl.dat args.gn dart-sdk/bin/dart gen_snapshot font-subset impellerc \
         gen/dart-pkg/sky_engine/pubspec.yaml flutter_patched_sdk/platform_strong.dill gen/const_finder.dart.snapshot \
@@ -496,7 +500,7 @@ build_flutter_engine() {
 }
 prepare_engine() {
     local lock="$SOURCE/prebuilt/flutter-engine/SOURCE_LOCK.json"
-    local generated="$WORKDIR/engine/build/out/denial_host_release_arm64_anland"
+    local generated="$WORKDIR/engine/build/out/denial_host_release_arm64_anland_ganesh"
     jq -e --arg flutter "$FLUTTER_REV" --arg repository "$FLUTTER_URL" \
         '.schema_version == 1 and .flutter.revision == $flutter and .flutter.repository == $repository
          and (.skia.revision | test("^[0-9a-f]{40}$"))
@@ -535,12 +539,147 @@ prepare_engine() {
     # package_all records the selected engine identity in cached inputs only.
 }
 
+prepare_flutter_tools() {
+    local adapter_identity
+    adapter_identity=$(declare -f prepare_flutter_tools | sha256sum | awk '{print $1}') || die 'cannot identify Flutter tool adapter'
+    run python3 - --flutter-root "$FLUTTER" \
+        --flutter-revision "$FLUTTER_REV" --plugin-kit-script "$SOURCE/tools/prepare-denial-plugin-kit" \
+        --output "$FLUTTER_EMBEDDER" --adapter-identity "$adapter_identity" <<'PY'
+"""Prepare managed Flutter tool inputs for Denial's non-GTK Linux embedder.
+
+Keep the locked checkout untouched. Only omit desktop runner unpacking: Linux
+AOT, asset/shader/font processing and native asset hooks remain upstream targets.
+The plugin build kit vendors the same adapted tool sources.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+from urllib.parse import urljoin
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def replace_once(text, old, new, label):
+    if text.count(old) != 1:
+        raise SystemExit(f'unsupported locked {label}; expected exactly one adapter point')
+    return text.replace(old, new, 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--flutter-root', type=Path, required=True)
+    parser.add_argument('--flutter-revision', required=True)
+    parser.add_argument('--plugin-kit-script', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--adapter-identity', required=True)
+    args = parser.parse_args()
+    flutter = args.flutter_root.absolute()
+    output = args.output.absolute()
+    if (output.is_symlink() or output.resolve().is_relative_to(flutter.resolve()) or
+            flutter.resolve().is_relative_to(output.resolve())):
+        parser.error('output must be separate from the Flutter checkout')
+    tool = flutter / 'packages/flutter_tools'
+    config_path = tool / '.dart_tool/package_config.json'
+    config_bytes = config_path.read_bytes()
+    linux_source = (tool / 'lib/src/build_system/targets/linux.dart').read_text()
+    linux = replace_once(
+        linux_source, '    UnpackLinux(targetPlatform),',
+        '    // Denial supplies its own embedder; do not unpack the GTK runner.',
+        'Linux bundle dependency graph')
+    kit_source = args.plugin_kit_script.read_text()
+    kit = replace_once(
+        kit_source,
+        "'flutter_patched_sdk', 'flutter_linux', 'libflutter_linux_gtk.so',",
+        "'flutter_patched_sdk',", 'plugin kit engine artifact list')
+    config = json.loads(config_bytes)
+    for package in config['packages']:
+        package['rootUri'] = ('../' if package['name'] == 'flutter_tools' else
+                              urljoin(config_path.as_uri(), package['rootUri']))
+    config.pop('flutterRoot', None)
+    config.pop('pubCache', None)
+    config_text = json.dumps(config, indent=2) + '\n'
+    marker = {
+        'schema': 1, 'policy': 'linux-embedder-assets-no-gtk-v1',
+        'flutter_root': str(flutter), 'flutter_revision': args.flutter_revision,
+        'helper_sha256': args.adapter_identity,
+        'source_linux_sha256': digest(linux_source.encode()),
+        'source_config_sha256': digest(config_bytes),
+        'source_kit_sha256': digest(kit_source.encode()),
+    }
+    generated = {
+        'packages/flutter_tools/lib/src/build_system/targets/linux.dart': linux,
+        'packages/flutter_tools/.dart_tool/package_config.json': config_text,
+        'prepare-denial-plugin-kit': kit,
+    }
+    tool_paths = ['bin', 'lib', 'templates', 'static', 'pubspec.yaml', 'pubspec.lock', 'LICENSE']
+    copied = {}
+    for name in tool_paths:
+        source = tool / name
+        files = sorted(source.rglob('*')) if source.is_dir() else [source]
+        for file in files:
+            if file.is_file():
+                copied['packages/flutter_tools/' + file.relative_to(tool).as_posix()] = digest(file.read_bytes())
+    # Detect missing or modified copied files too, not just the two adapter points.
+    marker['generated_sha256'] = {
+        **copied, **{name: digest(text.encode()) for name, text in generated.items()},
+    }
+    receipt = output / '.anland-embedder-tools.json'
+    if output.exists():
+        if not receipt.is_file():
+            parser.error(f'unmanaged output preserved: {output}')
+        previous = json.loads(receipt.read_text())
+        if previous.get('schema') != 1 or previous.get('policy') != marker['policy']:
+            parser.error(f'unrecognized managed output preserved: {output}')
+        if previous == marker and all(
+                (output / name).is_file() and
+                digest((output / name).read_bytes()) == expected
+                for name, expected in marker['generated_sha256'].items()):
+            print(f'Reuse verified non-GTK Flutter tool adapter: {output}')
+            return
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    for source in flutter.iterdir():
+        if source.name != 'packages':
+            (output / source.name).symlink_to(source, target_is_directory=source.is_dir())
+    packages = output / 'packages'
+    packages.mkdir()
+    for source in (flutter / 'packages').iterdir():
+        if source.name != 'flutter_tools':
+            (packages / source.name).symlink_to(source, target_is_directory=source.is_dir())
+    target_tool = packages / 'flutter_tools'
+    target_tool.mkdir()
+    for name in tool_paths:
+        source = tool / name
+        destination = target_tool / name
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        elif source.is_file():
+            shutil.copy2(source, destination)
+    for name, text in generated.items():
+        destination = output / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text)
+    receipt.write_text(json.dumps(marker, indent=2) + '\n')
+    print(f'Prepared non-GTK Flutter tools and plugin-kit adapter: {output}')
+
+
+if __name__ == '__main__':
+    main()
+PY
+}
+
 prepare_flutter() {
     log 'Configure the verified engine/SDK for Denial AOT'
     checkout "$FLUTTER" "$FLUTTER_URL" "$FLUTTER_REV"
     check_sha "$ENGINE_SHA256" "$ENGINE/libflutter_engine.so"
     check_sha "$ENGINE_ICU_SHA256" "$ENGINE/icudtl.dat"
     local file cache="$FLUTTER/bin/cache" tool="$FLUTTER/packages/flutter_tools" engine_revision
+    local adapter_identity
+    FLUTTER_EMBEDDER="$WORKDIR/engine/flutter-embedder-sdk"
     local tool_identity="$FLUTTER_REV:$ENGINE_SHA256:$ENGINE_ICU_SHA256:${ENGINE##*/}"
     for file in dart-sdk/bin/dart gen_snapshot font-subset impellerc; do
         [[ -x $ENGINE/$file ]] || die "prepared engine tool missing: $ENGINE/$file"
@@ -559,16 +698,24 @@ prepare_flutter() {
     local_engine=("--local-engine-src-path=$(dirname -- "$(dirname -- "$ENGINE")")"
                   "--local-engine=${ENGINE##*/}" "--local-engine-host=${ENGINE##*/}")
     flutter=("$ENGINE/dart-sdk/bin/dart" "$cache/flutter_tools.snapshot" "${local_engine[@]}" --no-version-check --suppress-analytics)
-    if [[ ! -f $cache/flutter_tools.snapshot || ! -f $cache/flutter_tools.stamp || ! -f $cache/.anland-flutter-tools.identity ]] ||
-       [[ $(cat "$cache/flutter_tools.stamp") != "$FLUTTER_REV:" ]] ||
-       [[ $(cat "$cache/.anland-flutter-tools.identity") != "$tool_identity" ]]; then
+    if [[ ! -s $tool/.dart_tool/package_config.json || ! -f $cache/flutter_tools.stamp ]] ||
+       [[ $(cat "$cache/flutter_tools.stamp") != "$FLUTTER_REV:" ]]; then
         local locked=()
         [[ ! -f $tool/pubspec.lock ]] || locked=(--enforce-lockfile)
         in_dir "$tool" "$ENGINE/dart-sdk/bin/dart" pub get "${network[@]}" "${locked[@]}"
+    fi
+    # Validate every adapted/copied tool input even when an old snapshot exists.
+    # Linux bundle assets need AOT + hooks, not the optional GTK desktop runner.
+    prepare_flutter_tools
+    adapter_identity=$(sha256sum "$FLUTTER_EMBEDDER/.anland-embedder-tools.json" | awk '{print $1}') || die 'cannot identify prepared Flutter tool inputs'
+    tool_identity+=":$adapter_identity"
+    if [[ ! -f $cache/flutter_tools.snapshot || ! -f $cache/flutter_tools.stamp || ! -f $cache/.anland-flutter-tools.identity ]] ||
+       [[ $(cat "$cache/flutter_tools.stamp") != "$FLUTTER_REV:" ]] ||
+       [[ $(cat "$cache/.anland-flutter-tools.identity") != "$tool_identity" ]]; then
         in_dir "$FLUTTER" "$ENGINE/dart-sdk/bin/dart" --verbosity=error \
             "--snapshot=$cache/flutter_tools.snapshot" --snapshot-kind=app-jit \
-            "--packages=$tool/.dart_tool/package_config.json" --no-enable-mirrors \
-            "$tool/bin/flutter_tools.dart" "${local_engine[@]}" --no-version-check --suppress-analytics --help
+            "--packages=$FLUTTER_EMBEDDER/packages/flutter_tools/.dart_tool/package_config.json" --no-enable-mirrors \
+            "$FLUTTER_EMBEDDER/packages/flutter_tools/bin/flutter_tools.dart" "${local_engine[@]}" --no-version-check --suppress-analytics --help
         printf '%s:\n' "$FLUTTER_REV" > "$cache/flutter_tools.stamp" || die 'cannot write Flutter stamp'
         printf '%s\n' "$tool_identity" > "$cache/.anland-flutter-tools.identity" || die 'cannot record Flutter tool inputs'
     fi
@@ -646,8 +793,9 @@ build_desktop() {
     for name in LICENSE.flutter LICENSE.third_party; do
         run install -m644 "$SOURCE/prebuilt/flutter-engine/linux-x64-release/$name" "$release/$name"
     done
-    run python3 "$SOURCE/tools/prepare-denial-plugin-kit" --source-root "$input" --source-revision "$DENIAL_REV" \
-        --flutter-root "$FLUTTER" --flutter-revision "$FLUTTER_REV" --engine-root "$(dirname -- "$(dirname -- "$ENGINE")")" \
+    # The relocatable plugin tool must use the same no-GTK asset target.
+    run python3 "$FLUTTER_EMBEDDER/prepare-denial-plugin-kit" --source-root "$input" --source-revision "$DENIAL_REV" \
+        --flutter-root "$FLUTTER_EMBEDDER" --flutter-revision "$FLUTTER_REV" --engine-root "$(dirname -- "$(dirname -- "$ENGINE")")" \
         --engine-source-root "$FLUTTER/engine" --engine-target "${ENGINE##*/}" --platform linux-arm64 --output "$BUILD/plugin-build-kit"
 }
 prepare_signing() {

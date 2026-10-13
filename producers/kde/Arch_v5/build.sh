@@ -3,7 +3,7 @@
 # Build the Arch Linux ARM anland KWin and Xwayland ports as pacman packages.
 #
 # Usage:
-#   ./build.sh [6.7.4] [additional makepkg options]
+#   ./build.sh [6.7.5] [additional makepkg options]
 #
 # KWIN_TARBALL and XWAYLAND_TARBALL may point at locally cached source archives.
 # Repository-level tarballs are used when available before makepkg downloads the
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION='6.7.4'
+VERSION='6.7.5'
 XWAYLAND_VERSION='24.1.13'
 if [[ "$#" -gt 0 && ( "$1" == '-h' || "$1" == '--help' ) ]]; then
     sed -n '4,9p' "$0"
@@ -37,7 +37,7 @@ for arg in "$@"; do
 done
 [[ "${JOBS:-$(nproc)}" =~ ^[1-9][0-9]*$ ]] || die 'JOBS must be a positive integer'
 
-[[ "$VERSION" == '6.7.4' ]] || die "this Arch port is tied to KWin 6.7.4 (got $VERSION)"
+[[ "$VERSION" == '6.7.5' ]] || die "this Arch port is tied to KWin 6.7.5 (got $VERSION)"
 [[ "$(id -u)" -ne 0 ]] || die 'makepkg must run as an unprivileged user'
 command -v makepkg >/dev/null 2>&1 || die 'makepkg is required (install base-devel)'
 [[ "$(uname -m)" == 'aarch64' ]] || die 'this package must be built natively on Arch Linux ARM (aarch64)'
