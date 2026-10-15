@@ -169,6 +169,10 @@ void anland_device_close(anland_device *dev);
 
 /* True once a consumer session is up (not in fallback). */
 bool anland_device_is_connected(const anland_device *dev);
+/* Poll target-ready and peer hangups together without consuming any bytes.
+ * 1 ready / 0 pending / -1 lost (fallback callback run); timeout is per-call.
+ * Detects closure before the first target as well as during normal ACK waits. */
+int anland_device_poll_buffer_ready(anland_device *dev, int timeout_ms);
 
 /* One attempt to leave fallback (pickup fds + receive dmabufs). Returns 0
  * when connected, -1 when the consumer is not (yet) available — safe to
@@ -293,6 +297,13 @@ bool anland_device_notify_frame_done(anland_device *dev);
 /* Poll one input event. Returns 1 = event, 0 = none, -1 = consumer lost. */
 int anland_device_poll_input(anland_device *dev, anland_device_input_t *ev,
                              int timeout_ms);
+
+/* True if poll_input() has consumed part of an event header but has not yet
+ * returned the event. False for idle reads, completed headers and fallback;
+ * callers track any announced payload/fds separately. Use this to retain the
+ * input target captured before the first read across partial header reads.
+ * Read-only; serialize with input reads and session changes. */
+bool anland_device_input_header_pending(const anland_device *dev);
 
 /* Read a variable-length payload (clipboard / text input) announced by the
  * previous poll_input() event. Returns 1 / 0 / -1. */

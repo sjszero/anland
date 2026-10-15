@@ -366,8 +366,14 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
 static void on_stream_readable(void *data, int fd, uint32_t mask)
 {
     struct cam *cam = data;
-    if (mask & (SPA_IO_ERR | SPA_IO_HUP))
+    if (fd != cam->stream_fd)
         return;
+    if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+        /* Like the audio reader, detach on the loop thread and return without
+         * touching the destroyed I/O source again. Keep the virtual node alive. */
+        detach_fd(cam);
+        return;
+    }
     if (!(mask & SPA_IO_IN))
         return;
 
@@ -382,8 +388,14 @@ static void on_stream_readable(void *data, int fd, uint32_t mask)
         struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
                               .msg_control = cmsg.buf, .msg_controllen = sizeof(cmsg.buf) };
         ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
-        if (n <= 0)
-            break;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return;
+            detach_fd(cam);
+            return;
+        }
         bool bad = msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC);
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
             if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
@@ -395,6 +407,14 @@ static void on_stream_readable(void *data, int fd, uint32_t mask)
                 if (rfd < 0) rfd = received;
                 else { close(received); bad = true; }
             }
+        }
+        if (n == 0) {
+            /* A zero-length SEQPACKET can still carry descriptors. Retire them
+             * before treating the closed/empty stream as disconnected. */
+            if (rfd >= 0)
+                close(rfd);
+            detach_fd(cam);
+            return;
         }
         if (!bad && n == (ssize_t)sizeof(m))
             handle_stream_msg(cam, &m, rfd);
@@ -409,14 +429,16 @@ static void attach_fd(struct cam *cam, int fd)
 {
     struct pw_loop *loop = pw_thread_loop_get_loop(cam->owner->loop);
     if (cam->io) {
-        pw_loop_destroy_source(loop, cam->io);
+        struct spa_source *io = cam->io;
         cam->io = NULL;
+        pw_loop_destroy_source(loop, io);
     }
     if (cam->stream_fd >= 0)
         close(cam->stream_fd);
     cam->stream_fd = fd;
     unmap_shm(cam);                   /* re-requested on the new connection */
     cam->have_frame = false;          /* show blank until a fresh frame arrives */
+    cam->frame_size = 0;
     if (fd >= 0)
         cam->io = pw_loop_add_io(loop, fd, SPA_IO_IN, false, on_stream_readable, cam);
     update_recording(cam);            /* START + GET_SHM if an app is consuming */

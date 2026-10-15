@@ -12,24 +12,21 @@ Linux 合成器仍负责窗口管理、完整桌面合成、原生 seat 和会�
 
 本文描述当前 v5 源码树，包含 Denial。目录存在只表示适配配方已纳入仓库，**不表示所有发行版、GPU 和功能均已通过编译或图形验证**。公共头文件、源码锁定清单和脚本实际行为优先于示例及历史文档。
 
+## 从这里开始
+
+一套可用环境需要 Android daemon 与 consumer、**一个** Linux 合成器／producer，以及能够导入共享缓冲区的 GPU 驱动栈。无需构建仓库中的所有合成器。
+
+| 目标 | 下一步 |
+|---|---|
+| 安装并使用 Android 上的 Linux 桌面 | 阅读[使用指南](doc/UserManual/anland_guide_zh.md)和 [Android 设置说明](doc/UserManual/anland_settings_guide_zh.md) |
+| 构建指定 Linux 桌面 | 选择匹配的[合成器／发行版入口](#section-3)，核对[构建边界](#section-6)，再阅读[启动与验证](#section-8) |
+| 开发或诊断后端 | 先读[帧生命周期契约](#section-4)，按需查阅 [API 索引](#section-13)和[排障表](#section-15) |
+
 ## 目录
 
-- [1. 仓库索引](#section-1)
-- [2. 架构与所有权](#section-2)
-- [3. 合成器与发行版入口](#section-3)
-- [4. 公共 API 与帧生命周期](#section-4)
-- [5. 传输、输入与媒体](#section-5)
-- [6. 构建与打包](#section-6)
-- [7. 新合成器适配流程](#section-7)
-- [8. 启动与验证](#section-8)
-- [9. 线上协议参考](#section-9)
-- [10. 变长负载、队列与服务资源](#section-10)
-- [11. 握手与恢复状态机](#section-11)
-- [12. 逐帧传输与 scene 反馈](#section-12)
-- [13. API 索引与返回契约](#section-13)
-- [14. 音频引擎细节](#section-14)
-- [15. 迁移、复现与诊断](#section-15)
-- [16. 历史与许可](#section-16)
+- 概览与使用：[仓库索引](#section-1) · [架构](#section-2) · [合成器入口](#section-3) · [构建打包](#section-6) · [启动验证](#section-8)
+- 后端开发：[帧契约](#section-4) · [输入与媒体](#section-5) · [适配流程](#section-7) · [迁移与诊断](#section-15)
+- 详细参考：[线上协议](#section-9) · [负载与资源](#section-10) · [恢复状态机](#section-11) · [帧反馈](#section-12) · [API](#section-13) · [音频](#section-14) · [历史与许可](#section-16)
 
 <a id="section-1"></a>
 
@@ -81,10 +78,10 @@ Linux 合成器：原生窗口、renderer、frame clock、seat 与桌面
 | [Gamescope](producers/gamescope/) | `anland_backend/`（C session wrapper、C++/Vulkan） | `SteamOS_v5` |
 | [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/`（GObject/Cogl/Clutter） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
 | [KDE / KWin](producers/kde/) | `anland_backend/`（Qt output/EGL/input） | `Arch_v5`、`Debian13_v5`、`Fedora43_v5`、`SteamOS_v5`、`ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5` |
-| [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Arch_v5`, `Debian13_v5` |
-| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5` |
-| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5` |
+| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5`、`Ubuntu2604_v5` |
+| [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
+| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5`、`Ubuntu2604_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) 是额外的 Xwayland 配方，不是独立 WM 后端。仅构建 Mutter/KWin 不等于交付完整 GNOME/Plasma，会话仍需 shell、portal、agent 和运行数据。Niri 的 X11 接入还需核对 xwayland-satellite 及其启动关系。
 
@@ -146,6 +143,12 @@ v1/v2/v3 的历史兼容结论不能证明 v5 互操作。consumer、协议、pr
 
 使用目标发行版入口的 `build.sh` 和原生配方，先确认实际接受的参数：没有通用阶段 CLI 或统一依赖安装开关。优先普通用户编译、仓库外持久缓存、锁定源码和原生包交付。
 
+| 需要的产物 | 构建入口 | 不包含什么 |
+|---|---|---|
+| Android 应用 | `consumers/anland_v5/android_consumer/` 的 Gradle 工程，参见 [Android 工作流](.github/workflows/build.yml) | Linux 合成器安装包 |
+| daemon 与 C 库 | 根目录 `CMakeLists.txt`；Android 与 Linux 的目标及依赖不同 | APK 或全部 WM 适配 |
+| 指定 Linux 合成器及其适配 | 对应 `producers/<wm>/<发行版>/` 配方 | 已安装桌面或 GPU 通过验证的证明 |
+
 **构建、安装、图形启动是不同操作。** 构建入口通常以 `ANLAND_INSTALL=1` 控制最终安装（部分兼容 `INSTALL`），但依赖准备仍可能调用 sudo。运行前必须核对脚本。安装可能替换发行版的 WM／Xwayland 包，不代表可以重启正在运行的桌面或音频服务。
 
 在匹配的 Linux 环境中，从仓库根目录运行示例：
@@ -163,6 +166,12 @@ JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
   bash producers/denial/Arch_v5/build.sh --noconfirm
 ```
 
+### Ubuntu 26.04 ARM64 入口
+
+Denial、Hyprland、Mango、Niri 均提供 `Ubuntu2604_v5/build.sh`。调用：`ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Ubuntu2604_v5/build.sh`；原生 `.deb` 位于该入口的 `artifacts/`，可用 `ARTIFACTS_DIR` 覆盖。这些入口只收集原生安装包，包的 SHA256 输出到构建日志；不把构建清单、签名密钥或校验文件加入交付内容。保留现有后端及补丁源码基线：Hyprland 0.55.2 使用锁定依赖栈，不强套 Ubuntu 较旧的 Hyprland；Mango 私有构建新版图形依赖；Denial 复用内联 no-GTK Flutter 工具并读取锁定 Rust 工具链；Niri 同时打包锁定版 xwayland-satellite。Xwayland 源锁、构建步骤和同一份非 SteamOS 补丁均留在各 WM 内。完整云编译和真实图形验证尚待执行。
+
+产物收集以原生打包结果为准：Arch 读取 `makepkg --packagelist`；`dpkg-buildpackage` 读取本次 `.changes`；直接生成 Debian 包时核对明确路径及包元数据。新鲜度检查避免将缓存旧包当成本次产物。源码锁和内部构建记录留在缓存，云编译日志与可下载的安装包分开保存。
+
 ### 公共库链接
 
 每个产物只选择一份公共实现：通过 pkg-config 动态链接 `display-producer`、内建权威公共源码，或由 Rust 使用窄 C bridge。`producer.cmake` 统一源码与依赖；`presentation.cmake` 提供展示层对象；`display-producer.pc.in` 提供发现元数据。不能既内建又动态链接重复实现。overlay 从唯一公共树生成，打包时解析仓库符号链接，不长期维护传输代码分叉。实际 API 需 compile/link 探测，不能只看版本字符串。
@@ -171,11 +180,11 @@ JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
 
 - **Hyprland / Debian 13：** lockfile 锁定依赖栈与插件 ABI；公共 producer 内建到 Aquamarine。产物位于 `producers/hyprland/Debian13_v5/artifacts/`，默认 `JOBS=4`。`nocheck nodwz` 明确意味着产包成功**不是**测试通过。
 - **Mango / Debian 13：** 私有 prefix 共享 producer、wlroots 与 SceneFX；产物位于 `producers/mango/Debian13_v5/artifacts/`，默认 `JOBS=2`。
-- **Denial / Arch：** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) 锁定 Denial `0.5.0-anland5`、Flutter `3.47.5` revision；Cargo/pub 锁文件负责传递依赖。缓存默认 `$XDG_CACHE_HOME/denial-anland`，未设置时为 `$HOME/.cache/denial-anland`；产物默认 `$WORKDIR/packages`，可由 `ARTIFACTS_DIR` 覆盖。`ANLAND_ENGINE_MODE=auto|build|prepared`、`ANLAND_OFFLINE=1`、`ANLAND_WITH_DE=0` 控制引擎／缓存／桌面行为。产物含 engine、`denial`、可选 `denial-desktop`、修补版 Xwayland、本地签名、`packages.list`、`manifest.env` 和 `SHA256SUMS`。安装前审查并信任本地签名密钥，它不是上游发布密钥。
+- **Denial / Arch：** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) 锁定 Denial `0.5.0-anland5`、Flutter `3.47.5` revision；Cargo/pub 锁文件负责传递依赖。缓存默认 `$XDG_CACHE_HOME/denial-anland`，未设置时为 `$HOME/.cache/denial-anland`；产物默认 `$WORKDIR/packages`，可由 `ARTIFACTS_DIR` 覆盖。`ANLAND_ENGINE_MODE=auto|build|prepared`、`ANLAND_OFFLINE=1`、`ANLAND_WITH_DE=0` 控制引擎／缓存／桌面行为。产物是 engine、`denial`、可选 `denial-desktop` 和修补版 Xwayland 的未签名原生包。脚本仅在构建日志中记录包的 SHA256，不在产物目录生成发布签名、`packages.list`、`manifest.env` 或 `SHA256SUMS`。应随包保存日志；哈希不等于发布签名。
 
 ### Xwayland
 
-Denial Arch 当前复用 KDE Arch 的 Xwayland `24.1.13` 配方／补丁，支持 `XWAYLAND_TARBALL` 本地归档与 `XWAYLAND_PATCH` 覆盖。产物加入 Denial 包清单、签名、校验和可选安装。Debian Hyprland/Mango 使用各自锁定的 Xwayland 源码配方，不可将某发行版补丁强套到任意版本。
+Denial Arch 当前复用 KDE Arch 的 Xwayland `24.1.13` 配方／补丁，支持 `XWAYLAND_TARBALL` 本地归档与 `XWAYLAND_PATCH` 覆盖。该包参与 Denial 产物检查、日志中的 SHA256 记录和可选安装，不生成签名。Debian Hyprland/Mango 使用各自锁定的 Xwayland 源码配方，不可将某发行版补丁强套到任意版本。
 
 kgsl/Turnip 补丁允许 implicit-modifier dma-buf 路径；v3 合成器不等待 v4 feedback；支持 render device fallback（`XWAYLAND_GBM_DEVICE`）。`1274 -> LINEAR` 仅针对已知 freedreno/kgsl 路径，不是猜测任意未知 modifier 的许可。新构建设计应隔离 WM 私有库／工具链变量对 Xwayland 的影响。安装新包不会重启现有 Xwayland 进程。
 
@@ -200,6 +209,7 @@ kgsl/Turnip 补丁允许 implicit-modifier dma-buf 路径；v3 合成器不等�
 
 完整验证记录应区分：
 
+- **静态审查：** 阅读源码、API 契约、补丁与脚本；不代表编译、链接兼容性或运行行为已验证。
 - **契约测试：** 首次 target 与呈现分离；accepted／ACK／released 状态；背压；提交和 fence 失败；旧 generation；FD 所有权；resize／重连及 watcher 复用；有界剪贴板／文本／资源消费。
 - **构建／包检查：** 真实编译和链接退出码、日志明确结论、架构、内容、依赖、符号与 RPATH。与旧产物对比哈希，排除增量构建复用旧对象；仅时间戳不够。
 - **明确授权的图形测试：** 首帧与持续重绘、窗口／光标／特效、输入及声明支持的媒体、consumer／daemon 恢复、旋转／resize、Wayland 与 X11 客户端。
@@ -339,7 +349,7 @@ Unix stream 可能拆分消息头、payload 和附带数据，一次 `recv()` �
 
 ### 10.2 有界剪贴板发送
 
-device facade payload 上限为 **1 MiB**（`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`），异步 output queue 总上限为 **2 MiB**。这些是实现限制，不是协商得到的协议功能。
+device facade payload 上限为 **1 MiB**（`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`），异步 output queue 总上限为 **2 MiB**。输入声明的长度须在**分配内存或窄化整数类型之前**校验，不能只在读取 payload 时检查。超限消息应终止会话，不能把残留正文作为下一条事件解析。这些是实现限制，不是协商得到的协议功能。
 
 ```c
 /* 事件循环模式示意，不是独立合成器。 */
@@ -369,7 +379,7 @@ app 停止／会话丢失 -> 停止录制并释放资源
 
 consumer 库通过 `allocate_services()` 注册 `service_info` 分配／释放回调，通过 `handle_resource_request()` 处理 `OUTPUT_TYPE_RESOURCES_REQUEST`。`service_info.userdata` 识别所属连接，不必使用全局状态。
 
-`anland_camera_start()` 启动引擎；`set_resources()` **接管** control 和 stream FD。第一个是 control socket，随后每个摄像头一个 stream socket。节点是动态的：`clear()` 停止采集、移除节点并关闭接管 FD；`stop()` 同时销毁引擎。当前 camera 头文件描述 I420 帧和按应用需求启动录制。它与持久音频节点不同，仅在 WM 实际接线后可用。
+`anland_camera_start()` 启动引擎；`set_resources()` **接管** control 和 stream FD。第一个是 control socket，随后每个摄像头一个 stream socket。`clear()` 关闭会话资源，但**保留虚拟节点**，在新资源到达前输出空白帧。单路 stream 出现 HUP／EOF 或致命读取错误时，移除该路监听、关闭 FD 与映射并使旧帧失效，不继续回放最后一帧。新资源集合会调整摄像头数量；`stop()` 销毁节点和引擎。录制按应用需求启动，功能仅在 WM 实际接线后可用。
 
 <a id="section-11"></a>
 
@@ -578,10 +588,14 @@ producer 音频引擎在 consumer 丢失后保留 PipeWire stream：脱离时丢
 | daemon 无法连接 | 实际选中 endpoint、挂载／权限、daemon log／control 状态 | 依据另一适配的默认 socket 猜测 |
 | daemon 正常但无输出 | consumer 到达、screen-info 阶段、五 FD pickup、metadata 数量与 target-ready | 伪造 mode 或忙循环 pickup |
 | 首帧正常后冻结 | commit ID 完成、pending/release 状态、pump/dispatch、target 答复 | 每个 eventfd 信号都报告为呈现 |
+| vkmark 等客户端 GPU 占用偏低 | 实际 FPS、输出刷新率、客户端 present mode、帧调度、consumer ACK 与 buffer 释放等待 | 移除 fence／背压，或仅凭占用低就认定渲染慢 |
 | 黑屏／损坏图像 | 格式域、modifier/stride/offset、导入能力与 acquire fence | 猜未知 fourcc/modifier 或静默退化 CPU readback |
 | 重连失败 | control alive 与无 consumer 的区别、watcher 更新、新 generation/import | 复用旧同号 FD 或 slot |
+| 重连后卡键或刷新率不对 | 旧按下状态的 release/cancel；mode、IPC 和 frame clock 刷新率更新 | 只清本地记录，或只更新尺寸 |
 | 剪贴板／输入停滞 | pending 扩展、短读短写、queue 限制和 payload 期限 | 扩展未完成就读新事件头 |
+| 旧剪贴板内容再次出现 | 异步结果的 selection/session 世代；长度和总期限内完整读到 EOF | 把晚到或截断的结果当作当前 selection |
 | 无声 | PipeWire session、已安装 bridge 调用、audio FD、节点路由与协商 | bridge 没接线却只增加 `PULSE_SERVER` |
+| 摄像头断流后定格或 CPU 占用升高 | stream HUP／EOF 清理、移除 I/O 监听及旧帧失效 | 保留断开的 FD 监听，或继续将最后一帧视为实时画面 |
 | Wayland 正常但 X11 失败 | 实际安装的修补版 Xwayland、render device、必要 satellite | 假定新包构建后 live server 已重启 |
 | 包时间戳新但行为未变 | 与历史包哈希对比、受影响对象是否重编译、安装文件身份 | 用时间戳或包装器 rc=0 当作构建证明 |
 

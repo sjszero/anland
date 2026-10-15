@@ -26,6 +26,7 @@ typedef struct anland_niri_input {
     int32_t action, code, pointer_id, discrete;
     float x, y, dx, dy, value;
     uint32_t payload_size, resource_type, fd_count;
+    uint32_t refresh_mhz;
 } anland_niri_input;
 
 /* Shared in-process presentation lifecycle over the daemon transport.

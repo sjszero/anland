@@ -134,11 +134,19 @@ impl OutputDriver {
         let interval = interval(refresh)?;
         if self.interval != interval {
             self.interval = interval;
+            self.current_tick = None;
             self.next_tick = Some(now);
         }
         Ok(())
     }
 
+    /// Ingest ordinary buffer-only updates once per output grant, not at the
+    /// mailbox client's rate. This is not a render/target-availability claim.
+    pub fn buffer_sync_due(&self, now: Instant) -> bool {
+        !self.stopped()
+            && !self.geometry_pending
+            && (self.current_tick.is_some() || self.next_tick.is_none_or(|at| now >= at))
+    }
     /// Coalesce updates while the public producer or native raster is busy.
     pub fn update_textures(&mut self, textures: impl IntoIterator<Item = i64>) {
         self.textures.extend(textures);
@@ -203,19 +211,37 @@ impl OutputDriver {
         if self.stopped() || self.next_tick.is_some_and(|at| now < at) {
             return Ok(None);
         }
-        self.tick_serial = self
-            .tick_serial
-            .checked_add(1)
+        // Keep the original clock phase when waking late. Work out the current
+        // grid boundary without multiplying a potentially large missed count.
+        let elapsed = now.duration_since(self.next_tick.unwrap_or(now)).as_nanos();
+        let period = self.interval.as_nanos();
+        let periods = u64::try_from(elapsed / period)
+            .ok()
+            .and_then(|missed| missed.checked_add(1))
             .ok_or_else(|| io::Error::other("Anland clock serial exhausted"))?;
-        // Skip missed wall-clock periods rather than flood clients with catch-up callbacks.
+        // interval() is nonzero and at most 1000 seconds, so the remainder fits.
+        let remainder = Duration::from_nanos((elapsed % period) as u64);
+        let render_deadline = now
+            .checked_sub(remainder)
+            .ok_or_else(|| io::Error::other("Anland clock deadline overflow"))?;
+        let presentation_target = render_deadline
+            .checked_add(self.interval)
+            .ok_or_else(|| io::Error::other("Anland clock deadline overflow"))?;
+        let sequence = self
+            .tick_serial
+            .checked_add(periods)
+            .ok_or_else(|| io::Error::other("Anland clock serial exhausted"))?;
+        // Publish only one tick after missed periods. Keep a full interval for
+        // native authorization expiry, even when this boundary was observed late.
         let tick = FrameTick {
             output: self.pool.output,
-            sequence: self.tick_serial,
+            sequence,
             nominal_interval: self.interval,
             interval: self.interval,
-            render_deadline: now,
-            presentation_target: now + self.interval,
+            render_deadline,
+            presentation_target,
         };
+        self.tick_serial = sequence;
         self.next_tick = Some(tick.presentation_target);
         self.current_tick = Some(tick);
         Ok(Some(tick))
@@ -265,16 +291,8 @@ impl OutputDriver {
                         || output.height != self.pool.size.height
                     {
                         progress.pool_changed = true;
-                    } else {
-                        match interval(output.refresh_mhz) {
-                            Ok(interval) => {
-                                if self.interval != interval {
-                                    self.interval = interval;
-                                    self.next_tick = Some(now);
-                                }
-                            }
-                            Err(error) => self.fail(native, &mut progress, error),
-                        }
+                    } else if let Err(error) = self.set_refresh(output.refresh_mhz, now) {
+                        self.fail(native, &mut progress, error);
                     }
                 }
                 Event::Target {
@@ -462,6 +480,11 @@ impl OutputDriver {
         });
         match native.render(request, &texture_ids) {
             Ok(dispatch) if dispatch.authorized => {
+                // The display tick is a single-use raster grant, not a reusable
+                // permission. A FrameReady/ACK/input wakeup before next_tick must
+                // not render the same period again. New texture updates remain
+                // coalesced until the next clock tick, independently of input.
+                self.current_tick = None;
                 progress.render_requested = true;
                 progress.vsync_dispatched = dispatch.vsync_dispatched;
             }

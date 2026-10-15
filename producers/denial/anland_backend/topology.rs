@@ -110,7 +110,7 @@ impl OutputPlan {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid Anland output/target",
+                format!("invalid Anland output/target: output={output:?}, target={target:?}"),
             ));
         }
         if previous

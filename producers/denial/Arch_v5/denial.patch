@@ -3294,3 +3294,188 @@ diff --git a/compositor/src/bin/deniald/wayland_frontend/screencopy.rs b/composi
          let failed = !self.screencopy.pending.is_empty();
          for request in self.screencopy.pending.drain(..) {
              request.frame.release_buffer(&request.buffer);
+diff --git a/compositor/src/bin/deniald/wayland_frontend/handlers.rs b/compositor/src/bin/deniald/wayland_frontend/handlers.rs
+index 5c257ee..542ec42 100644
+--- a/compositor/src/bin/deniald/wayland_frontend/handlers.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/handlers.rs
+@@ -211,14 +211,13 @@ const fn commit_has_visual_update(
+     buffer_attached: bool,
+     buffer_removed: bool,
+     sampling_changed: bool,
++    has_damage: bool,
+ ) -> bool {
+-    // wl_surface.damage describes how a newly pending buffer differs from
+-    // the current surface contents; it does not itself provide new contents.
+-    // In particular, Moonlight's independent frame-callback pacer commits
+-    // damage at output refresh even though its renderer only attaches a new
+-    // stream buffer at the configured stream rate. Publishing those
+-    // damage-only commits would resample an unchanged external texture.
+-    first_buffer || buffer_attached || buffer_removed || sampling_changed
++    // A client may update its current wl_buffer in place and commit only
++    // damage. Treating all no-attach commits as callback pacing loses those
++    // pixels (and their texture invalidation) until unrelated shell input.
++    // A callback-only commit with no damage remains a non-visual transaction.
++    first_buffer || buffer_attached || buffer_removed || sampling_changed || has_damage
+ }
+ 
+ #[cfg(feature = "flutter")]
+@@ -227,16 +226,18 @@ const fn surface_commit_kind(
+     buffer_attached: bool,
+     buffer_removed: bool,
+     sampling_changed: bool,
++    has_damage: bool,
+ ) -> Option<super::SurfaceCommitKind> {
+     if !commit_has_visual_update(
+         first_buffer,
+         buffer_attached,
+         buffer_removed,
+         sampling_changed,
++        has_damage,
+     ) {
+         return None;
+     }
+-    if buffer_attached && !first_buffer && !buffer_removed && !sampling_changed {
++    if (buffer_attached || has_damage) && !first_buffer && !buffer_removed && !sampling_changed {
+         Some(super::SurfaceCommitKind::BufferOnly)
+     } else {
+         Some(super::SurfaceCommitKind::Metadata)
+@@ -1314,6 +1315,13 @@ impl CompositorHandler for RuntimeState {
+         let mut committed_window_metadata_changed = false;
+         let frontend = self.wayland.as_mut().expect("missing Wayland frontend");
+         #[cfg(feature = "flutter")]
++        if has_damage && !buffer_attached && !buffer_removed {
++            // Republish SHM pixels at the parent transaction boundary as well
++            // as DMA-BUF revisions. Synchronized children must not be consumed
++            // here; publish_surface_commits performs the actual snapshot.
++            frontend.pending_shm_snapshots.insert(surface.id());
++        }
++        #[cfg(feature = "flutter")]
+         let sampling_changed = previous_sampling
+             != with_renderer_surface_state(surface, |state| {
+                 (
+@@ -1330,6 +1338,7 @@ impl CompositorHandler for RuntimeState {
+             buffer_attached,
+             buffer_removed,
+             sampling_changed,
++            has_damage,
+         );
+         #[cfg(feature = "flutter")]
+         let visual_update = commit_kind.is_some();
+diff --git a/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs b/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
+index 97ca553..3dd9b11 100644
+--- a/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
++++ b/compositor/src/bin/deniald/flutter_runtime/renderer/handler/open_gl.rs
+@@ -123,12 +123,30 @@ impl OpenGlHandler for FlutterGlHandler {
+             self.rearm_abandoned_samples();
+             let batch = self.seal_sampled_buffers();
+             if batch.is_some() {
+-                // The raster transaction returned without present(), so no
+-                // exportable fence exists. Match the C++ conservative path.
+-                // SAFETY: the sentinel runs on Flutter's render thread after
+-                // the abandoned raster task.
+-                unsafe { (self.gl.finish)() };
+-                self.publish_sampled_buffer_release(None, batch);
++                // No present() does not mean the GL stream cannot be fenced.
++                // This sentinel follows the abandoned raster task on the same
++                // current context. Release the held client buffers only after
++                // its exported fence signals, without stalling the CPU here.
++                let exported = {
++                    let context = lock(&self.render_context);
++                    EGLFence::create(context.context.display()).and_then(|fence| {
++                        // SAFETY: the raster sentinel owns the current context.
++                        unsafe { (self.gl.flush)() };
++                        fence.export()
++                    })
++                };
++                let fence = match exported {
++                    Ok(fence) => Some(fence),
++                    Err(error) => {
++                        warn!(%error, "abandoned raster fence export failed; completing sampled buffers with glFinish");
++                        // Preserve the original safe fallback on missing EGL
++                        // fence support, never release unfinished GPU reads.
++                        // SAFETY: same current raster context as above.
++                        unsafe { (self.gl.finish)() };
++                        None
++                    }
++                };
++                self.publish_sampled_buffer_release(fence, batch);
+             }
+         }
+     }
+diff --git a/compositor/src/bin/deniald/wayland_frontend.rs b/compositor/src/bin/deniald/wayland_frontend.rs
+index 05a87ee..b27e2f8 100644
+--- a/compositor/src/bin/deniald/wayland_frontend.rs
++++ b/compositor/src/bin/deniald/wayland_frontend.rs
+@@ -423,6 +423,8 @@ pub(super) struct WaylandFrontend {
+     _tablet_manager_state: TabletManagerState,
+     pub shm_state: ShmState,
+     pub dmabuf_state: DmabufState,
++    // Set only by the composited Anland backend. KMS/default stays conservative.
++    pub(crate) defer_implicit_dmabuf_wait: bool,
+     drm_syncobj_state: Option<DrmSyncobjState>,
+     dmabuf_global: Option<DmabufGlobal>,
+     dmabuf_render_node: Option<DrmNode>,
+diff --git a/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs b/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
+index bc92f06..3cf4416 100644
+--- a/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/frame_timeline.rs
+@@ -475,6 +475,10 @@ fn lock_surface_state(
+ }
+ 
+ impl WaylandFrontend {
++    // Buffer-only coalescing must not postpone exact frame/latch contracts.
++    pub(crate) fn has_frame_timeline_clients(&self) -> bool {
++        !self.frame_timeline.subscriptions.is_empty()
++    }
+     pub(super) fn invalidate_frame_timeline(&mut self) {
+         self.frame_timeline.begin_new_epoch();
+     }
+diff --git a/compositor/src/bin/deniald/wayland_frontend/handlers.rs b/compositor/src/bin/deniald/wayland_frontend/handlers.rs
+--- a/compositor/src/bin/deniald/wayland_frontend/handlers.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/handlers.rs
+@@ -518,6 +518,18 @@ fn install_frame_deadline_blocker(
+     })
+ }
+ 
++// Anland never directly scans out a client buffer. EGL still waits on the
++// DMA-BUF reservation fence before sampling; ordinary mailbox replacements
++// need not install a second CPU-side blocker for a buffer we may never sample.
++// Explicit-sync and exact-frame targets always keep the readiness path below.
++#[cfg(feature = "flutter")]
++const fn defer_implicit_readiness_wait(
++    composited_fast_path: bool,
++    explicit_acquire: bool,
++    targeted_frame: bool,
++) -> bool {
++    composited_fast_path && !explicit_acquire && !targeted_frame
++}
+ fn install_surface_readiness_hook(surface: &WlSurface) {
+     add_pre_commit_hook::<RuntimeState, _>(surface, |state, _display, surface| {
+         // LoopHandle is deliberately fetched at invocation time: Smithay's
+@@ -589,6 +601,14 @@ fn install_surface_readiness_hook(surface: &WlSurface) {
+             }
+             return;
+         };
++        #[cfg(feature = "flutter")]
++        if defer_implicit_readiness_wait(
++            state.wayland.as_ref().expect("missing Wayland frontend").defer_implicit_dmabuf_wait,
++            acquire_point.is_some(),
++            frame_target.is_some(),
++        ) {
++            return;
++        }
+         let Some(client) = surface.client() else {
+             warn!(surface_id = ?surface.id(), "DMA-BUF commit has no owning Wayland client");
+             #[cfg(feature = "flutter")]
+diff --git a/compositor/src/bin/deniald/wayland_frontend/startup.rs b/compositor/src/bin/deniald/wayland_frontend/startup.rs
+index ec594b1..75f6177 100644
+--- a/compositor/src/bin/deniald/wayland_frontend/startup.rs
++++ b/compositor/src/bin/deniald/wayland_frontend/startup.rs
+@@ -298,6 +298,7 @@ impl WaylandFrontend {
+             _tablet_manager_state: tablet_manager_state,
+             shm_state,
+             dmabuf_state,
++            defer_implicit_dmabuf_wait: false,
+             drm_syncobj_state,
+             dmabuf_global: None,
+             dmabuf_render_node: None,

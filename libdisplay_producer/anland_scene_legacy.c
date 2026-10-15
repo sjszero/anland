@@ -526,14 +526,20 @@ int anland_scene_legacy_pump(anland_scene_legacy *b, int timeout_ms)
         return 0;
     }
 
-    /* A connected consumer may take any amount of time to select its first
-     * slot. Do not fabricate slot zero or detach it because time passed. */
+    /* Watch peer closure in the same poll as target/ACK readiness, without
+     * an extra hot-path syscall or reading application input. An eventfd
+     * cannot tell us that the consumer died before selecting its first slot. */
+    const int ready = anland_device_poll_buffer_ready(b->dev, b->ready_pending ? 0 : timeout_ms);
+    if (ready < 0) {
+        drop_session(b);
+        return 0;
+    }
+    /* A live consumer can take any time to select its first slot. No fake slot
+     * zero and no wall-clock arrival deadline; only proven loss retires it. */
     if (!b->ready_pending) {
+        if (!ready) return 0;
         const int fd = anland_device_buffer_ready_fd(b->dev);
         if (fd < 0)
-            return 0;
-        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
-        if (poll(&p, 1, timeout_ms) <= 0 || !(p.revents & POLLIN))
             return 0;
         eventfd_t v;
         if (eventfd_read(fd, &v) != 0)

@@ -490,6 +490,7 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let mut clipboard_sync = ClipboardSync::default();
     let mut pointer_capture = CaptureSync::default();
     let mut pending_service_context = None;
+    let mut waiting_initial_refresh = false;
     let mut launcher: Option<FlutterLauncher> = None;
     let mut active: Option<Active> = None;
     let mut parked: Option<Active> = None;
@@ -516,10 +517,29 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut frames = 0u64;
     let mut immediate = true;
+    let audit_frames = std::env::var("DENIAL_RENDER_AUDIT").ok().as_deref() == Some("1");
+    let mut audit_since = started;
+    let mut audit_ticks = 0u64;
+    let mut audit_renders = 0u64;
+    let mut audit_vsync = 0u64;
+    let mut audit_presented = 0u64;
 
     // Direct GLES replacement uses the resident renderer policy (including
     // Impeller stencil). Offscreen storage, changed topology and reload stay cold.
     let warm_supported = !options.flutter_offscreen_blit;
+    // Anland always composites client textures with EGL. Explicit acquire
+    // points and exact-frame targets still retain CPU readiness monitoring.
+    let defer_implicit_dmabuf_wait =
+        std::env::var("ANLAND_SKIP_IMPLICIT_SYNC_WAIT").map_or(true, |value| value == "1");
+    let coalesce_buffer_commits = std::env::var("DENIAL_ANLAND_COALESCE_BUFFER_COMMITS")
+        .ok()
+        .as_deref()
+        != Some("0");
+    info!(
+        defer_implicit_dmabuf_wait,
+        coalesce_buffer_commits,
+        "Anland deferred startup: waiting for daemon, consumer pool and real target; no arrival timeout"
+    );
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), Box<dyn Error>> {
         loop {
             let timeout = if immediate {
@@ -543,6 +563,12 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                         (*since + Duration::from_secs(5)).saturating_duration_since(Instant::now()),
                     )
                 });
+            // Asynchronous buffer retirement can queue wl_buffer.release even
+            // without frame callbacks or presentation feedback. Flush every
+            // iteration before waiting, so mailbox clients can reuse buffers.
+            if let Some(frontend) = events.wayland.as_mut() {
+                frontend.display_handle.flush_clients()?;
+            }
             event_loop.dispatch(timeout, &mut events)?;
             let now = Instant::now();
             sampled.drain(&mut events, now)?;
@@ -609,9 +635,10 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                         pending_service_context = None;
                     }
                     for index in 0..64 {
-                        // Capture BEFORE reading a header/payload. A short read
-                        // must not re-target text or overwrite a newer selection.
-                        if !input_stream.has_pending() {
+                        // Capture BEFORE the first header byte. Both public
+                        // partial headers and local payloads retain this context;
+                        // a genuinely idle poll allows a fresh target next time.
+                        if !input_stream.has_pending(c) {
                             let target = if events.secure_session_locked() {
                                 None
                             } else {
@@ -789,6 +816,7 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                         )?;
                     }
                 }
+                let mut drive_now = Instant::now();
                 if !a.driver.stopped() && client.as_ref().unwrap().connected() {
                     // Consumer routing above may have just queued shell input.
                     // Use the runtime's bounded batch before scene synchronization/render.
@@ -824,7 +852,20 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                         now,
                     )?;
                     synchronize_flutter_window_management(&mut a.runtime, &mut events)?;
-                    synchronize_flutter_scene(&publisher, &mut a.runtime, &mut events)?;
+                    // Coalesce mailbox pixels until an output tick instead of
+                    // cloning buffers/locking the raster texture map per commit.
+                    // Metadata/unmaps, captures and exact-frame clients keep
+                    // their existing immediate ingest and deadline semantics.
+                    let buffer_sync_due = !coalesce_buffer_commits
+                        || a.driver.buffer_sync_due(Instant::now())
+                        || a.captures.requested(&events, a.plan.pool.output)
+                        || events
+                            .wayland
+                            .as_ref()
+                            .is_some_and(|frontend| frontend.has_frame_timeline_clients());
+                    if buffer_sync_due || events.scene_sync.pending_metadata_revision().is_some() {
+                        synchronize_flutter_scene(&publisher, &mut a.runtime, &mut events)?;
+                    }
                     synchronize_flutter_input_layout(&mut a.runtime, &mut events)?;
                     synchronize_wayland_cursor(&mut a.runtime, &mut events)?;
                     a.captures.service_requests(
@@ -879,6 +920,17 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                             );
                         },
                     )?;
+                    // Services above may cross an output edge after the early
+                    // scene check. Latch one time for the last buffer ingest
+                    // and drive, so that edge cannot render an avoidably stale
+                    // texture and postpone the newest pixels by another tick.
+                    drive_now = Instant::now();
+                    if coalesce_buffer_commits
+                        && a.driver.buffer_sync_due(drive_now)
+                        && events.scene_sync.pending_buffer_revision().is_some()
+                    {
+                        synchronize_flutter_scene(&publisher, &mut a.runtime, &mut events)?;
+                    }
                     let updates = a.runtime.take_output_updates();
                     for (_, textures) in &updates {
                         a.driver.update_textures(textures.iter().copied());
@@ -888,6 +940,9 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                 let capture_requested =
                     !a.driver.stopped() && a.captures.requested(&events, a.plan.pool.output);
                 let capture_running = !a.driver.stopped();
+                // Shared with the last ingest above; do not observe a later
+                // edge here without first ingesting its coalesced client pixels.
+                let now = drive_now;
                 let progress = a.driver.drive(
                     &mut CapturingRenderer {
                         runtime: &mut a.runtime,
@@ -900,6 +955,25 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                     64,
                     fence_signaled,
                 );
+                if audit_frames {
+                    audit_ticks += u64::from(progress.frame_tick.is_some());
+                    audit_renders += u64::from(progress.render_requested);
+                    audit_vsync += u64::from(progress.vsync_dispatched);
+                    audit_presented += progress.outcomes.iter().filter(|outcome| {
+                        matches!(outcome, super::submission::Outcome::Presented { .. })
+                    }).count() as u64;
+                    if now.saturating_duration_since(audit_since) >= Duration::from_secs(1) {
+                        info!(clock_ticks = audit_ticks, raster_requests = audit_renders,
+                            flutter_vsync = audit_vsync, consumer_ack = audit_presented,
+                            elapsed_ms = now.saturating_duration_since(audit_since).as_millis(),
+                            "Anland frame statistics");
+                        audit_since = now;
+                        audit_ticks = 0;
+                        audit_renders = 0;
+                        audit_vsync = 0;
+                        audit_presented = 0;
+                    }
+                }
                 // The facade may also publish OUTPUT_CHANGED without a seat notification.
                 for change in &progress.state_changes {
                     if let super::client::Event::Output(output) = change
@@ -1131,7 +1205,35 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                         break;
                     }
                 }
-                if (c.connected() && c.events_pending() == 0)
+                // Consumer HELLO can contain refresh=0 until Java reports the
+                // display rate on the input stream. Waiting for an Active output
+                // before reading that stream would make output creation depend
+                // on itself. Drain only while metadata/partial framing is pending.
+                let needs_initial_refresh = c.connected()
+                    && c.output().is_ok_and(|output| output.refresh_mhz == 0);
+                if needs_initial_refresh && !waiting_initial_refresh {
+                    info!(
+                        "Anland consumer connected; waiting for initial refresh rate without dropping session"
+                    );
+                }
+                waiting_initial_refresh = needs_initial_refresh;
+                if c.connected() && (input_stream.has_pending(c) || needs_initial_refresh) {
+                    pending_service_context = None;
+                    match input_stream.bootstrap_refresh(c, now) {
+                        Ok(Some(refresh_mhz)) => {
+                            info!(refresh_mhz, "Anland initial consumer refresh received");
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // next() already retired the failed transport; do not
+                            // forward any partially decoded input after reconnect.
+                            sources.invalidate();
+                            input_seat.reset();
+                            warn!(%error, "Anland startup metadata stream failed; retrying session");
+                        }
+                    }
+                }
+                if (c.connected() && c.events_pending() == 0 && !input_stream.has_pending(c))
                     || staged_plan.is_some()
                     || replacing.is_some()
                 {
@@ -1157,6 +1259,8 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                                         settings.take().unwrap(),
                                         shortcuts.take().unwrap(),
                                     )?;
+                                    frontend.defer_implicit_dmabuf_wait =
+                                        defer_implicit_dmabuf_wait;
                                     frontend.init_renderer(&mut graphics.renderer)?;
                                     launcher = Some(FlutterLauncher::new(
                                         FlutterLaunchConfiguration {
@@ -1334,6 +1438,13 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                                 }
                                 publisher.publish(scale.state(Some(plan)));
                                 topology = plan.topology.clone();
+                                info!(
+                                    generation = plan.pool.generation,
+                                    slots = plan.pool.count,
+                                    width = plan.target.width,
+                                    height = plan.target.height,
+                                    "Anland consumer target pool activated"
+                                );
                                 events.install_workspace_snapshot(
                                     &mut active.as_mut().unwrap().runtime,
                                 )?;
@@ -1357,7 +1468,15 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            sources.watch_input(active.as_ref().is_some_and(|a| !a.driver.stopped()));
+            let bootstrap_input = active.is_none()
+                && client.as_ref().is_some_and(|c| {
+                    c.connected()
+                        && (input_stream.has_pending(c)
+                            || c.output().is_ok_and(|output| output.refresh_mhz == 0))
+                });
+            sources.watch_input(
+                active.as_ref().is_some_and(|a| !a.driver.stopped()) || bootstrap_input,
+            );
             if let Some(c) = client.as_ref() {
                 sources.refresh(c)?;
             }

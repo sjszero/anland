@@ -202,6 +202,10 @@ impl Client {
         // SAFETY: same live, single-threaded session; no ownership is transferred.
         unsafe { ffi::ad_events_pending(self.session.as_ptr()) }
     }
+    pub fn input_header_pending(&self) -> bool {
+        // SAFETY: read-only query on the same live, single-threaded session.
+        unsafe { ffi::ad_input_header_pending(self.session.as_ptr()) != 0 }
+    }
     pub fn poll_input(&mut self) -> io::Result<Option<Input>> {
         let mut out = Input::default();
         // SAFETY: initialized storage; caller must complete payload before repoll.

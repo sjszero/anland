@@ -485,6 +485,11 @@ static int input_read(display_ctx *ctx, void *out, size_t size, int kind, int ti
     } while (true);
 }
 
+bool input_header_pending(const display_ctx *ctx)
+{
+    return ctx && !ctx->fallback && ctx->input_kind == 1 && ctx->input_used > 0;
+}
+
 int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
 {
     uint8_t bytes[sizeof(struct data_msg) + sizeof(struct InputEvent)];
@@ -494,7 +499,14 @@ int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
     if (hdr.type != DATA_MSG_INPUT_EVENT || hdr.size != sizeof(*event)) {
         enter_fallback(ctx); return -1;
     }
-    memcpy(event,bytes+sizeof(hdr),sizeof(*event)); return 1;
+    memcpy(event, bytes + sizeof(hdr), sizeof(*event));
+    /* SCREEN_INFO can precede Android's first refresh callback. Keep the
+     * consumer's later, validated display rate visible through get_screen_info
+     * without swallowing/reordering its input notification or payloads. */
+    if (event->type == INPUT_TYPE_DISPLAY_REFRESH &&
+        event->display.refresh_mhz > 0 && event->display.refresh_mhz <= INT32_MAX)
+        ctx->refresh = event->display.refresh_mhz;
+    return 1;
 }
 int poll_input_event_extend_fds(display_ctx *ctx, int *fds, int max_fds,
                                 int *fd_count, int timeout_ms)
@@ -717,6 +729,31 @@ bool is_daemon_alive(display_ctx *ctx)
     return !(pfd.revents & (POLLHUP | POLLERR | POLLNVAL));
 }
 
+int poll_buffer_ready(display_ctx *ctx, int timeout_ms)
+{
+    if (!ctx) { errno = EINVAL; return -1; }
+    if (ctx->fallback) return 0;
+    /* One poll serves both ACK/initial-target readiness and peer health.
+     * eventfd alone cannot report a consumer closing before its first target.
+     * Only poll socket hangups: never steal input or ancillary bytes. */
+    struct pollfd channels[] = {
+        {.fd = ctx->buf_ready_efd, .events = POLLIN},
+        {.fd = ctx->ctrl_fd, .events = POLLRDHUP},
+        {.fd = ctx->data_fd, .events = POLLRDHUP},
+    };
+    int rc = poll(channels, sizeof(channels) / sizeof(channels[0]), timeout_ms);
+    if (rc < 0 && errno == EINTR) return 0;
+    int error = rc < 0 ? errno : ECONNRESET;
+    bool lost = rc < 0;
+    for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]); ++i) {
+        lost |= channels[i].fd < 0 ||
+            (channels[i].revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
+    }
+    if (!lost) return (channels[0].revents & POLLIN) != 0;
+    enter_fallback(ctx);
+    errno = error;
+    return -1;
+}
 void force_fallback(display_ctx *ctx)
 {
     if (!ctx) return;

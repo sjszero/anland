@@ -144,6 +144,10 @@ bool anland_device_is_connected(const anland_device *dev)
     return dev && !is_fallback(dev->ctx);
 }
 
+int anland_device_poll_buffer_ready(anland_device *dev, int timeout_ms)
+{
+    return poll_buffer_ready(dev ? dev->ctx : NULL, timeout_ms);
+}
 int anland_device_connect(anland_device *dev)
 {
     if (!dev)
@@ -404,6 +408,11 @@ bool anland_device_notify_frame_done(anland_device *dev)
     }
 
     return trigger_refresh(dev->ctx) == 0;
+}
+
+bool anland_device_input_header_pending(const anland_device *dev)
+{
+    return dev && input_header_pending(dev->ctx);
 }
 
 int anland_device_poll_input(anland_device *dev, anland_device_input_t *ev,

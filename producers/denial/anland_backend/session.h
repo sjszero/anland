@@ -50,6 +50,8 @@ size_t ad_events_pending(ad_session *session);
 /* Borrowed Linux sync_file; 1 completed, 0 pending, negative error. Never waits. */
 int ad_fence_signaled(int32_t fd);
 int ad_poll_input(ad_session *session, ad_input *out);
+/* 1 for a partially consumed event header, 0 for idle/completed/disconnected. */
+int ad_input_header_pending(ad_session *session);
 int ad_read_payload(ad_session *session, void *data, size_t size);
 int ad_read_fds(ad_session *session, int32_t *fds, uint32_t capacity, uint32_t *count);
 int ad_clipboard(ad_session *session, const void *data, size_t size);

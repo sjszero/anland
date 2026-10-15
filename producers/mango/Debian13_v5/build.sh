@@ -113,7 +113,7 @@ bootstrap() {
     done
 }
 package_deb() {
-    local stage private file depends
+    local stage private file depends marker
     stage=$(mktemp -d "$WORKDIR/package.XXXXXX") || die 'cannot create package stage'
     private="$stage/usr/lib/mango-anland"
     log 'Package mango-anland'
@@ -173,12 +173,19 @@ EOF
     run find "$stage" -type d -exec chmod 755 {} +
     run find "$stage" -type f -exec chmod 644 {} +
     run chmod 755 "$private/bin/"* "$stage/usr/bin/mango" "$stage/usr/bin/mmsg"
+    marker=$(mktemp "$WORKDIR/.package-start.XXXXXX") || die 'cannot create package marker'
     run dpkg-deb --root-owner-group -Zxz --build "$stage" "$DEB"
+    [[ -s $DEB && $DEB -nt $marker &&
+       $(dpkg-deb -f "$DEB" Package) == mango-anland &&
+       $(dpkg-deb -f "$DEB" Version) == 0.17.5+anland5 &&
+       $(dpkg-deb -f "$DEB" Architecture) == arm64 ]] || die 'invalid or stale Mango package'
+    run rm -f -- "$marker"
     run rm -r "$stage"
 }
 declare -a xwayland_debs=()
 build_xwayland() {
     local out="$WORKDIR/xwayland" tree patch file identity upstream
+    local version arch changes marker listing name package_arch found=0
     patch="$(find_patch xwayland "${XWAYLAND_PATCH:-}")" || die 'cannot select Xwayland patch'
     printf '%s  %s\n' "$XWAYLAND_PATCH_SHA256" "$patch" | sha256sum -c --status - ||
         die 'checksum: xwayland.patch (update lock for an intentional override)'
@@ -210,16 +217,34 @@ build_xwayland() {
         printf '%s\n' "$identity" > "$tree/.anland-source-identity" || die 'cannot record prepared Xwayland'
     fi
     log 'Build Xwayland .deb'
-    run rm -f "$out"/xwayland_*.deb
+    version=$(dpkg-parsechangelog -l "$tree/debian/changelog" -S Version) || die 'cannot read Xwayland changelog'
+    [[ $version == "$XWAYLAND_VERSION" ]] || die 'Xwayland changelog does not match lock'
+    arch=$(dpkg --print-architecture) || die 'cannot read build architecture'
+    changes="$out/xwayland_${version#*:}_${arch}.changes"
+    marker=$(mktemp "$out/.build-start.XXXXXX") || die 'cannot create Xwayland marker'
     (cd "$tree" && env -u PKG_CONFIG_PATH -u PKG_CONFIG_LIBDIR -u CMAKE_PREFIX_PATH \
         -u LD_LIBRARY_PATH -u DESTDIR PATH="/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         DEB_BUILD_OPTIONS="nocheck nodwz parallel=$JOBS" dpkg-buildpackage -b -uc -us) || die 'package: xwayland'
-    local -a debs=("$out"/xwayland_*.deb)
-    [ -f "${debs[0]}" ] || die 'no Xwayland package produced'
-    for file in "${debs[@]}"; do
+    [[ -s $changes && $changes -nt $marker ]] || die "missing or stale changes: $changes"
+    listing=$(awk '/^Files:/ {in_files=1; next} in_files && /^[^ ]/ {exit} in_files && $5 ~ /\.deb$/ {print $5}' "$changes") || die 'cannot read Xwayland package list'
+    xwayland_debs=()
+    while IFS= read -r file; do
+        [[ $file == *.deb && $file != */* ]] || die "invalid package filename: $file"
+        file="$out/$file"
+        [[ -s $file && $file -nt $marker ]] || die "missing or stale package: $file"
+        name=$(dpkg-deb -f "$file" Package) || die "cannot read package name: $file"
+        [[ -n $name ]] || die "missing package name: $file"
+        case $name in *-debug|*-dbg|*-dbgsym) continue ;; esac
+        package_arch=$(dpkg-deb -f "$file" Architecture) || die "cannot read package architecture: $file"
+        [[ $package_arch == "$arch" || $package_arch == all ]] || die "wrong package architecture: $file"
+        [[ $(dpkg-deb -f "$file" Version) == "$version" ]] || die "wrong package version: $file"
+        run dpkg-deb --contents "$file" >/dev/null
         run cp -p "$file" "$PACKAGES/"
         xwayland_debs+=("$PACKAGES/${file##*/}")
-    done
+        [[ $name != xwayland ]] || found=1
+    done <<<"$listing"
+    [[ $found == 1 ]] || die 'no Xwayland runtime package produced'
+    run rm -f -- "$marker"
 }
 main() {
     [ $# -eq 0 ] || die 'use environment variables, not arguments'
@@ -241,10 +266,7 @@ main() {
     meson_build "$WORKDIR/src/mango" "$WORKDIR/build/mango" --sysconfdir="$PREFIX/etc" -Danland=enabled -Dxwayland=enabled
     package_deb
     build_xwayland
-    local -a package_names=("${DEB##*/}")
-    local file
-    for file in "${xwayland_debs[@]}"; do package_names+=("${file##*/}"); done
-    (cd "$PACKAGES" && sha256sum "${package_names[@]}" > SHA256SUMS) || die 'cannot write SHA256SUMS'
+    run sha256sum "$DEB" "${xwayland_debs[@]}"
     if [ "${ANLAND_INSTALL:-0}" = 1 ]; then run $SUDO dpkg -i "$DEB" "${xwayland_debs[@]}"; fi
     log "Done. Packages: $PACKAGES (Mango + Xwayland)"
 }

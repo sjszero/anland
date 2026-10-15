@@ -103,6 +103,7 @@ unsafe extern "C" {
     pub fn ad_events_pending(session: *mut Session) -> usize;
     pub fn ad_fence_signaled(fd: i32) -> i32;
     pub fn ad_poll_input(session: *mut Session, out: *mut Input) -> i32;
+    pub fn ad_input_header_pending(session: *mut Session) -> i32;
     pub fn ad_read_payload(session: *mut Session, data: *mut c_void, size: usize) -> i32;
     pub fn ad_read_fds(session: *mut Session, fds: *mut i32, capacity: u32, count: *mut u32)
     -> i32;

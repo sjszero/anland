@@ -192,6 +192,7 @@ int anland_niri_poll_input(anland_niri_bridge *b, anland_niri_input *out)
         out->value = ev.pointer_axis.value;
         out->discrete = ev.pointer_axis.discrete; break;
     case ANLAND_DEVICE_IN_CLIPBOARD: out->payload_size = ev.clipboard.size; break;
+    case ANLAND_DEVICE_IN_DISPLAY_REFRESH: out->refresh_mhz = ev.display.refresh_mhz; break;
     case ANLAND_DEVICE_IN_TEXT_INPUT: out->payload_size = ev.text_input.size; break;
     case ANLAND_DEVICE_IN_RESOURCE:
     case ANLAND_DEVICE_IN_RESOURCE_INVALID:

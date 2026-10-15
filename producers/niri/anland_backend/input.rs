@@ -1,6 +1,7 @@
 //! Anland input backend: feeds smithay input events from the anland consumer.
 
 use std::path::PathBuf;
+use std::collections::BTreeSet;
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
@@ -414,6 +415,9 @@ pub struct AnlandInputBackend {
     /// logical output coordinates.
     pub scale: f64,
     pub time_offset: u64,
+    pressed_keys: BTreeSet<i32>,
+    pressed_buttons: BTreeSet<i32>,
+    touch_slots: BTreeSet<i32>,
 }
 
 impl Default for AnlandInputBackend {
@@ -423,11 +427,50 @@ impl Default for AnlandInputBackend {
             native_h: 0,
             scale: 1.5,
             time_offset: 0,
+            pressed_keys: BTreeSet::new(),
+            pressed_buttons: BTreeSet::new(),
+            touch_slots: BTreeSet::new(),
         }
     }
 }
 
 impl AnlandInputBackend {
+    pub fn new(native_w: u32, native_h: u32) -> Self {
+        Self { native_w, native_h, ..Self::default() }
+    }
+
+    /// Replay these through State::process_input_event before new-session input,
+    /// so Smithay grabs/modifiers and niri's shortcut state see real releases.
+    pub fn take_releases(&mut self) -> Vec<ffi::InputEvent> {
+        let mut events = Vec::new();
+        for code in std::mem::take(&mut self.pressed_keys) {
+            events.push(ffi::InputEvent {
+                type_: ffi::INPUT_TYPE_KEY, code, action: ffi::INPUT_ACTION_UP,
+                ..Default::default()
+            });
+        }
+        for code in std::mem::take(&mut self.pressed_buttons) {
+            events.push(ffi::InputEvent {
+                type_: ffi::INPUT_TYPE_POINTER_BUTTON, code, action: 0,
+                ..Default::default()
+            });
+        }
+        let touches = std::mem::take(&mut self.touch_slots);
+        let had_touches = !touches.is_empty();
+        for pointer_id in touches {
+            events.push(ffi::InputEvent {
+                type_: ffi::INPUT_TYPE_TOUCH, pointer_id, action: ffi::INPUT_ACTION_UP,
+                ..Default::default()
+            });
+        }
+        if had_touches {
+            events.push(ffi::InputEvent {
+                type_: ffi::INPUT_TYPE_TOUCH_FRAME, ..Default::default()
+            });
+        }
+        events
+    }
+
     fn base(&self, x: f64, y: f64) -> AnlandEventBase {
         let now = crate::utils::get_monotonic_time().as_micros() as u64;
         AnlandEventBase {
@@ -470,11 +513,35 @@ impl InputBackend for AnlandInputBackend {
 
 /// Translate a common producer input event into a Smithay input event.
 pub fn translate(
-    backend: &AnlandInputBackend,
+    backend: &mut AnlandInputBackend,
     raw: &ffi::InputEvent,
 ) -> Option<smithay::backend::input::InputEvent<AnlandInputBackend>> {
     use smithay::backend::input::{ButtonState, InputEvent as I, KeyState};
 
+    match raw.type_ {
+        ffi::INPUT_TYPE_KEY => {
+            if raw.action == ffi::INPUT_ACTION_DOWN {
+                backend.pressed_keys.insert(raw.code.max(0));
+            } else {
+                backend.pressed_keys.remove(&raw.code.max(0));
+            }
+        }
+        ffi::INPUT_TYPE_POINTER_BUTTON => {
+            if raw.action != 0 {
+                backend.pressed_buttons.insert(raw.code);
+            } else {
+                backend.pressed_buttons.remove(&raw.code);
+            }
+        }
+        ffi::INPUT_TYPE_TOUCH => {
+            if raw.action == ffi::INPUT_ACTION_DOWN {
+                backend.touch_slots.insert(raw.pointer_id.max(0));
+            } else if raw.action == ffi::INPUT_ACTION_UP {
+                backend.touch_slots.remove(&raw.pointer_id.max(0));
+            }
+        }
+        _ => {}
+    }
     let base = |x: f64, y: f64| backend.base(x, y);
 
     match raw.type_ {

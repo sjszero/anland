@@ -57,7 +57,14 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 [[ -d "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]] || fail "Invalid runtime directory: $XDG_RUNTIME_DIR"
 [[ "$(stat -c %a "$XDG_RUNTIME_DIR")" == 700 ]] || fail 'XDG_RUNTIME_DIR must have mode 0700.'
 export ANLAND_SOCKET="${ANLAND_SOCKET:-/run/display.sock}"
-[[ -S "$ANLAND_SOCKET" ]] || fail "Missing daemon socket: $ANLAND_SOCKET"
+# Boot ordering belongs to deniald's deferred connector, not the launcher.
+# --check stays a strict, non-starting preflight; a real session waits/reopens
+# in its signal-aware event loop when the daemon/consumer appears later.
+if [[ $mode == check ]]; then
+    [[ -S "$ANLAND_SOCKET" ]] || fail "Missing daemon socket: $ANLAND_SOCKET"
+elif [[ ! -S "$ANLAND_SOCKET" ]]; then
+    printf 'denial: daemon socket not ready (%s); the compositor will keep retrying.\n' "$ANLAND_SOCKET" >&2
+fi
 render="${ANLAND_DRM_DEVICE:-/dev/dri/renderD128}"
 [[ -c "$render" && -r "$render" && -w "$render" ]] || fail "Render device is not accessible: $render"
 # Preserve the caller's proven Mesa/GBM settings; never change clocks or drivers.

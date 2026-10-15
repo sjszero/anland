@@ -35,6 +35,15 @@ pub(crate) fn prepare_output(
     }
     let target = client.writable()?.ok_or(io::ErrorKind::WouldBlock)?;
     let output = client.output()?;
+    // Android may report its first rate after HELLO and the target-ready signal.
+    // Retain this valid pool while the owner drains that metadata notification;
+    // no fabricated frame clock and no destructive reconnect for pending data.
+    if output.refresh_mhz == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "waiting for Anland consumer refresh rate",
+        ));
+    }
     let plan = OutputPlan::prepare_scaled(previous, output, target, scale_120)?;
     let imported = ImportedPool::import(client, target, plan.pool)?;
     let current = client.output()?;

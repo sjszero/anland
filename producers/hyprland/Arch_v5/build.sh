@@ -15,7 +15,7 @@ for flag in ANLAND_INSTALL ANLAND_WITH_DEPS ANLAND_OFFLINE; do
     [[ ${!flag:-0} =~ ^[01]$ ]] || die "$flag must be 0 or 1"
 done
 [[ ${ANLAND_OFFLINE:-0} != 1 || ${ANLAND_WITH_DEPS:-0} != 1 ]] || die 'offline dependency installation is not supported'
-for tool in python3 flock makepkg pacman tar sha256sum bsdtar gpg; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done
+for tool in python3 flock makepkg pacman tar sha256sum bsdtar; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done
 run mkdir -p "$WORKDIR" "$(dirname -- "$ARTIFACTS")"
 [[ ! -L $ARTIFACTS ]] || die 'ARTIFACTS must not be a symlink'
 WORKDIR=$(realpath "$WORKDIR") || die 'WORKDIR'; ARTIFACTS=$(realpath -m "$ARTIFACTS") || die 'ARTIFACTS'
@@ -24,21 +24,10 @@ WORKDIR=$(realpath "$WORKDIR") || die 'WORKDIR'; ARTIFACTS=$(realpath -m "$ARTIF
    $WORKDIR != "$ARTIFACTS" && $WORKDIR != "$ARTIFACTS/"* ]] || die 'ARTIFACTS must not contain the source or cache'
 exec 8>"$WORKDIR/build.lock" || die 'cannot open build lock'
 flock -n 8 || die 'WORKDIR is already in use'
-# This lock must stay outside the directory exchanged during publication.
-lockdir="$(dirname -- "$ARTIFACTS")/.cache/anland-artifacts-locks"
-run mkdir -p "$lockdir"
-exec 9>"$lockdir/${ARTIFACTS##*/}.lock" || die 'cannot open artifacts lock'
+# Only native packages are copied to the output directory; build records stay cached.
+run mkdir -p "$ARTIFACTS"
+exec 9>"$ARTIFACTS/.build.lock" || die 'cannot open artifacts lock'
 flock -n 9 || die 'artifacts are already in use'
-# Stage a complete signed delivery beside ARTIFACTS, on the same filesystem.
-# Neither failed builds nor cancelled signing may modify the previous delivery.
-STAGING=
-cleanup() { [[ -z $STAGING ]] || rm -rf -- "$STAGING"; }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-STAGING=$(mktemp -d "$(dirname -- "$ARTIFACTS")/.${ARTIFACTS##*/}.staging.XXXXXXXX") || die 'cannot create artifact staging'
-run chmod 755 "$STAGING"
 # Fingerprint includes lock, recipes, patch bytes, backend and public sources.
 # Input preparation stays in this entrypoint; no companion Python file.
 python3 - "$SCRIPT_DIR" "$WORKDIR" <<'PY_INPUTS' || die 'input preparation failed'
@@ -104,73 +93,36 @@ for recipe in wm xwayland; do
         done') || die 'offline source preflight failed'
     fi
     printf '\n==> makepkg %s (input %s)\n' "$recipe" "$input_id"
+    stamp=$(mktemp "$cwd/.build-start.XXXXXX") || die 'cannot mark package build'
     (cd "$cwd" && makepkg "${flags[@]}") || die "makepkg $recipe failed"
     (cd "$cwd" && makepkg --packagelist) > "$BUILDROOT/$recipe.packagelist" || die 'cannot query package list'
     while IFS= read -r file; do
-        [[ -s $file ]] || die "expected package missing: $file"
+        [[ -s $file && $file -nt $stamp ]] || die "missing or stale package: $file"
         metadata=$(bsdtar -xOf "$file" .PKGINFO) || die "cannot read package metadata"
         [[ $metadata == *"arch = aarch64"* ]] || die "wrong package architecture: $file"
         run pacman -Qip "$file"
-        run bsdtar -tf "$file" > "$file.contents"
+        run bsdtar -tf "$file" >/dev/null
         pkgname=$(awk -F' = ' '$1 == "pkgname" {print $2; exit}' <<<"$metadata") || die 'cannot read package name'
         [[ -n $pkgname ]] || die "package name missing in metadata: $file"
-        run cp -p "$file" "$STAGING/"
+        case $pkgname in *-debug|*-dbg|*-dbgsym) continue ;; esac
+        # A previous native signature must not authenticate different package bytes.
+        if [[ -e $ARTIFACTS/${file##*/}.sig || -L $ARTIFACTS/${file##*/}.sig ]]; then
+            cmp -s "$file" "$ARTIFACTS/${file##*/}" ||
+                die "old signature preserved: $ARTIFACTS/${file##*/}.sig; use a fresh output directory"
+        fi
+        [[ $file -ef $ARTIFACTS/${file##*/} ]] || run cp -p "$file" "$ARTIFACTS/"
         packages+=("${file##*/}")
     done < "$BUILDROOT/$recipe.packagelist"
+    run rm -f -- "$stamp"
 done
 [[ ${#packages[@]} -ge 3 ]] || die 'incomplete package set (Hyprland, hyprpm, Xwayland)'
-# Publish only a complete, verified, signed delivery. Linux RENAME_EXCHANGE
-# switches the entire directory at once, including same-version rebuilds.
-# The previous delivery then lives at STAGING until the EXIT cleanup removes it.
-_publish() {
-    local name
-    for name in "${packages[@]}"; do
-        [[ -s $STAGING/$name && -s $STAGING/$name.sig ]] || die "staged package/signature missing: $name"
-    done
-    run cp "$BUILDROOT/build-inputs.json" "$STAGING/build-inputs.json"
-    printf '%s\n' "${packages[@]}" > "$STAGING/packages.list" || die 'cannot write package list'
-    (cd "$STAGING" && sha256sum "${packages[@]}" "${packages[@]/%/.sig}" \
-        packages.list build-inputs.json anland-local-signing-key.asc > SHA256SUMS && \
-        sha256sum -c SHA256SUMS) || die 'staged artifact checksums failed'
-    python3 - "$STAGING" "$ARTIFACTS" <<'PY_PUBLISH' || die 'atomic artifact publication failed'
-import ctypes, os, sys
-stage, destination = sys.argv[1:]
-if os.path.lexists(destination):
-    if os.path.islink(destination) or not os.path.isdir(destination):
-        raise SystemExit('artifact destination is no longer an ordinary directory')
-    libc = ctypes.CDLL(None, use_errno=True)
-    rename = libc.renameat2
-    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    rename.restype = ctypes.c_int
-    if rename(-100, os.fsencode(stage), -100, os.fsencode(destination), 2):
-        raise OSError(ctypes.get_errno(), 'RENAME_EXCHANGE failed; previous delivery unchanged')
-else:
-    os.rename(stage, destination)
-print('Published complete artifact set: '+destination)
-PY_PUBLISH
-    (cd "$ARTIFACTS" && sha256sum -c SHA256SUMS) || die 'artifact checksums failed'
-}
-# Persistent machine-local signing identity; keep pacman's signature policy intact.
-keyhome=${ANLAND_SIGNING_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/anland-arch/signing}
-[[ ! -L $keyhome ]] || die 'signing home must not be a symlink'
-run install -dm700 "$keyhome"
-gpg=(gpg --no-options --homedir "$keyhome" --batch --yes)
-uid='Anland Arch local packages <anland-local@localhost>'
-if ! "${gpg[@]}" --list-secret-keys "$uid" >/dev/null 2>&1; then
-    run "${gpg[@]}" --pinentry-mode loopback --passphrase '' --quick-generate-key "$uid" ed25519 sign 0
-fi
-fingerprint=$("${gpg[@]}" --with-colons --list-secret-keys "$uid" | awk -F: '$1 == "fpr" {print $10; exit}') || die 'signing fingerprint'
-[[ $fingerprint =~ ^[0-9A-F]{40}$ ]] || die 'invalid signing fingerprint'
-run "${gpg[@]}" --armor --output "$STAGING/anland-local-signing-key.asc" --export "$fingerprint"
+# Like GNOME/KDE, report exact package paths and hashes in the build log.
+# Do not publish manifests, signing keys, signatures or build-input records.
 for file in "${packages[@]}"; do
-    run "${gpg[@]}" --local-user "$fingerprint" --detach-sign --output "$STAGING/$file.sig" "$STAGING/$file"
-    run "${gpg[@]}" --verify "$STAGING/$file.sig" "$STAGING/$file"
+    run sha256sum "$ARTIFACTS/$file"
 done
-_publish
 if [[ ${ANLAND_INSTALL:-0} == 1 ]]; then
     printf '\nInstalling the standard Hyprland SDK/runtime, hyprpm, and patched xorg-xwayland; no session/service restart.\n'
-    run sudo pacman-key --add "$ARTIFACTS/anland-local-signing-key.asc"
-    run sudo pacman-key --lsign-key "$fingerprint"
     paths=(); for file in "${packages[@]}"; do paths+=("$ARTIFACTS/$file"); done
     run sudo pacman --noconfirm -U "${paths[@]}"
 fi

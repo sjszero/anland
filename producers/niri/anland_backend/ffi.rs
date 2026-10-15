@@ -14,6 +14,7 @@ pub const INPUT_TYPE_POINTER_MOTION: u32 = 3;
 pub const INPUT_TYPE_POINTER_BUTTON: u32 = 4;
 pub const INPUT_TYPE_POINTER_AXIS: u32 = 5;
 pub const INPUT_TYPE_TOUCH_FRAME: u32 = 6;
+pub const INPUT_TYPE_DISPLAY_REFRESH: u32 = 7;
 pub const INPUT_TYPE_CLIPBOARD: u32 = 8;
 pub const INPUT_TYPE_TEXT_INPUT: u32 = 9;
 pub const INPUT_TYPE_RESOURCE: u32 = 11;
@@ -79,6 +80,7 @@ pub struct InputEvent {
     pub payload_size: u32,
     pub resource_type: u32,
     pub fd_count: u32,
+    pub refresh_mhz: u32,
 }
 extern "C" {
     pub fn anland_niri_open(endpoint: *const c_char) -> *mut Bridge;

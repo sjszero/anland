@@ -20,12 +20,17 @@ pub enum Message {
     },
 }
 pub trait InputTransport {
+    /// Already consumed header bytes, not merely an idle/readable socket.
+    fn header_pending(&self) -> bool;
     fn poll(&mut self) -> io::Result<Option<Input>>;
     fn payload(&mut self, bytes: &mut [u8]) -> io::Result<bool>;
     fn descriptors(&mut self) -> io::Result<Option<Vec<OwnedFd>>>;
     fn disconnect(&mut self);
 }
 impl InputTransport for Client {
+    fn header_pending(&self) -> bool {
+        self.input_header_pending()
+    }
     fn poll(&mut self) -> io::Result<Option<Input>> {
         self.poll_input()
     }
@@ -49,8 +54,10 @@ pub struct InputStream {
     deadline: Option<Instant>,
 }
 impl InputStream {
-    pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
+    /// Preserve the caller's target through both the public header read and
+    /// the announced payload. A genuinely idle poll must not pin an old target.
+    pub fn has_pending(&self, source: &impl InputTransport) -> bool {
+        self.pending.is_some() || source.header_pending()
     }
 
     /// Mandatory before reconnect/reopen: old payload belongs to the old session.
@@ -69,6 +76,25 @@ impl InputStream {
             source.disconnect();
         }
         result
+    }
+    /// Before any output/focus exists, learn the consumer's real refresh through
+    /// the same framed reader used by the running desktop. Unrouted user input
+    /// is discarded, including complete text/clipboard payloads; OwnedFd replies
+    /// close normally. Never replay these messages into a later focus/session.
+    /// Stop at refresh so subsequent live-session events stay in wire order.
+    pub fn bootstrap_refresh(
+        &mut self,
+        source: &mut impl InputTransport,
+        now: Instant,
+    ) -> io::Result<Option<u32>> {
+        for _ in 0..64 {
+            match self.next(source, now)? {
+                Some(Message::Refresh(refresh)) => return Ok(Some(refresh)),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(None)
     }
     fn step(
         &mut self,

@@ -5,13 +5,106 @@
 # auto verifies prepared inputs or builds missing ones; build selects Impeller+Ganesh/Vulkan/no-LTO/no-GTK.
 # prepared never compiles an engine; ANLAND_OFFLINE=1 requires synchronized source/dependency caches.
 # ANLAND_WITH_DE=0 omits desktop; JOBS=2 limits builds; ANLAND_INSTALL=1 explicitly installs packages.
-# Signed packages, packages.list and manifest.env are emitted; no desktop is started/restarted.
+# Only finished native packages are emitted; no desktop is started/restarted.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
     printf 'execute build.sh with bash; do not source it into an interactive shell\n' >&2
     return 1
 fi
 set -uo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+BUILD_SCRIPT=$(realpath -- "${BASH_SOURCE[0]}") || exit 1
+
+# Manage only the exact engine diff tracked by this build recipe.
+engine_patch_manager() {
+    python3 - "$@" <<'PY_ENGINE_PATCH_MANAGER'
+"""Apply only an exactly identified engine patch; never discard unrelated edits.
+
+An alternate Git index proves the complete expected diff. It is not a second
+worktree and never changes the real index, checkout revision, or user changes.
+"""
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('check', 'apply'))
+    parser.add_argument('--checkout', type=Path, required=True)
+    parser.add_argument('--patch', type=Path, required=True)
+    parser.add_argument('--state', type=Path, required=True)
+    args = parser.parse_args(argv)
+    checkout = args.checkout.resolve(strict=True)
+    patch = args.patch.resolve(strict=True)
+    args.state.mkdir(parents=True, exist_ok=True)
+    state = args.state.resolve(strict=True)
+    if not patch.read_bytes():
+        raise RuntimeError('empty engine patch')
+    applied = state / 'engine-local.applied.patch'
+
+    def git(*command, env=None, data=None):
+        result = subprocess.run(['git', '-C', str(checkout), *command],
+                                env=env, input=data, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError('git ' + ' '.join(command) + ': ' +
+                               result.stderr.decode(errors='replace').strip())
+        return result.stdout
+
+    if Path(git('rev-parse', '--show-toplevel').decode().strip()).resolve() != checkout:
+        raise RuntimeError('checkout must name the engine Git root')
+    git('diff', '--cached', '--quiet', '--ignore-submodules=all')
+    if git('ls-files', '--others', '--exclude-standard'):
+        raise RuntimeError('untracked engine changes preserved; refusing patch management')
+    actual = git('diff', '--no-ext-diff', '--binary', '--ignore-submodules=all', 'HEAD')
+
+    def patch_index(path):
+        fd, name = tempfile.mkstemp(prefix='engine-patch-index-', dir=state)
+        os.close(fd)
+        os.unlink(name)  # read-tree creates a valid index, not an empty file.
+        env = dict(os.environ, GIT_INDEX_FILE=name)
+        try:
+            git('read-tree', 'HEAD', env=env)
+            git('apply', '--cached', '--whitespace=error', str(path), env=env)
+            expected = git('diff', '--cached', '--no-ext-diff', '--binary',
+                           '--ignore-submodules=all', 'HEAD', env=env)
+            transition = git('diff', '--no-ext-diff', '--binary',
+                             '--ignore-submodules=all', env=env)
+            return expected, transition
+        finally:
+            Path(name).unlink(missing_ok=True)
+            Path(name + '.lock').unlink(missing_ok=True)
+
+    expected, transition = patch_index(patch)
+    if actual and actual != expected:
+        previous = patch_index(applied)[0] if applied.is_file() else None
+        if previous != actual:
+            raise RuntimeError('engine diff is not the exact current or recorded patch; unrelated edits preserved')
+    if args.action == 'check':
+        print('engine patch check: ' + ('managed' if actual else 'pristine'))
+        return
+    if actual != expected:
+        # transition describes new-index -> working-tree; reverse it to update
+        # the entire known old state atomically to the new desired patch.
+        git('apply', '--reverse', '--check', '--whitespace=error', '-', data=transition)
+        git('apply', '--reverse', '--whitespace=error', '-', data=transition)
+        if git('diff', '--no-ext-diff', '--binary', '--ignore-submodules=all', 'HEAD') != expected:
+            raise RuntimeError('engine patch post-apply diff mismatch')
+    saved = state / 'engine-local.applied.patch.new'
+    saved.write_bytes(patch.read_bytes())
+    os.replace(saved, applied)
+    print('engine patch apply: ' + ('already current (mtime preserved)' if actual == expected else 'updated'))
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except (OSError, RuntimeError) as error:
+        raise SystemExit('engine-patch: ' + str(error))
+PY_ENGINE_PATCH_MANAGER
+}
+SCRIPT_DIR="$(cd -- "${ANLAND_DENIAL_RECIPE_DIR:-$(dirname -- "${BASH_SOURCE[0]}")}" && pwd -P)" || exit 1
 ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)" || exit 1
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf 'denial-build: %s\n' "$*" >&2; exit 1; }
@@ -19,7 +112,7 @@ run() { "$@" || die "failed: $*"; }
 in_dir() { local dir=$1; shift; (cd -- "$dir" && "$@") || die "failed in $dir: $*"; }
 for argument in "$@"; do
     case $argument in
-        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,8p' "$BUILD_SCRIPT"; exit 0 ;;
         --noconfirm) ;; # Same calling convention as the other Arch_v5 entries.
         *) die "unknown argument: $argument (see --help)" ;;
     esac
@@ -37,18 +130,21 @@ case $ANLAND_ENGINE_MODE in auto|build|prepared) ;; *) die 'ANLAND_ENGINE_MODE m
 LOCKED_ENGINE_SHA256=$ENGINE_SHA256
 LOCKED_ENGINE_ICU_SHA256=$ENGINE_ICU_SHA256
 LOCKED_ENGINE_VERSION=$ENGINE_VERSION
-ENGINE_POLICY='release-arm64-impeller-ganesh-vulkan-nolto-no-gtk-v2'
+ENGINE_POLICY='release-arm64-impeller-ganesh-vulkan-nolto-no-gtk-shadow-opacity-v3'
 for flag in ANLAND_WITH_DE ANLAND_WITH_DEPS ANLAND_OFFLINE ANLAND_INSTALL; do
     [[ ${!flag} == 0 || ${!flag} == 1 ]] || die "$flag must be 0 or 1"
 done
 for number in JOBS ANLAND_PKGREL ANLAND_DE_PKGREL; do
     [[ ${!number} =~ ^[1-9][0-9]*$ ]] || die "$number must be a positive integer"
 done
-[[ $(id -u) != 0 && $(uname -m) == aarch64 ]] || die 'run as a normal user on Arch Linux ARM/aarch64'
+[[ $(id -u) != 0 && $(uname -m) == aarch64 ]] || die 'run as a normal aarch64 user'
+ANLAND_DENIAL_DISTRO=${ANLAND_DENIAL_DISTRO:-arch}
+case $ANLAND_DENIAL_DISTRO in arch|ubuntu2604) ;; *) die 'unsupported Denial distribution' ;; esac
 WORKDIR=$(realpath -m -- "${WORKDIR:-${DENIAL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/denial-anland}}") || die 'invalid WORKDIR'
 ARTIFACTS_DIR=$(realpath -m -- "${ARTIFACTS_DIR:-$WORKDIR/packages}") || die 'invalid ARTIFACTS_DIR'
 [[ $WORKDIR != / && $WORKDIR != "$HOME" && $WORKDIR != "$ROOT" && $WORKDIR != "$ROOT/"* ]] || die 'WORKDIR must be a separate cache directory'
 SOURCE="$WORKDIR/src/denial"
+ENGINE_PATCH="$WORKDIR/engine.pending.patch"
 BUILD="$WORKDIR/build"
 PUBLIC="$WORKDIR/public-overlay/anland"
 FLUTTER=$(realpath -m -- "${DENIAL_FLUTTER_ROOT:-$WORKDIR/engine/checkout}") || die 'invalid Flutter path'
@@ -88,16 +184,45 @@ checkout() {
     [[ $(git -C "$tree" rev-parse HEAD) == "$revision" ]] ||
         die "cached revision differs: $tree; move it aside before changing upstream version"
 }
+emit_adapter_patch() {
+    # One maintained adapter patch, two Git roots. Keep the selected blocks
+    # byte-for-byte intact so existing applied patches and engine receipts match.
+    python3 - "$SCRIPT_DIR/flutter-adapter.patch" "$1" <<'PY_ADAPTER_PATCH'
+from pathlib import Path
+import re
+import sys
+
+patch = Path(sys.argv[1]).read_bytes()
+target = sys.argv[2]
+if target not in ('denial', 'engine') or not patch.startswith(b'diff --git '):
+    raise SystemExit('invalid adapter patch or target')
+selected = []
+for block in re.split(rb'(?m)(?=^diff --git )', patch):
+    if not block:
+        continue
+    header = block.split(b'\n', 1)[0].split()
+    if len(header) != 4 or not header[2].startswith(b'a/') or not header[3].startswith(b'b/'):
+        raise SystemExit('unsupported adapter patch header')
+    engine = (header[2].startswith(b'a/engine/'), header[3].startswith(b'b/engine/'))
+    if engine[0] != engine[1]:
+        raise SystemExit('adapter patch crosses Denial and Flutter Git roots')
+    if engine[0] == (target == 'engine'):
+        selected.append(block)
+if not selected:
+    raise SystemExit('missing adapter patch section: ' + target)
+sys.stdout.buffer.write(b''.join(selected))
+PY_ADAPTER_PATCH
+}
 prepare_sources() {
     log 'Prepare Denial and Anland sources'
     checkout "$SOURCE" "$DENIAL_URL" "$DENIAL_REV" "${DENIAL_SOURCE:-$ROOT/../denial}"
     local patch="$WORKDIR/denial.pending.patch" previous="$WORKDIR/denial.applied.patch" file target
-    # Both component patches target the locked Denial tree, not Flutter upstream.
-    : > "$patch" || die 'cannot create pending source patch'
-    for file in flutter-adapter.patch denial.patch; do
-        [[ -s $SCRIPT_DIR/$file ]] || die "missing component patch: $file"
-        cat -- "$SCRIPT_DIR/$file" >> "$patch" || die "cannot read component patch: $file"
-    done
+    # Denial adapter first, then backend/performance hooks; Flutter engine hunks
+    # are extracted separately and applied only in the locked Flutter checkout.
+    emit_adapter_patch denial > "$patch" || die 'cannot extract Denial adapter patch'
+    [[ -s $SCRIPT_DIR/denial.patch ]] || die 'missing component patch: denial.patch'
+    cat -- "$SCRIPT_DIR/denial.patch" >> "$patch" || die 'cannot read denial.patch'
+    emit_adapter_patch engine > "$ENGINE_PATCH" || die 'cannot extract Flutter engine patch'
     if ! git -C "$SOURCE" apply --reverse --check "$patch" 2>/dev/null; then
         if ! git -C "$SOURCE" apply --check "$patch" 2>/dev/null; then
             [[ -f $previous ]] || die 'source has conflicting edits; refusing to overwrite them'
@@ -160,6 +285,12 @@ prepare_engine_sources() (
       [[ "$(git -C "$checkout" rev-parse --is-inside-work-tree 2>/dev/null || true)" \
         == true ]] \
         || fail "$label source is not a Git checkout: $checkout"
+      if [[ $label == Flutter ]]; then
+        engine_patch_manager check \
+          --checkout "$checkout" --patch "$ENGINE_PATCH" \
+          --state "$STATE_ROOT" || fail 'unmanaged Flutter source changes preserved'
+        return
+      fi
       git -C "$checkout" diff --quiet --ignore-submodules=all \
         || fail "$label source has tracked modifications: $checkout"
       git -C "$checkout" diff --cached --quiet --ignore-submodules=all \
@@ -179,19 +310,54 @@ prepare_engine_sources() (
       local repository="$2"
       local revision="$3"
       local destination="$4"
-      local actual_origin
+      local actual_origin checkout_root head_ref ref_status entries
+      local initial_checkout=0
 
       if [[ ! -e "$destination" ]]; then
         install -d -m 0700 "$(dirname -- "$destination")"
         git init --quiet "$destination"
         git -C "$destination" remote add origin "$repository"
       fi
-      require_clean_checkout "$label" "$destination"
-
-      actual_origin="$(git -C "$destination" remote get-url origin)"
+      checkout_root="$(git -C "$destination" rev-parse --show-toplevel)" \
+        || fail "$label source is not a Git worktree: $destination"
+      [[ "$checkout_root" == "$(realpath -e -- "$destination")" ]] \
+        || fail "$label cache must name the Git worktree root: $destination"
+      actual_origin="$(git -C "$destination" remote get-url origin)" \
+        || fail "$label cache has no origin: $destination"
       [[ "$actual_origin" == "$repository" ]] \
         || fail "$label cache origin is $actual_origin, expected $repository"
 
+      if git -C "$destination" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null; then
+        # Existing worktrees must be checked before any checkout can change them.
+        require_clean_checkout "$label" "$destination"
+        if [[ $label == Flutter ]] && ! git -C "$destination" diff --quiet; then
+          [[ $(git -C "$destination" rev-parse HEAD) == "$revision" ]] \
+            || fail 'managed Flutter patch cannot be moved to a different source lock'
+          return
+        fi
+      else
+        # git init (or an interrupted first fetch) has no HEAD to diff against.
+        # Only an empty unborn worktree may bootstrap; never repair broken refs.
+        head_ref="$(git -C "$destination" symbolic-ref --quiet --no-recurse HEAD)" \
+          || fail "$label cache has invalid HEAD; preserved: $destination"
+        [[ $head_ref == refs/heads/* ]] \
+          || fail "$label cache HEAD is not a branch; preserved: $destination"
+        ref_status=0
+        # Git >= 2.46: only status 2 means missing; malformed refs are errors.
+        git -C "$destination" show-ref --exists "$head_ref" 2>/dev/null || ref_status=$?
+        [[ $ref_status == 2 ]] \
+          || fail "$label cache is not verifiably unborn (Git >= 2.46 required); preserved: $destination"
+        entries="$(git -C "$destination" ls-files --stage)" \
+          || fail "$label cache index cannot be read; preserved: $destination"
+        [[ -z "$entries" ]] \
+          || fail "$label unborn cache has index entries; use a new cache directory: $destination"
+        # Include ignored files, hidden files and empty directories, unlike status.
+        entries="$(find "$checkout_root" -mindepth 1 -maxdepth 1 ! -name .git -printf x -quit)" \
+          || fail "$label cache cannot be inspected; preserved: $destination"
+        [[ -z "$entries" ]] \
+          || fail "$label unborn cache is not empty; use a new cache directory: $destination"
+        initial_checkout=1
+      fi
       if ! git -C "$destination" cat-file -e "$revision^{commit}" 2>/dev/null; then
         printf 'Fetching %s %s\n' "$label" "$revision"
         git -C "$destination" fetch \
@@ -204,6 +370,9 @@ prepare_engine_sources() (
       git -C "$destination" checkout --quiet --detach "$revision"
       [[ "$(git -C "$destination" rev-parse HEAD)" == "$revision" ]] \
         || fail "$label checkout did not reach $revision"
+      if [[ $initial_checkout == 1 ]]; then
+        require_clean_checkout "$label" "$destination"
+      fi
     }
 
     write_gclient_config() {
@@ -378,6 +547,9 @@ prepare_engine_sources() (
     }
     install -d -m 0700 "$CACHE_ROOT" "$STATE_ROOT" "$VPYTHON_CACHE_ROOT"
     prepare_checkout "$(file_sha256 "$SOURCE_LOCK")"
+    engine_patch_manager apply \
+        --checkout "$CHECKOUT" --patch "$ENGINE_PATCH" \
+        --state "$STATE_ROOT" || fail 'engine local patch application failed'
 )
 
 engine_inputs_ready() {
@@ -394,6 +566,7 @@ engine_policy_id() {
     {
         printf '%s\n' "$ENGINE_POLICY" "$FLUTTER_REV"
         sha256sum "$SOURCE/prebuilt/flutter-engine/SOURCE_LOCK.json" | awk '{print $1}'
+        sha256sum "$ENGINE_PATCH" | awk '{print $1}'
     } | sha256sum | awk '{print $1}'
 }
 engine_receipt_ready() {
@@ -402,7 +575,9 @@ engine_receipt_ready() {
     [[ -f $directory/.anland-engine.json && -f $directory/.anland-engine.SHA256SUMS ]] || return 1
     identity=$(engine_policy_id) || return 1
     jq -e --arg identity "$identity" --arg policy "$ENGINE_POLICY" \
+        --arg patch "$(sha256sum "$ENGINE_PATCH" | awk '{print $1}')" \
         '.schema == 1 and .identity == $identity and .policy == $policy
+         and .local_patch_sha256 == $patch
          and (.package_version | test("^[A-Za-z0-9.+_]+-[0-9]+$"))
          and (.engine_sha256 | test("^[0-9a-f]{64}$"))
          and (.icu_sha256 | test("^[0-9a-f]{64}$"))' \
@@ -415,6 +590,9 @@ engine_receipt_ready() {
 }
 legacy_engine_ready() {
     local directory=$1
+    # The locked legacy engine has the shadow-opacity bug. Do not silently
+    # reuse it when this recipe requires a locally patched engine.
+    [[ ! -s $ENGINE_PATCH ]] || return 1
     engine_inputs_ready "$directory" || return 1
     [[ $(sha256sum "$directory/libflutter_engine.so" | awk '{print $1}') == "$LOCKED_ENGINE_SHA256" ]] || return 1
     [[ $(sha256sum "$directory/icudtl.dat" | awk '{print $1}') == "$LOCKED_ENGINE_ICU_SHA256" ]]
@@ -446,8 +624,25 @@ build_flutter_engine() {
     [[ $ENGINE == "$engine_build/out/$target" && $target == denial_host_release_arm64_anland_ganesh ]] ||
         die 'compilation uses WORKDIR/engine/build/out/denial_host_release_arm64_anland_ganesh; prepared overrides are read-only'
     if [[ -f $ENGINE/libflutter_engine.so ]]; then
-        [[ -f $ENGINE/.anland-engine-policy && $(cat "$ENGINE/.anland-engine-policy") == "$identity" ]] ||
-            die 'unrecognized engine output preserved; use a separate WORKDIR rather than overwrite it'
+        [[ -f $ENGINE/.anland-engine-policy ]] ||
+            die 'unrecognized engine output preserved; build receipt is required'
+        if [[ $(cat "$ENGINE/.anland-engine-policy") != "$identity" ]]; then
+            # Permit only the exact recorded v2 cache to migrate to v3 in place;
+            # source and build files stay in the unique existing working copy.
+            local previous_identity
+            previous_identity=$({
+                printf '%s\n' 'release-arm64-impeller-ganesh-vulkan-nolto-no-gtk-v2' "$FLUTTER_REV"
+                sha256sum "$SOURCE/prebuilt/flutter-engine/SOURCE_LOCK.json" | awk '{print $1}'
+            } | sha256sum | awk '{print $1}') || die 'cannot identify previous engine policy'
+            [[ $(cat "$ENGINE/.anland-engine-policy") == "$previous_identity" ]] ||
+                die 'unrecognized engine policy preserved'
+            jq -e --arg previous "$previous_identity" --arg revision "$FLUTTER_REV" \
+                --arg hash "$(sha256sum "$ENGINE/libflutter_engine.so" | awk '{print $1}')" \
+                '.schema == 1 and .identity == $previous and .flutter_revision == $revision
+                 and .engine_sha256 == $hash' "$ENGINE/.anland-engine.json" >/dev/null ||
+                die 'unverified previous engine cache preserved'
+            in_dir "$ENGINE" sha256sum --check --status .anland-engine.SHA256SUMS
+        fi
     fi
     log 'Build locked Flutter release engine and AOT tools (Impeller+Ganesh/Vulkan/no-LTO/no-GTK)'
     # This pinned Flutter embedder still compiles the Ganesh Vulkan path. Slimpeller
@@ -486,7 +681,9 @@ build_flutter_engine() {
     check_elf "$ENGINE/libflutter_engine.so"
     ENGINE_SHA256=$(sha256sum "$ENGINE/libflutter_engine.so" | awk '{print $1}') || die 'cannot hash engine'
     ENGINE_ICU_SHA256=$(sha256sum "$ENGINE/icudtl.dat" | awk '{print $1}') || die 'cannot hash engine ICU'
-    ENGINE_VERSION="$FLUTTER_VERSION.r1.g${FLUTTER_REV:0:12}.vknolto.ganesh.h${ENGINE_SHA256:0:12}-1"
+    # Put a monotonic feature revision before the content hash: hash-only
+    # versions may sort lower than the previous unpatched engine in APT.
+    ENGINE_VERSION="$FLUTTER_VERSION.r1.g${FLUTTER_REV:0:12}.vknolto.ganesh.shadowopacity1.h${ENGINE_SHA256:0:12}-1"
     DENIAL_ENGINE_POLICY='Impeller + Ganesh GLES/Vulkan, no-LTO, no-GTK'
     # New policy uses a new package identity, never the locked legacy hash/version.
     in_dir "$ENGINE" sha256sum libflutter_engine.so icudtl.dat args.gn dart-sdk/bin/dart gen_snapshot font-subset impellerc \
@@ -494,7 +691,8 @@ build_flutter_engine() {
         > "$ENGINE/.anland-engine.SHA256SUMS" || die 'cannot record engine/tool checksums'
     run jq -n --arg identity "$identity" --arg policy "$ENGINE_POLICY" --arg version "$ENGINE_VERSION" \
         --arg engine "$ENGINE_SHA256" --arg icu "$ENGINE_ICU_SHA256" --arg flutter "$FLUTTER_REV" \
-        '{schema:1, identity:$identity, policy:$policy, package_version:$version, engine_sha256:$engine, icu_sha256:$icu, flutter_revision:$flutter}' \
+        --arg patch "$(sha256sum "$ENGINE_PATCH" | awk '{print $1}')" \
+        '{schema:1, identity:$identity, policy:$policy, package_version:$version, engine_sha256:$engine, icu_sha256:$icu, flutter_revision:$flutter, local_patch_sha256:$patch}' \
         > "$ENGINE/.anland-engine.json" || die 'cannot record engine provenance'
     engine_receipt_ready "$ENGINE" || die 'new engine cache failed verification'
 }
@@ -798,54 +996,53 @@ build_desktop() {
         --flutter-root "$FLUTTER_EMBEDDER" --flutter-revision "$FLUTTER_REV" --engine-root "$(dirname -- "$(dirname -- "$ENGINE")")" \
         --engine-source-root "$FLUTTER/engine" --engine-target "${ENGINE##*/}" --platform linux-arm64 --output "$BUILD/plugin-build-kit"
 }
-prepare_signing() {
-    # Signing identity belongs to this machine/user, not a disposable build cache.
-    local keyhome="${XDG_DATA_HOME:-$HOME/.local/share}/denial-anland/signing"
-    local uid='Denial Anland local package signing <denial-local@localhost>'
-    [[ ! -L $keyhome ]] || die 'signing key directory must not be a symlink'
-    run install -dm700 "$keyhome"
-    gpg=(gpg --no-options --homedir "$keyhome" --batch --yes)
-    if ! "${gpg[@]}" --list-secret-keys "$uid" >/dev/null 2>&1; then
-        log 'Create persistent local signing key (not an upstream release key)'
-        run "${gpg[@]}" --pinentry-mode loopback --passphrase '' --quick-generate-key "$uid" ed25519 sign 0
-    fi
-    signing_fingerprint=$("${gpg[@]}" --with-colons --list-secret-keys "$uid" | awk -F: '$1 == "fpr" {print $10; exit}') || die 'cannot read signing key'
-    [[ $signing_fingerprint =~ ^[0-9A-F]{40}$ ]] || die 'invalid local signing fingerprint'
-    run "${gpg[@]}" --armor --output "$ARTIFACTS_DIR/denial-local-signing-key.asc" --export "$signing_fingerprint"
-    log "Local signing key: $signing_fingerprint"
-}
-sign_file() (
-    local file=$1 temporary
-    temporary=$(mktemp "$file.sig.XXXXXX") || die "cannot stage signature: $file"
-    trap 'rm -f -- "$temporary"' EXIT
-    run "${gpg[@]}" --local-user "$signing_fingerprint" --detach-sign --output "$temporary" -- "$file"
-    run "${gpg[@]}" --verify "$temporary" "$file"
-    run chmod 644 "$temporary"
-    run mv -f -- "$temporary" "$file.sig"
-)
-publish_build_metadata() {
-    local package source_commit build_time
-    source_commit=$(git -C "$ROOT" rev-parse HEAD) || die 'cannot identify Anland source commit'
-    build_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || die 'cannot identify build time'
-    : > "$ARTIFACTS_DIR/packages.list" || die 'cannot write package list'
-    for package in "${packages[@]}"; do
-        printf '%s\n' "${package##*/}" >> "$ARTIFACTS_DIR/packages.list" || die 'cannot record package name'
-    done
-    {
-        printf 'format=1\ntarget=arch\narchitecture=aarch64\nsource_commit=%s\ndenial_commit=%s\nflutter_commit=%s\n' "$source_commit" "$DENIAL_REV" "$FLUTTER_REV"
-        printf 'denial_version=%s\nengine_version=%s\nengine_sha256=%s\nengine_icu_sha256=%s\n' "$DENIAL_VERSION" "$ENGINE_VERSION" "$ENGINE_SHA256" "$ENGINE_ICU_SHA256"
-        printf 'with_desktop=%s\nbuild_time=%s\npackage_list=packages.list\n' "$ANLAND_WITH_DE" "$build_time"
-    } > "$ARTIFACTS_DIR/manifest.env" || die 'cannot write build manifest'
+record_package_outputs() {
+    # Workflow version and verification evidence stay in the build cache/log.
+    # No signatures, checksum lists, keys or build manifests enter artifacts.
     printf '%s\n' "${DENIAL_VERSION//-/.}" > "$WORKDIR/.denial-version" || die 'cannot record workflow version'
-    sign_file "$ARTIFACTS_DIR/packages.list" || die 'cannot sign package list'
-    sign_file "$ARTIFACTS_DIR/manifest.env" || die 'cannot sign build manifest'
+    log 'Verified native packages (SHA256 recorded in build log only)'
+    local package
+    for package in "${packages[@]}"; do
+        [[ -s $package ]] || die "missing package: $package"
+    done
+    run sha256sum "${packages[@]}"
+}
+
+publish_native_package() {
+    local source=$1 destination=$2
+    if [[ -e $destination.sig || -L $destination.sig ]]; then
+        [[ -f $destination ]] && cmp -s -- "$source" "$destination" ||
+            die "existing signature preserved: $destination.sig; choose a clean ARTIFACTS_DIR before replacing this package"
+    fi
+    run cp -p -- "$source" "$destination"
+}
+
+collect_arch_packages() {
+    local stage=$1 marker=$2 listed package destination package_name collected=0
+    listed=$(in_dir "$stage" makepkg --packagelist) || die 'cannot obtain native package paths'
+    [[ -n $listed ]] || die 'makepkg returned an empty package list'
+    while IFS= read -r package; do
+        [[ -n $package && -s $package && $package -nt $marker ]] ||
+            die "package was not produced by this build: $package"
+        run bsdtar -tf "$package" >/dev/null
+        package_name=$(bsdtar -xOf "$package" .PKGINFO | sed -n 's/^pkgname = //p') ||
+            die "cannot read package identity: $package"
+        [[ -n $package_name && $package_name != *$'\n'* ]] || die "invalid package identity: $package"
+        [[ $package_name != *-debug ]] || continue
+        destination="$ARTIFACTS_DIR/${package##*/}"
+        publish_native_package "$package" "$destination"
+        packages+=("$destination")
+        ((collected += 1))
+    done <<< "$listed"
+    ((collected > 0)) || die 'makepkg produced no runtime packages'
+    run rm -f -- "$marker"
 }
 
 # Same pinned recipe and kgsl/turnip fixes as producers/kde/Arch_v5.
 build_xwayland() {
     log 'Build patched Xwayland 24.1.13 (no installation)'
     local stage="$WORKDIR/xwayland-package" sources="$WORKDIR/xwayland-sources"
-    local tarball=${XWAYLAND_TARBALL:-} candidate package
+    local tarball=${XWAYLAND_TARBALL:-} candidate marker
     run mkdir -p "$stage" "$sources"
     run install -m644 "$SCRIPT_DIR/xorg-xwayland.PKGBUILD" "$stage/PKGBUILD"
     run install -m644 "${XWAYLAND_PATCH:-$SCRIPT_DIR/xwayland.patch}" "$stage/xwayland.patch"
@@ -860,17 +1057,15 @@ build_xwayland() {
     fi
     [[ $ANLAND_OFFLINE == 0 || -f $sources/xwayland-24.1.13.tar.xz ]] ||
         die 'offline Xwayland source missing (set XWAYLAND_TARBALL)'
+    marker=$(mktemp "$WORKDIR/.xwayland-package-start.XXXXXX") || die 'cannot mark Xwayland build start'
     in_dir "$stage" env SRCDEST="$sources" BUILDDIR="$WORKDIR/xwayland-build" JOBS="$JOBS" \
         makepkg --nodeps --force --cleanbuild --noconfirm --nosign
-    package=$(in_dir "$stage" makepkg --packagelist) || die 'cannot obtain Xwayland package path'
-    [[ -s $package ]] || die "Xwayland package not produced: $package"
-    run rm -f -- "$package.sig"
-    packages+=("$package")
+    collect_arch_packages "$stage" "$marker"
 }
 
 package_all() {
     log 'Build Arch packages (no installation)'
-    local pack="$WORKDIR/package" kind package file runtime app
+    local pack="$WORKDIR/package" kind package file runtime app marker native_packages
     local package_version=${DENIAL_VERSION//-/.}
 
     local kinds=(engine wm) packages=()
@@ -887,16 +1082,17 @@ package_all() {
         "Denial private ARM64 Flutter embedder engine ($DENIAL_ENGINE_POLICY)" \
         >> "$pack/PKGBUILD" || die 'cannot record cached engine description'
     export DENIAL_SOURCE_TREE="$SOURCE" DENIAL_BUILD_DIR="$BUILD" DENIAL_ENGINE_DIR="$ENGINE"
-    export PKGDEST="$ARTIFACTS_DIR" BUILDDIR="$pack/build" PKGEXT=.pkg.tar.xz XZ_OPT="-T$JOBS"
+    # makepkg removes an existing same-name .sig even with --nosign. Build in
+    # a fresh cache directory and publish only the verified native packages.
+    native_packages=$(mktemp -d "$WORKDIR/package-output.XXXXXX") || die 'cannot stage native packages'
+    export PKGDEST="$native_packages" BUILDDIR="$pack/build" PKGEXT=.pkg.tar.xz XZ_OPT="-T$JOBS"
     build_xwayland
     for kind in "${kinds[@]}"; do
         export DENIAL_PACKAGE_KIND=$kind
-        # Sign all verified outputs together with the local build identity.
+        # Package the verified payload without local release signatures.
+        marker=$(mktemp "$WORKDIR/.denial-package-start.XXXXXX") || die 'cannot mark package build start'
         in_dir "$pack" makepkg --nodeps --force --noconfirm --nosign
-        package=$(in_dir "$pack" makepkg --packagelist) || die 'cannot obtain package path'
-        [[ -f $package ]] || die "package not produced: $package"
-        run rm -f -- "$package.sig" # An old signature cannot authenticate rebuilt bytes.
-        packages+=("$package")
+        collect_arch_packages "$pack" "$marker"
     done
     log 'Check packaged files, runtime links and help/bundle commands; no graphical session'
     run rm -rf -- "$BUILD/package-check"
@@ -950,28 +1146,11 @@ package_all() {
             [[ -r $BUILD/package-check/$file ]] || die "missing desktop integration: $file"
         done
     fi
-    publish_build_metadata
-    log 'Sign all packages and checksum manifest'
-    local checksums=(denial-local-signing-key.asc packages.list packages.list.sig manifest.env manifest.env.sig)
-    for package in "${packages[@]}"; do
-        sign_file "$package" || die "cannot sign package: $package"
-        checksums+=("${package##*/}" "${package##*/}.sig")
-    done
-    run rm -f -- "$ARTIFACTS_DIR/SHA256SUMS.sig"
-    in_dir "$ARTIFACTS_DIR" sha256sum "${checksums[@]}" > "$ARTIFACTS_DIR/SHA256SUMS"
-    in_dir "$ARTIFACTS_DIR" sha256sum -c SHA256SUMS
-    sign_file "$ARTIFACTS_DIR/SHA256SUMS" || die 'cannot sign checksum manifest'
+    record_package_outputs
     if [[ $ANLAND_INSTALL == 1 ]]; then
-        log "Trust this local build key in pacman: $signing_fingerprint"
-        run sudo pacman-key --init
-        run sudo pacman-key --add "$ARTIFACTS_DIR/denial-local-signing-key.asc"
-        run sudo pacman-key --lsign-key "$signing_fingerprint"
         run sudo pacman -U --needed "${packages[@]}"
-    else
-        printf 'First use on another machine: sudo pacman-key --add %q && sudo pacman-key --lsign-key %q\n' \
-            "$ARTIFACTS_DIR/denial-local-signing-key.asc" "$signing_fingerprint"
     fi
-    log "Done. Signed packages: $ARTIFACTS_DIR (DE=$ANLAND_WITH_DE, installed=$ANLAND_INSTALL; no graphical test)"
+    log "Done. Native packages: $ARTIFACTS_DIR (DE=$ANLAND_WITH_DE, installed=$ANLAND_INSTALL; no graphical test)"
 }
 
 # Declare host tools and runtime libraries explicitly: prepared-engine builds
@@ -990,13 +1169,20 @@ build_deps+=(meson xorgproto xtrans libxkbfile xorg-font-util wayland-protocols 
 if [[ $ANLAND_WITH_DE == 1 ]]; then
     build_deps+=(xdg-utils zenity xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr)
 fi
-if [[ $ANLAND_WITH_DEPS == 1 ]]; then
-    [[ $ANLAND_OFFLINE == 0 ]] || die 'dependency installation conflicts with ANLAND_OFFLINE=1'
-    run sudo pacman -S --needed --noconfirm "${build_deps[@]}"
+if [[ $ANLAND_DENIAL_DISTRO == ubuntu2604 ]]; then
+    # Ubuntu reuses this exact engine/AOT implementation and supplies only native packaging.
+    source "$SCRIPT_DIR/build.sh" || die 'cannot load Ubuntu package functions'
+    ubuntu_preflight
+    ubuntu_dependencies
+else
+    if [[ $ANLAND_WITH_DEPS == 1 ]]; then
+        [[ $ANLAND_OFFLINE == 0 ]] || die 'dependency installation conflicts with ANLAND_OFFLINE=1'
+        run sudo pacman -S --needed --noconfirm "${build_deps[@]}"
+    fi
+    missing=$(pacman -T "${build_deps[@]}") || die "missing dependencies: $missing (use ANLAND_WITH_DEPS=1)"
 fi
-missing=$(pacman -T "${build_deps[@]}") || die "missing dependencies: $missing (use ANLAND_WITH_DEPS=1)"
-prepare_signing
 prepare_sources
+if [[ $ANLAND_DENIAL_DISTRO == ubuntu2604 ]]; then prepare_ubuntu_rust; fi
 prepare_engine
 prepare_flutter
 fetch_dependencies

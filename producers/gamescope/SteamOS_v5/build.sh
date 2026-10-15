@@ -98,6 +98,8 @@ done
 # Follow the canonical shared-source links when preparing makepkg input.
 tar -chf "$STAGE/anland-overlay.tar" --exclude='run_*' --exclude='*_test.*' -C "$BACKEND" .
 PACKAGES="$HERE/artifacts"
+BUILD_PACKAGES="$RUN/packages"
+mkdir -p "$BUILD_PACKAGES"
 packages=()
 build_marker="$RUN/.build-start"
 touch "$build_marker"
@@ -142,19 +144,30 @@ if text.count(old) != 1:
 recipe.write_text(text.replace(old, sums))
 PY
 collect_packages() {
-    local stage="$1" list="$2"
-    (cd "$stage" && PKGDEST="$PACKAGES" makepkg --packagelist) > "$list"
+    local stage="$1" list="$2" pkg metadata name arch
+    local before=${#packages[@]}
+    (cd "$stage" && PKGDEST="$BUILD_PACKAGES" makepkg --packagelist) > "$list" || return 1
     local -a outputs=()
     mapfile -t outputs < "$list"
     [[ ${#outputs[@]} -gt 0 ]] || { echo 'Empty package list' >&2; return 1; }
-    packages+=("${outputs[@]}")
+    for pkg in "${outputs[@]}"; do
+        [[ -s "$pkg" && "$pkg" -nt "$build_marker" ]] || { echo "Missing or stale package: $pkg" >&2; return 1; }
+        metadata=$(bsdtar -xOf "$pkg" .PKGINFO) || return 1
+        name=$(awk -F' = ' '$1 == "pkgname" {print $2; exit}' <<<"$metadata")
+        [[ -n "$name" ]] || { echo "Missing package name: $pkg" >&2; return 1; }
+        case "$name" in *-debug|*-dbg|*-dbgsym) continue ;; esac
+        arch=$(awk -F' = ' '$1 == "arch" {print $2; exit}' <<<"$metadata")
+        [[ "$arch" == aarch64 || "$arch" == any ]] || { echo "Wrong package architecture: $pkg" >&2; return 1; }
+        packages+=("$pkg")
+    done
+    [[ ${#packages[@]} -gt "$before" ]] || { echo 'No binary packages returned' >&2; return 1; }
 }
 # Build Gamescope first, so an unavailable release download fails before Xwayland work.
 (
     cd "$STAGE"
     # SRCDEST is the persistent shallow cache; --holdver stops makepkg from
     # "updating" those single-commit repos back into full-history fetches.
-    export SRCDEST="$DEPCACHE" PKGDEST="$PACKAGES"
+    export SRCDEST="$DEPCACHE" PKGDEST="$BUILD_PACKAGES"
     makepkg --force --cleanbuild --syncdeps --needed --holdver "$@"
 )
 collect_packages "$STAGE" "$RUN/.gamescope-packagelist"
@@ -165,21 +178,24 @@ if [[ "$BUILD_XWAYLAND" == 1 ]]; then
     cp "$XPORT/xwayland.patch" "$XSTAGE/xwayland.patch"
     (
         cd "$XSTAGE"
-        export SRCDEST="$RUN/xwayland-sources" PKGDEST="$PACKAGES"
+        export SRCDEST="$RUN/xwayland-sources" PKGDEST="$BUILD_PACKAGES"
         makepkg --force --cleanbuild --syncdeps --needed --nocheck "$@"
     )
     collect_packages "$XSTAGE" "$RUN/.xwayland-packagelist"
 fi
+delivered=()
 for pkg in "${packages[@]}"; do
-    [[ -s "$pkg" && "$pkg" -nt "$build_marker" ]] || { echo "Missing or stale package: $pkg" >&2; exit 1; }
     bsdtar -tf "$pkg" >/dev/null
-    sha256sum "$pkg"
+    destination="$PACKAGES/${pkg##*/}"
+    if [[ -e "$destination.sig" || -L "$destination.sig" ]]; then
+        cmp -s "$pkg" "$destination" || { echo "Existing signature preserved; move $destination.sig aside before replacing its package" >&2; exit 1; }
+    fi
+    cp -p "$pkg" "$destination"
+    delivered+=("$destination")
 done
-names=()
-for pkg in "${packages[@]}"; do names+=("${pkg##*/}"); done
-(cd "$PACKAGES" && sha256sum "${names[@]}" > SHA256SUMS && sha256sum -c SHA256SUMS)
+sha256sum "${delivered[@]}"
 if [[ "$INSTALL" == 1 ]]; then
-    sudo pacman -U "${packages[@]}"
+    sudo pacman -U "${delivered[@]}"
 fi
 printf 'Build finished (INSTALL=%s). Packages: %s\n' "$INSTALL" "$PACKAGES"
 # Keep failed trees for diagnosis; remove disposable sources/objects only after success.

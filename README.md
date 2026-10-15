@@ -12,24 +12,21 @@ The Linux compositor still manages windows, composes the complete desktop and ha
 
 This README describes the current v5 source tree, including Denial. Directory presence means a port recipe exists, **not** that every distribution, GPU or feature has passed build and graphical validation. Public headers, source locks and executable script behavior take precedence over examples and historical documentation.
 
+## Start here
+
+A working setup needs an Android daemon and consumer, **one** Linux compositor/producer, and a GPU stack that can import the shared buffers. You do not need to build every compositor in this repository.
+
+| Goal | Read next |
+|---|---|
+| Install and use an Android-hosted desktop | [User guide](doc/UserManual/anland_guide.md), then [Android settings](doc/UserManual/anland_settings_guide.md) |
+| Build a particular Linux desktop | Choose a matching [compositor/distribution entry](#section-3), read [build boundaries](#section-6), then [startup and validation](#section-8) |
+| Develop or diagnose a backend | Start with the [frame contract](#section-4); use the [API map](#section-13) and [troubleshooting table](#section-15) as references |
+
 ## Contents
 
-- [1. Repository map](#section-1)
-- [2. Architecture and ownership](#section-2)
-- [3. Compositor and distribution index](#section-3)
-- [4. Public API and frame contract](#section-4)
-- [5. Transport, input and media](#section-5)
-- [6. Building and packaging](#section-6)
-- [7. Porting a compositor](#section-7)
-- [8. Startup and validation](#section-8)
-- [9. Wire protocol reference](#section-9)
-- [10. Variable payloads, queues and service resources](#section-10)
-- [11. Handshake and recovery state machines](#section-11)
-- [12. Per-frame transport versus scene feedback](#section-12)
-- [13. API map and return contracts](#section-13)
-- [14. Audio engine details](#section-14)
-- [15. Migration, reproducibility and diagnosis](#section-15)
-- [16. History and license](#section-16)
+- Overview and use: [repository](#section-1) · [architecture](#section-2) · [compositor index](#section-3) · [build/package](#section-6) · [startup/validation](#section-8)
+- Backend development: [frame contract](#section-4) · [input/media](#section-5) · [porting](#section-7) · [migration/diagnosis](#section-15)
+- Detailed reference: [wire protocol](#section-9) · [payloads/resources](#section-10) · [recovery](#section-11) · [frame feedback](#section-12) · [APIs](#section-13) · [audio](#section-14) · [history/license](#section-16)
 
 <a id="section-1"></a>
 
@@ -81,10 +78,10 @@ Paths below are relative to `producers/<name>/`; directory names are case-sensit
 | [Gamescope](producers/gamescope/) | `anland_backend/` (C session wrapper, C++/Vulkan) | `SteamOS_v5` |
 | [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/` (GObject/Cogl/Clutter) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
 | [KDE / KWin](producers/kde/) | `anland_backend/` (Qt output/EGL/input) | `Arch_v5`, `Debian13_v5`, `Fedora43_v5`, `SteamOS_v5`, `ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5` |
-| [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Arch_v5`, `Debian13_v5` |
-| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5` |
-| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5` |
+| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5`, `Ubuntu2604_v5` |
+| [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
+| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5`, `Ubuntu2604_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) contains an additional Xwayland recipe, not a WM backend. Building Mutter or KWin alone does not deliver the complete GNOME or Plasma session; native shells, portals, agents and session data remain necessary. Niri's X11 integration also requires checking xwayland-satellite and its startup relationship.
 
@@ -146,6 +143,12 @@ Historical v1/v2/v3 compatibility claims do not establish v5 interoperability. B
 
 Use the `build.sh` and package recipe in the selected distribution entry. Read its accepted parameters first: there is no universal stage CLI or dependency-install switch. Prefer ordinary-user builds, persistent caches outside the repository, locked source revisions and native packages.
 
+| What you need | Build entry | What it does not produce |
+|---|---|---|
+| Android application | Gradle in `consumers/anland_v5/android_consumer/`; see the [Android workflow](.github/workflows/build.yml) | A Linux compositor package |
+| Daemon and C libraries | Root `CMakeLists.txt`; Android and Linux select different targets/dependencies | The APK or all WM ports |
+| A Linux compositor and its integration | The chosen `producers/<wm>/<distribution>/` recipe | Proof that the installed desktop or GPU has been validated |
+
 **Build, installation and graphical startup are separate operations.** Build entries generally gate final installation with `ANLAND_INSTALL=1` (some also support `INSTALL`), but dependency preparation may still use sudo. Review the actual script before running it. Installation can replace distribution WM/Xwayland packages; it is not permission to restart a running desktop or audio service.
 
 Examples, run from the repository root in the matching Linux environment:
@@ -163,6 +166,12 @@ JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
   bash producers/denial/Arch_v5/build.sh --noconfirm
 ```
 
+### Ubuntu 26.04 ARM64 entries
+
+Denial, Hyprland, Mango and Niri have `Ubuntu2604_v5/build.sh`. Use `ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Ubuntu2604_v5/build.sh`; native `.deb` files go to that entry's `artifacts/` (override `ARTIFACTS_DIR`). These entries collect only native installation packages and print package SHA256 hashes in the build log; build manifests, signing keys and checksum files are not added to the delivery. The existing backend/patch source baseline is retained: Hyprland 0.55.2 uses its locked stack instead of Ubuntu's older Hyprland, Mango builds newer graphics dependencies privately, Denial reuses the inline no-GTK Flutter tool adaptation and locked Rust toolchain, and Niri includes pinned xwayland-satellite. Xwayland source locks/build steps and the same non-SteamOS patch stay within each WM recipe. Full cloud builds and graphical validation are still pending.
+
+Package collection follows native build outputs: `makepkg --packagelist` on Arch; the current `.changes` file for `dpkg-buildpackage`; explicit package paths and metadata for direct Debian packaging. Fresh-build checks prevent old cached packages from being reported as new results. Source locks and internal build records stay in the cache, and CI build logs are kept separate from downloadable installation packages.
+
 ### Public-library linkage
 
 Use one public implementation per product: dynamic `display-producer` through pkg-config, canonical public sources built into the compositor, or a narrow C bridge used from Rust. `producer.cmake` centralizes sources and dependencies; `presentation.cmake` supplies presentation objects; `display-producer.pc.in` supplies discovery metadata. Do not both embed and dynamically link duplicate implementations. Generate self-contained overlays from the canonical tree, resolving repository symlinks for packaging; do not maintain copied transport forks. Verify the actual APIs by compile/link tests, not version strings alone.
@@ -171,11 +180,11 @@ Use one public implementation per product: dynamic `display-producer` through pk
 
 - **Hyprland / Debian 13:** lockfile covers the dependency stack and plugin ABI; public producer is built into Aquamarine. Build artifacts go to `producers/hyprland/Debian13_v5/artifacts/`. Default `JOBS=4`; `nocheck nodwz` means package success is **not** proof of tests passing.
 - **Mango / Debian 13:** private-prefix shared producer, wlroots and SceneFX; artifacts go to `producers/mango/Debian13_v5/artifacts/`. Default `JOBS=2`.
-- **Denial / Arch:** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) pins Denial `0.5.0-anland5` and Flutter `3.47.5` revisions; Cargo/pub locks cover transitive dependencies. Cache defaults to `$XDG_CACHE_HOME/denial-anland` or `$HOME/.cache/denial-anland`; output defaults to `$WORKDIR/packages`, overridable with `ARTIFACTS_DIR`. `ANLAND_ENGINE_MODE=auto|build|prepared`, `ANLAND_OFFLINE=1` and `ANLAND_WITH_DE=0` select engine/cache/desktop behavior. Outputs include the engine, `denial`, optional `denial-desktop`, patched Xwayland, local signatures, `packages.list`, `manifest.env` and `SHA256SUMS`. Review/trust the local signing key before installation; it is not an upstream release key.
+- **Denial / Arch:** [dependencies.lock](producers/denial/Arch_v5/dependencies.lock) pins Denial `0.5.0-anland5` and Flutter `3.47.5` revisions; Cargo/pub locks cover transitive dependencies. Cache defaults to `$XDG_CACHE_HOME/denial-anland` or `$HOME/.cache/denial-anland`; output defaults to `$WORKDIR/packages`, overridable with `ARTIFACTS_DIR`. `ANLAND_ENGINE_MODE=auto|build|prepared`, `ANLAND_OFFLINE=1` and `ANLAND_WITH_DE=0` select engine/cache/desktop behavior. Outputs are unsigned native packages for the engine, `denial`, optional `denial-desktop` and patched Xwayland. The script records package SHA256 hashes in the build log; it does not generate release signatures, `packages.list`, `manifest.env` or `SHA256SUMS` in the artifact directory. Keep the log with the packages; a hash is not a release signature.
 
 ### Xwayland
 
-Denial's Arch entry now uses the same Xwayland `24.1.13` recipe/patch as KDE Arch, with `XWAYLAND_TARBALL` for a local archive and `XWAYLAND_PATCH` for an override. Its output participates in Denial's package list, signatures, checksums and optional installation. Debian Hyprland/Mango use their own locked Xwayland source recipes; do not apply one distribution's patch to arbitrary versions.
+Denial's Arch entry uses the same Xwayland `24.1.13` recipe/patch as KDE Arch, with `XWAYLAND_TARBALL` for a local archive and `XWAYLAND_PATCH` for an override. The package is included in Denial's artifact checks, logged SHA256 hashes and optional installation; no signature is generated. Debian Hyprland/Mango use their own locked Xwayland source recipes; do not apply one distribution's patch to arbitrary versions.
 
 The kgsl/Turnip compatibility patch permits implicit-modifier dma-bufs, avoids waiting for v4 feedback on a v3-only compositor, and allows a render-device fallback (`XWAYLAND_GBM_DEVICE`). The `1274 -> LINEAR` workaround is specific to a known freedreno/kgsl path, not permission to guess any unknown modifier. New build designs should isolate Xwayland from WM-private library/toolchain variables. Installing a new package does not restart a live Xwayland process.
 
@@ -200,6 +209,7 @@ Use the chosen `startup.sh` or installed session entry only after reviewing its 
 
 A complete validation record distinguishes:
 
+- **Static review:** source, API contracts, patches and script inspection. This does not establish compilation, link compatibility or runtime correctness.
 - **Contract tests:** first target versus presentation; accepted/ACK/released states; backpressure; failed commits and fences; old generations; FD ownership; resize/reconnect and watcher reuse; bounded clipboard/text/resource handling.
 - **Build/package checks:** real compiler/linker exit status, explicit log conclusion, architecture, contents, dependencies, symbols and RPATH. Compare hashes with previous artifacts to catch stale incremental objects; timestamps alone are insufficient.
 - **Authorized graphical tests:** first frame and sustained redraw, windows/cursor/effects, input and declared media, consumer/daemon recovery, rotation/resize, Wayland and X11 clients.
@@ -339,7 +349,7 @@ A Unix stream may split a header, payload or ancillary data across reads. One `r
 
 ### 10.2 Bounded clipboard export
 
-The device facade accepts payloads up to **1 MiB** (`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`); the asynchronous output queue is bounded to **2 MiB** in total. These are implementation limits, not negotiated wire features.
+The device facade accepts payloads up to **1 MiB** (`ANLAND_DEVICE_MAX_PAYLOAD_SIZE`); the asynchronous output queue is bounded to **2 MiB** in total. Check announced input lengths **before allocating memory or narrowing integer types**, not only when reading the payload. An oversized message must end the session rather than leave its body to be parsed as the next event. These are implementation limits, not negotiated wire features.
 
 ```c
 /* Illustrative event-loop pattern; not a standalone compositor. */
@@ -369,7 +379,7 @@ app stops / session lost -> stop recording and release resources
 
 The consumer library registers `service_info` allocation/free callbacks through `allocate_services()` and handles `OUTPUT_TYPE_RESOURCES_REQUEST` through `handle_resource_request()`. `service_info.userdata` identifies the owning connection rather than requiring global state.
 
-`anland_camera_start()` starts the engine; `set_resources()` **takes ownership** of the control and stream FDs. The control socket is first, followed by one stream socket per camera. Nodes are dynamic: `clear()` stops capture, removes nodes and closes adopted FDs; `stop()` also shuts down the engine. The current camera header describes I420 frames and demand-driven recording. This differs from persistent audio nodes and is only usable where the WM actually wires the bridge.
+`anland_camera_start()` starts the engine; `set_resources()` **takes ownership** of the control and stream FDs. The control socket is first, followed by one stream socket per camera. `clear()` closes session resources but **keeps virtual nodes alive**, emitting blank frames until fresh resources arrive. A stream HUP/EOF or fatal read error detaches that stream's watcher, FD and mapping and invalidates its old frame; it does not keep replaying the last image. A replacement resource set reconciles the camera count, and `stop()` destroys the nodes and engine. Recording is demand-driven and available only where the WM actually wires the bridge.
 
 <a id="section-11"></a>
 
@@ -578,10 +588,14 @@ Validate packages through their native metadata and extraction, not just filenam
 | No daemon connection | Actual selected endpoint, mount/permissions, daemon log/control health | Guessing from a different port's default socket |
 | Daemon works but no output | Consumer arrival, screen-info stage, five-FD pickup, metadata count and target readiness | Inventing a mode or busy-looping pickup |
 | First frame appears, then freezes | Commit ID completion, pending/release state, event-loop pump/dispatch, target response | Reporting every eventfd signal as presentation |
+| Low GPU utilization in vkmark or another client | Actual FPS, output refresh, client present mode, frame pacing, consumer ACK and buffer-release waits | Removing fences/backpressure or assuming low utilization alone proves slow rendering |
 | Black/corrupt image | Format domain, modifier/stride/offset, import support and acquire fence | Guessing unknown fourcc/modifier or substituting CPU readback silently |
 | Reconnect fails | Control alive vs consumer absent, watcher refresh, new generation/import set | Reusing old same-number FDs or slots |
+| Stuck input or wrong refresh after reconnect | Release/cancel of old pressed states; mode, IPC and frame-clock refresh updates | Only clearing local bookkeeping or updating geometry alone |
 | Clipboard/input stream stalls | Pending extension, short reads/writes, queue limits and payload deadlines | Polling a new header before extension completion |
+| Old clipboard content returns | Selection/session generation of asynchronous results; complete EOF within size/time bounds | Forwarding a delayed or truncated result as the current selection |
 | No sound | PipeWire session, installed bridge API calls, bound audio FD, node routing and negotiation | Only adding `PULSE_SERVER` when the bridge is not wired |
+| Camera freezes or uses CPU after stream loss | Stream HUP/EOF cleanup, I/O watcher removal and old-frame invalidation | Leaving a disconnected FD registered or treating the last frame as live |
 | X11 fails, Wayland works | Actually installed patched Xwayland, render-device path, satellite where needed | Assuming building a new package restarted the live server |
 | Package timestamp is new but behavior unchanged | Hash versus prior package, affected objects actually recompiled, installed file identity | Treating timestamps or wrapper rc=0 as build proof |
 

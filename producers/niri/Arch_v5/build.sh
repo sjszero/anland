@@ -65,6 +65,7 @@ NIRI_OVERLAY_ROOT="$WORKDIR/niri-overlay"
 NIRI_SRCDEST_DIR="$WORKDIR/niri-sources"
 XWAYLAND_SRCDEST_DIR="$WORKDIR/xwayland-sources"
 PKGDEST_DIR="$WORKDIR/packages"
+BUILD_PKGDEST_DIR="$WORKDIR/package-build"
 NIRI_BUILDDIR="$WORKDIR/niri-build"
 XWAYLAND_BUILDDIR="$WORKDIR/xwayland-build"
 PACMAN_LOCAL_CONFIG="$WORKDIR/pacman-local.conf"
@@ -165,9 +166,34 @@ run_makepkg() {
     shift 3
     (
         cd "$stage"
-        PKGDEST="$PKGDEST_DIR" SRCDEST="$srcdest" BUILDDIR="$builddir" \
+        PKGDEST="$BUILD_PKGDEST_DIR" SRCDEST="$srcdest" BUILDDIR="$builddir" \
             makepkg "${MAKEPKG_ARGS[@]}" "$@"
     )
+}
+
+collect_packages() {
+    local stage="$1" output="$2" listing pkg metadata name arch destination
+    local -n selected="$output"
+    listing=$(cd "$stage" && PKGDEST="$BUILD_PKGDEST_DIR" makepkg --packagelist) || die 'cannot query package list'
+    selected=()
+    while IFS= read -r pkg; do
+        [[ -s "$pkg" && "$pkg" -nt "$build_marker" ]] || die "missing or stale package: $pkg"
+        metadata=$(bsdtar -xOf "$pkg" .PKGINFO) || die "cannot read package metadata: $pkg"
+        name=$(awk -F' = ' '$1 == "pkgname" {print $2; exit}' <<<"$metadata")
+        [[ -n "$name" ]] || die "missing package name: $pkg"
+        case "$name" in *-debug|*-dbg|*-dbgsym) continue ;; esac
+        arch=$(awk -F' = ' '$1 == "arch" {print $2; exit}' <<<"$metadata")
+        [[ "$arch" == aarch64 || "$arch" == any ]] || die "wrong package architecture: $pkg"
+        bsdtar -tf "$pkg" >/dev/null
+        destination="$PKGDEST_DIR/${pkg##*/}"
+        if [[ -e "$destination.sig" || -L "$destination.sig" ]]; then
+            cmp -s "$pkg" "$destination" || die "existing signature preserved; move $destination.sig aside before replacing its package"
+        fi
+        cp -p "$pkg" "$destination"
+        selected+=("$destination")
+    done <<<"$listing"
+    (( ${#selected[@]} > 0 )) || die 'no binary packages returned'
+    sha256sum "${selected[@]}"
 }
 
 install_packages() {
@@ -184,13 +210,13 @@ install_packages() {
     sudo pacman --config "$PACMAN_LOCAL_CONFIG" -U --noconfirm "$@"
 }
 
-shopt -s nullglob
+mkdir -p "$BUILD_PKGDEST_DIR" "$PKGDEST_DIR"
+build_marker=$(mktemp "$WORKDIR/.build-start.XXXXXX")
+trap 'rm -f -- "$build_marker"' EXIT
 if [[ "$BUILD_XWAYLAND" == 1 ]]; then
     prepare_xwayland_stage
     run_makepkg "$XWAYLAND_STAGE" "$XWAYLAND_SRCDEST_DIR" "$XWAYLAND_BUILDDIR" "$@"
-    mapfile -t xwayland_packages < <(cd "$XWAYLAND_STAGE" && PKGDEST="$PKGDEST_DIR" makepkg --packagelist)
-    (( ${#xwayland_packages[@]} > 0 )) || die 'no Xwayland package names returned'
-    for pkg in "${xwayland_packages[@]}"; do [[ -f "$pkg" ]] || die "missing package: $pkg"; done
+    collect_packages "$XWAYLAND_STAGE" xwayland_packages
     if [[ "$INSTALL" == 1 ]]; then
         log 'Installing the freshly built patched Xwayland package'
         install_packages "${xwayland_packages[@]}"
@@ -202,14 +228,11 @@ fi
 prepare_niri_stage
 run_makepkg "$NIRI_STAGE" "$NIRI_SRCDEST_DIR" "$NIRI_BUILDDIR" "$@"
 
-mapfile -t niri_packages < <(cd "$NIRI_STAGE" && PKGDEST="$PKGDEST_DIR" makepkg --packagelist)
-(( ${#niri_packages[@]} > 0 )) || die 'no niri package names returned'
-for pkg in "${niri_packages[@]}"; do [[ -f "$pkg" ]] || die "missing package: $pkg"; done
+collect_packages "$NIRI_STAGE" niri_packages
 if [[ "$INSTALL" == 1 ]]; then
     log 'Installing the freshly built Anland niri package'
     install_packages "${niri_packages[@]}"
 fi
-shopt -u nullglob
 
 cat <<EOF
 

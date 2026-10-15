@@ -95,8 +95,7 @@ PY
     [ $? -eq 0 ] || die 'cannot read dependencies.lock'
     while IFS=$'\t' read -r kind name a b c d; do
         case "$kind" in
-            source) directory[$name]=$a; version[$name]=$b; runtime[$name]=$c; dsc[$name]=$d
-                    packages+=("${c}_${b}+anland5_arm64.deb") ;;
+            source) directory[$name]=$a; version[$name]=$b; runtime[$name]=$c; dsc[$name]=$d ;;
             plugin) plugin[$name]=$a ;;
             download)
                 file="$WORKDIR/downloads/$name"
@@ -198,7 +197,8 @@ build_hyprgrass() {
 }
 package_deb() {
     local name="$1" tree="$WORKDIR/src/${directory[$1]}" dep soname
-    local produced="$WORKDIR/src/${runtime[$name]}_${version[$name]}+anland5_arm64.deb"
+    local package_version="${version[$name]}+anland5"
+    local produced="$WORKDIR/src/${runtime[$name]}_${package_version#*:}_arm64.deb"
     log "Package $name"
     : > "$tree/debian/shlibs.local" || die 'cannot write shlibs.local'
     for dep in hyprutils hyprlang hyprgraphics aquamarine; do
@@ -239,12 +239,51 @@ EOF
         [ $? -eq 0 ] || die 'cannot append Debian rules'
     fi
     run chmod +x "$tree/debian/rules"
-    run rm -f "$produced"
+    local stamp
+    stamp=$(mktemp "$tree/.package-start.XXXXXX") || die "cannot mark package build: $name"
     (cd "$tree" && build_env fakeroot debian/rules binary) || die "package: $name"
-    run cp -p "$produced" "$ARTIFACTS/"
+    [[ -s $produced && $produced -nt $stamp ]] || die "missing or stale package: $produced"
+    [[ $(dpkg-deb -f "$produced" Package) == "${runtime[$name]}" &&
+       $(dpkg-deb -f "$produced" Version) == "$package_version" &&
+       $(dpkg-deb -f "$produced" Architecture) == arm64 ]] || die "unexpected package metadata: $produced"
+    run dpkg-deb --contents "$produced" >/dev/null
+    [[ $produced -ef $ARTIFACTS/${produced##*/} ]] || run cp -p "$produced" "$ARTIFACTS/"
+    packages+=("${produced##*/}")
+    run rm -f -- "$stamp"
+}
+# Follow the current .changes file, not every package left in the cache.
+collect_xwayland_package() {
+    local tree=$1 out=$2 expected_version=$3 stamp=$4
+    local built_version changes rows sha size file produced count=0
+    built_version=$(dpkg-parsechangelog -l "$tree/debian/changelog" -S Version) ||
+        die 'cannot read built Xwayland version'
+    [[ $built_version == "$expected_version" ]] || die 'Xwayland version differs from lock'
+    changes="$out/xwayland_${built_version#*:}_arm64.changes"
+    [[ -s $changes && $changes -nt $stamp ]] || die "missing or stale .changes: $changes"
+    rows=$(awk '/^Checksums-Sha256:/ {in_files=1; next}
+        in_files && /^[^ ]/ {exit}
+        in_files && NF == 3 {printf "%s\t%s\t%s\n", $1, $2, $3}' "$changes") ||
+        die 'cannot read Xwayland output list'
+    while IFS=$'\t' read -r sha size file; do
+        case $file in xwayland_*.deb) ;; *) continue ;; esac
+        [[ $file != */* && $sha =~ ^[0-9a-f]{64}$ && $size =~ ^[0-9]+$ ]] ||
+            die 'invalid package entry in .changes'
+        produced="$out/$file"
+        [[ -s $produced && $produced -nt $stamp ]] || die "missing or stale package: $produced"
+        [[ $(stat -c %s -- "$produced") == "$size" ]] || die 'Xwayland package size mismatch'
+        printf '%s  %s\n' "$sha" "$produced" | sha256sum -c --status - || die 'Xwayland package checksum mismatch'
+        [[ $(dpkg-deb -f "$produced" Package) == xwayland &&
+           $(dpkg-deb -f "$produced" Version) == "$built_version" &&
+           $(dpkg-deb -f "$produced" Architecture) == arm64 ]] || die 'unexpected Xwayland package metadata'
+        run dpkg-deb --contents "$produced" >/dev/null
+        [[ $produced -ef $ARTIFACTS/$file ]] || run cp -p "$produced" "$ARTIFACTS/"
+        packages+=("$file")
+        count=$((count + 1))
+    done <<< "$rows"
+    [[ $count == 1 ]] || die 'expected one Xwayland runtime package in .changes'
 }
 build_xwayland() {
-    local out="$WORKDIR/xwayland" tree patch file pinned identity
+    local out="$WORKDIR/xwayland" tree patch pinned identity stamp
     patch="$(find_patch xwayland "${XWAYLAND_PATCH:-}")" || die 'cannot select Xwayland patch'
     verify_patch xwayland "$patch"
     pinned=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["xwayland"]["version"])' \
@@ -272,16 +311,12 @@ PY
         printf '%s\n' "$identity" > "$tree/.anland-source-identity" || die 'cannot record prepared Xwayland'
     fi
     log 'Build Xwayland .deb'
-    run rm -f "$out"/xwayland_*.deb
+    stamp=$(mktemp "$out/.build-start.XXXXXX") || die 'cannot mark Xwayland build'
     (cd "$tree" && env -u PKG_CONFIG_PATH -u PKG_CONFIG_LIBDIR -u CMAKE_PREFIX_PATH \
         -u LD_LIBRARY_PATH -u DESTDIR DEB_BUILD_OPTIONS="nocheck nodwz parallel=$JOBS" \
         dpkg-buildpackage -b -uc -us) || die 'package: xwayland'
-    local -a debs=("$out"/xwayland_*.deb)
-    [ -f "${debs[0]}" ] || die 'no Xwayland package produced'
-    for file in "${debs[@]}"; do
-        run cp -p "$file" "$ARTIFACTS/"
-        packages+=("${file##*/}")
-    done
+    collect_xwayland_package "$tree" "$out" "$pinned" "$stamp"
+    run rm -f -- "$stamp"
 }
 main() {
     [ $# -eq 0 ] || die 'use environment variables, not arguments'
@@ -298,7 +333,7 @@ main() {
     build_hyprgrass
     for name in "${PROJECTS[@]}"; do package_deb "$name"; done
     build_xwayland
-    (cd "$ARTIFACTS" && sha256sum "${packages[@]}" > SHA256SUMS) || die 'cannot write SHA256SUMS'
+    (cd "$ARTIFACTS" && sha256sum "${packages[@]}") || die 'cannot hash packages'
     if [ "${ANLAND_INSTALL:-0}" = 1 ]; then
         local -a debs=()
         for file in "${packages[@]}"; do debs+=("$ARTIFACTS/$file"); done

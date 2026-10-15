@@ -10,12 +10,14 @@ pub mod client;
 pub use client::ffi;
 pub mod frame_state;
 pub mod input;
+mod clipboard;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::input::keyboard::xkb;
 
 use std::mem;
 use std::collections::VecDeque;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -149,6 +151,7 @@ pub struct Anland {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     output: Option<Output>,
     input_backend: input::AnlandInputBackend,
+    pending_input_releases: VecDeque<ffi::InputEvent>,
     /// Candidate consumer size and the monotonic timestamp at which it was
     /// first observed continuously.
     pending_size: Option<(i32, i32, u64)>,
@@ -178,11 +181,14 @@ pub struct Anland {
     consumer_dmabufs: [Option<Dmabuf>; ffi::MAX_BUFS],
     /// Signalled by the selection handler when a client sets the clipboard; the
     /// poll timer reads the new selection and forwards it to the consumer.
-    selection_tx: std::sync::mpsc::Sender<()>,
+    selection_tx: std::sync::mpsc::SyncSender<()>,
     selection_rx: std::sync::mpsc::Receiver<()>,
     /// Signalled by the clipboard reader thread with the compositor clipboard text.
-    clipboard_tx: std::sync::mpsc::Sender<String>,
-    clipboard_rx: std::sync::mpsc::Receiver<String>,
+    clipboard_tx: std::sync::mpsc::SyncSender<clipboard::ReadResult>,
+    clipboard_rx: std::sync::mpsc::Receiver<clipboard::ReadResult>,
+    selection_epoch: Arc<AtomicU64>,
+    clipboard_worker_running: bool,
+    clipboard_read_pending: bool,
     disposed: bool,
 }
 
@@ -211,14 +217,9 @@ impl Anland {
             (initial.width.max(1), initial.height.max(1), initial.refresh_mhz.max(1));
         info!("anland: common device output {width}x{height} {refresh} mHz");
         let ipc_outputs = Arc::new(Mutex::new(IpcOutputMap::new()));
-        let input_backend = input::AnlandInputBackend {
-            native_w: width,
-            native_h: height,
-            scale: 1.5,
-            time_offset: 0,
-        };
-        let (selection_tx, selection_rx) = std::sync::mpsc::channel();
-        let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel();
+        let input_backend = input::AnlandInputBackend::new(width, height);
+        let (selection_tx, selection_rx) = std::sync::mpsc::sync_channel(1);
+        let (clipboard_tx, clipboard_rx) = std::sync::mpsc::sync_channel(1);
 
         Ok(Self {
             client,
@@ -235,6 +236,7 @@ impl Anland {
             ipc_outputs,
             output: None,
             input_backend,
+            pending_input_releases: VecDeque::new(),
             pending_size: None,
             size_adapt_cooldown_until: 0,
 
@@ -248,13 +250,18 @@ impl Anland {
             selection_rx,
             clipboard_tx,
             clipboard_rx,
+            selection_epoch: Arc::new(AtomicU64::new(1)),
+            clipboard_worker_running: false,
+            clipboard_read_pending: false,
             disposed: false,
         })
     }
 
-    /// Sender for the selection handler to request a clipboard forward.
-    pub fn clipboard_selection_tx(&self) -> std::sync::mpsc::Sender<()> {
-        self.selection_tx.clone()
+    /// Invalidate synchronously, including cleared and non-text selections.
+    /// Coalesce notifications; at most one reader and one queued result exist.
+    pub fn clipboard_selection_changed(&self) {
+        self.selection_epoch.fetch_add(1, Ordering::AcqRel);
+        let _ = self.selection_tx.try_send(());
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
@@ -428,9 +435,23 @@ impl Anland {
     /// The consumer switched resolution/orientation. Adopt the new buffer size as
     /// our output mode so rendering resumes instead of skipping every frame.
     fn adapt_to_size(&mut self, niri: &mut Niri, output: &Output, w: i32, h: i32) {
-        info!("anland: consumer changed size to {w}x{h}, adapting output");
+        self.update_output_mode(niri, output, w, h, self.screen_refresh);
+    }
+
+    fn update_output_mode(&mut self, niri: &mut Niri, output: &Output, w: i32, h: i32, refresh: u32) {
+        if w <= 0 || h <= 0 { return; }
+        let refresh = if refresh > 0 && refresh <= i32::MAX as u32 {
+            refresh
+        } else {
+            self.screen_refresh
+        };
+        let size_changed = self.screen_w != w as u32 || self.screen_h != h as u32;
+        let refresh_changed = self.screen_refresh != refresh;
+        if !size_changed && !refresh_changed { return; }
+        info!("anland: output changed to {w}x{h} @ {refresh} mHz");
         self.screen_w = w as u32;
         self.screen_h = h as u32;
+        self.screen_refresh = refresh;
         self.input_backend.native_w = self.screen_w;
         self.input_backend.native_h = self.screen_h;
 
@@ -448,6 +469,7 @@ impl Anland {
                 let mode = &mut output.modes[0];
                 mode.width = w.clamp(0, u16::MAX as i32) as u16;
                 mode.height = h.clamp(0, u16::MAX as i32) as u16;
+                mode.refresh_rate = refresh;
                 if let Some(logical) = output.logical.as_mut() {
                     logical.width = w as u32;
                     logical.height = h as u32;
@@ -456,7 +478,18 @@ impl Anland {
             niri.ipc_outputs_changed = true;
         }
 
-        niri.output_resized(output);
+        if refresh_changed {
+            if let Some(state) = niri.output_state.get_mut(output) {
+                // Publishing a new wl_output mode does not repace the native
+                // clock. Reset its fixed interval; Anland does not expose VRR.
+                state.frame_clock = crate::frame_clock::FrameClock::new(
+                    Some(Duration::from_nanos(1_000_000_000_000 / u64::from(refresh))),
+                    false,
+                );
+            }
+        }
+        if size_changed { niri.output_resized(output); }
+        niri.queue_redraw(output);
     }
 
     pub fn seat_name(&self) -> String {
@@ -473,12 +506,6 @@ impl Anland {
     /// Polls the consumer: drains input events, checks buffer-ready, and attempts
     /// a reconnect if we fell back. Called from the poll timer.
     pub fn poll(&mut self, niri: &mut Niri) {
-        while let Ok(text) = self.clipboard_rx.try_recv() {
-            self.send_clipboard_to_consumer(&text);
-        }
-        while let Ok(()) = self.selection_rx.try_recv() {
-            self.read_and_forward_clipboard(niri);
-        }
         if let Err(err) = self.client.pump() {
             warn!("anland: presentation pump: {err}");
         }
@@ -492,10 +519,32 @@ impl Anland {
             }
         }
         self.dispatch_scene(niri);
+        if self.selection_rx.try_recv().is_ok() {
+            self.clipboard_read_pending = true;
+        }
+        if let Ok(result) = self.clipboard_rx.try_recv() {
+            self.clipboard_worker_running = false;
+            if self.client.connected()
+                && self.session_generation == Some(result.session)
+                && self.selection_epoch.load(Ordering::Acquire) == result.selection
+            {
+                if let Some(text) = result.text {
+                    self.send_clipboard_to_consumer(&text);
+                }
+            }
+        }
+        if self.clipboard_read_pending && !self.clipboard_worker_running && self.client.connected() {
+            self.clipboard_read_pending = false;
+            self.read_and_forward_clipboard(niri);
+        }
     }
 
     fn on_session_lost(&mut self, niri: &mut Niri) {
         if self.session_generation.take().is_none() { return; }
+        self.pending_input_releases.extend(self.input_backend.take_releases());
+        self.selection_epoch.fetch_add(1, Ordering::AcqRel);
+        self.clipboard_read_pending = false;
+        let _ = self.selection_rx.try_recv();
         #[cfg(have_anland_audio)] unsafe {
             ffi::anland_audio_set_fd(-1);
             ffi::anland_camera_clear();
@@ -550,10 +599,8 @@ impl Anland {
                 }
                 client::OUTPUT_CHANGED => {
                     if let Some(output) = self.output.clone() {
-                        if e.width > 0 && e.height > 0 &&
-                            (self.screen_w != e.width || self.screen_h != e.height) {
-                            self.adapt_to_size(niri, &output, e.width as i32, e.height as i32);
-                        }
+                        self.update_output_mode(niri, &output, e.width as i32, e.height as i32,
+                            e.refresh_mhz);
                     }
                 }
                 client::BUFFER_RELEASED => { /* Owned release fence closes on drop. */ }
@@ -565,53 +612,35 @@ impl Anland {
     /// Ask the client that owns the current clipboard selection for its text/plain
     /// content and forward it to the consumer once it arrives.
     fn read_and_forward_clipboard(&mut self, niri: &mut Niri) {
-        use std::os::fd::FromRawFd;
-
         use smithay::wayland::selection::data_device::request_data_device_client_selection;
 
+        let Some(session) = self.session_generation else { return; };
+        let selection = self.selection_epoch.load(Ordering::Acquire);
         let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return;
         }
-        let read_fd = fds[0];
-        if request_data_device_client_selection(&niri.seat, "text/plain".to_string(), unsafe {
-            OwnedFd::from_raw_fd(fds[1])
-        })
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let flags = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe {
+            libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } < 0 { return; }
+        if request_data_device_client_selection(&niri.seat, "text/plain".to_string(), write_fd)
         .is_err()
         {
-            unsafe { libc::close(read_fd) };
             return;
         }
 
         let tx = self.clipboard_tx.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let start = std::time::Instant::now();
-            loop {
-                if start.elapsed() > Duration::from_secs(2) || bytes.len() > 2 * 1024 * 1024 {
-                    break;
-                }
-                let mut pfd = libc::pollfd {
-                    fd: read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let n = unsafe { libc::poll(&mut pfd, 1, 200) };
-                if n <= 0 {
-                    continue;
-                }
-                let mut buf = [0u8; 4096];
-                let r = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if r <= 0 {
-                    break; // EOF / error
-                }
-                bytes.extend_from_slice(&buf[..r as usize]);
-            }
-            unsafe { libc::close(read_fd) };
-            if let Ok(text) = String::from_utf8(bytes) {
-                let _ = tx.send(text);
-            }
-        });
+        let epoch = self.selection_epoch.clone();
+        match std::thread::Builder::new().name("anland-clipboard".into()).spawn(move || {
+            let text = clipboard::read_selection(read_fd, &epoch, selection);
+            let _ = tx.try_send(clipboard::ReadResult { selection, session, text });
+        }) {
+            Ok(_) => self.clipboard_worker_running = true,
+            Err(err) => warn!("anland: cannot start clipboard reader: {err}"),
+        }
     }
 
     /// Send a clipboard text to the consumer as an OUTPUT_TYPE_CLIPBOARD event.
@@ -646,6 +675,9 @@ impl Anland {
         &mut self,
         niri: &mut Niri,
     ) -> Option<smithay::backend::input::InputEvent<input::AnlandInputBackend>> {
+        if let Some(release) = self.pending_input_releases.pop_front() {
+            return input::translate(&mut self.input_backend, &release);
+        }
         let raw = match self.client.poll_input() {
             Ok(Some(event)) => event,
             Ok(None) => return None,
@@ -656,6 +688,12 @@ impl Anland {
             }
         };
         match raw.type_ {
+            ffi::INPUT_TYPE_DISPLAY_REFRESH => {
+                if let Some(output) = self.output.clone() {
+                    self.update_output_mode(niri, &output, self.screen_w as i32,
+                        self.screen_h as i32, raw.refresh_mhz);
+                }
+            }
             ffi::INPUT_TYPE_CLIPBOARD | ffi::INPUT_TYPE_TEXT_INPUT => {
                 match self.client.read_payload(raw.payload_size as usize) {
                     Ok(bytes) if raw.type_ == ffi::INPUT_TYPE_CLIPBOARD => {
@@ -694,7 +732,7 @@ impl Anland {
                     },
                 }
             }
-            _ => return input::translate(&self.input_backend, &raw),
+            _ => return input::translate(&mut self.input_backend, &raw),
         }
         None
     }
@@ -732,6 +770,9 @@ impl Anland {
     /// Publish text pushed by the consumer as the compositor's clipboard selection.
     fn set_compositor_clipboard(&mut self, niri: &mut Niri, text: String) {
         use smithay::wayland::selection::data_device::set_data_device_selection;
+        self.selection_epoch.fetch_add(1, Ordering::AcqRel);
+        self.clipboard_read_pending = false;
+        let _ = self.selection_rx.try_recv();
         if text.is_empty() {
             return;
         }
@@ -993,6 +1034,7 @@ impl Drop for Anland {
             return;
         }
         self.disposed = true;
+        self.selection_epoch.fetch_add(1, Ordering::AcqRel);
         #[cfg(have_anland_audio)]
         unsafe {
             ffi::anland_audio_stop();

@@ -33,6 +33,8 @@ void disconnect(display_ctx *ctx);
  * Partial screen/pickup/pool records survive arbitrarily delayed consumers. */
 int connect_to_deamon_deferred(display_ctx **out, const char *socket_path);
 
+/* Geometry starts with HELLO; refresh also tracks valid DISPLAY_REFRESH events
+ * delivered by poll_input_event(). A zero initial rate is pending, not 60 Hz. */
 int  get_screen_info(display_ctx *ctx, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *refresh);
 
 /* Stash the render-done fence (created in doEndFrame) for the current frame. The
@@ -52,6 +54,11 @@ int  trigger_refresh(display_ctx *ctx);
  * an extended payload is pending. Incomplete frames expire after 5 seconds.
  * Access to a context must be serialized by the caller. */
 int  poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms);
+/* True only after bytes of an event header (data_msg + InputEvent) were read
+ * but before poll_input_event() returned that event. An idle poll is false,
+ * even if its read buffer was allocated. Excludes extended payloads/fds.
+ * Read-only; serialize with input reads and session changes. */
+bool input_header_pending(const display_ctx *ctx);
 int poll_input_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms);
 
 /* Receive the fds that follow an INPUT_TYPE_RESOURCE event (a DATA_MSG_INPUT_EXTEND_FDS
@@ -110,6 +117,12 @@ bool is_fallback(display_ctx *ctx);
  * return code alone. Backends use this to tell the two apart and reconnect from
  * scratch instead of polling forever for a consumer that can never arrive. */
 bool is_daemon_alive(display_ctx *ctx);
+/* Poll the current target-ready eventfd AND consumer/control socket hangups.
+ * 1: ready, 0: pending/fallback/interrupted, -1: loss detected and fallback run.
+ * Non-consuming: caller still reads the ready eventfd; input/SCM_RIGHTS are
+ * untouched. timeout_ms is per-call (-1 waits), never an arrival deadline.
+ * Serialize with input/pump/session calls; fallback callbacks must not re-enter. */
+int poll_buffer_ready(display_ctx *ctx, int timeout_ms);
 
 /* Drop the current consumer connection without dropping the daemon control
  * connection.  This is used when the KWin/EGL side cannot import a freshly
@@ -118,8 +131,8 @@ void force_fallback(display_ctx *ctx);
 
 /* Nonblocking staged handshake. Returns 0 when pool metadata is ready, -1 with
  * EAGAIN while pending: retain all partial bytes/FDs and retry on readiness or a
- * bounded timer. One 3s total deadline covers pickup through metadata, not each
- * read. EOF/protocol/deadline errors release partial resources. An ambiguous
+ * bounded timer. There is no total consumer-arrival deadline; delayed/partial
+ * records stay owned until completion or transport/protocol failure. An ambiguous
  * control response also closes the daemon connection (caller must reopen).
  * Success does NOT prove a writable slot; scene waits for buffer-ready. */
 int  try_exit_fallback(display_ctx *ctx);

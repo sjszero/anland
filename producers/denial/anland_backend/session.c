@@ -237,6 +237,10 @@ int ad_fence_signaled(int32_t fd)
     if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0) return -errno;
     return info.status < 0 ? -EIO : info.status > 0;
 }
+int ad_input_header_pending(ad_session *s)
+{
+    return s && anland_device_input_header_pending(device(s));
+}
 int ad_poll_input(ad_session *s, ad_input *out)
 {
     if (!out) return -EINVAL;
