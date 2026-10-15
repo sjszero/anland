@@ -139,7 +139,7 @@ for number in JOBS ANLAND_PKGREL ANLAND_DE_PKGREL; do
 done
 [[ $(id -u) != 0 && $(uname -m) == aarch64 ]] || die 'run as a normal aarch64 user'
 ANLAND_DENIAL_DISTRO=${ANLAND_DENIAL_DISTRO:-arch}
-case $ANLAND_DENIAL_DISTRO in arch|ubuntu2604) ;; *) die 'unsupported Denial distribution' ;; esac
+case $ANLAND_DENIAL_DISTRO in arch|ubuntu2604|fedora43) ;; *) die 'unsupported Denial distribution' ;; esac
 WORKDIR=$(realpath -m -- "${WORKDIR:-${DENIAL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/denial-anland}}") || die 'invalid WORKDIR'
 ARTIFACTS_DIR=$(realpath -m -- "${ARTIFACTS_DIR:-$WORKDIR/packages}") || die 'invalid ARTIFACTS_DIR'
 [[ $WORKDIR != / && $WORKDIR != "$HOME" && $WORKDIR != "$ROOT" && $WORKDIR != "$ROOT/"* ]] || die 'WORKDIR must be a separate cache directory'
@@ -1174,6 +1174,14 @@ if [[ $ANLAND_DENIAL_DISTRO == ubuntu2604 ]]; then
     source "$SCRIPT_DIR/build.sh" || die 'cannot load Ubuntu package functions'
     ubuntu_preflight
     ubuntu_dependencies
+elif [[ $ANLAND_DENIAL_DISTRO == fedora43 ]]; then
+    source "$SCRIPT_DIR/build.sh" || die 'cannot load Fedora package functions'
+    fedora_denial_preflight
+    fedora_denial_dependencies
+    if [[ $ANLAND_STAGE == check ]]; then
+        printf 'FEDORA43_RECIPE_OK denial (no compilation or graphical test)\n'
+        exit 0
+    fi
 else
     if [[ $ANLAND_WITH_DEPS == 1 ]]; then
         [[ $ANLAND_OFFLINE == 0 ]] || die 'dependency installation conflicts with ANLAND_OFFLINE=1'
@@ -1182,7 +1190,15 @@ else
     missing=$(pacman -T "${build_deps[@]}") || die "missing dependencies: $missing (use ANLAND_WITH_DEPS=1)"
 fi
 prepare_sources
-if [[ $ANLAND_DENIAL_DISTRO == ubuntu2604 ]]; then prepare_ubuntu_rust; fi
+if [[ $ANLAND_DENIAL_DISTRO == fedora43 && $ANLAND_STAGE == prepare ]]; then
+    fedora_xwayland
+    printf 'FEDORA43_PREPARED denial\n'
+    exit 0
+fi
+case $ANLAND_DENIAL_DISTRO in
+    ubuntu2604) prepare_ubuntu_rust ;;
+    fedora43) prepare_fedora_rust ;;
+esac
 prepare_engine
 prepare_flutter
 fetch_dependencies

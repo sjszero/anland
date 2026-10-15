@@ -5,7 +5,7 @@
 #include "backends/anland/meta-anland-input.h"
 
 #include "backends/meta-backend-private.h"
-#ifdef ANLAND_MUTTER_50
+#if defined(ANLAND_MUTTER_50) || defined(ANLAND_MUTTER_49)
 #include "backends/meta-logical-monitor-private.h"
 #else
 #include "backends/meta-logical-monitor.h"

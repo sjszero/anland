@@ -1,0 +1,9 @@
+{
+  "version": "49.7",
+  "release": "1.fc43",
+  "archive": "mutter-49.7-1.fc43.src.rpm",
+  "sha256": "731dabe14979ca378f1d4770ae9e71989e06fe74aa72ec7bd36741b218495cee",
+  "url": "https://kojipkgs.fedoraproject.org/packages/mutter/49.7/1.fc43/src/mutter-49.7-1.fc43.src.rpm",
+  "patch_sha256": "fd7449313391e8b5fd76f0a8535651a6c4f707d84c4ceebb665498f670637f36",
+  "mutter_api": 17
+}

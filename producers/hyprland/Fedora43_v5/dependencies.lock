@@ -1,0 +1,94 @@
+{
+  "suite": "Fedora 43",
+  "version": "0.55.2",
+  "private_prefix": "/usr/lib64/hyprland-anland",
+  "public_linkage": "built-in-once-in-private-aquamarine",
+  "lua": "Fedora lua 5.4",
+  "sources": {
+    "hyprwayland-scanner": {
+      "version": "0.4.6",
+      "archive": "hyprwayland-scanner_0.4.6.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprwayland-scanner/hyprwayland-scanner_0.4.6.orig.tar.gz",
+      "sha256": "f4f574c9339ddf85cd97d423b335bfff81458ed6dd03407e556346089bab3e4a"
+    },
+    "hyprland-protocols": {
+      "version": "0.7.1",
+      "archive": "hyprland-protocols_0.7.1.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprland-protocols/hyprland-protocols_0.7.1.orig.tar.gz",
+      "sha256": "ed69685937af9615a825891bed32f9188b2fd858e4c017d469e1887d076b5a26"
+    },
+    "hyprutils": {
+      "version": "0.13.1",
+      "archive": "hyprutils_0.13.1.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprutils/hyprutils_0.13.1.orig.tar.gz",
+      "sha256": "a096db4e34a9104d2e115352f90aba01a2b784ae2063671a9845d153b096de19"
+    },
+    "hyprlang": {
+      "version": "0.6.8",
+      "archive": "hyprlang_0.6.8.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprlang/hyprlang_0.6.8.orig.tar.gz",
+      "sha256": "d10a0778b646e04d83e8b90cc0f764fb96958c01a15c3c0678d95a40fc647ed5"
+    },
+    "hyprgraphics": {
+      "version": "0.5.1",
+      "archive": "hyprgraphics_0.5.1.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprgraphics/hyprgraphics_0.5.1.orig.tar.gz",
+      "sha256": "57268fb39108c161ff83a0d8cab7e5222764794b99f071b28efd809ba85f9ad9"
+    },
+    "aquamarine": {
+      "version": "0.15.1",
+      "archive": "aquamarine_0.15.1.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/a/aquamarine/aquamarine_0.15.1.orig.tar.gz",
+      "sha256": "5de0842f2ccb8b242baa801f553e8cdc7689ef7b882675d1b671f77928225857"
+    },
+    "hyprland": {
+      "version": "0.55.2+ds",
+      "archive": "hyprland_0.55.2+ds.orig.tar.xz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprland/hyprland_0.55.2+ds.orig.tar.xz",
+      "sha256": "61f150f337923bd690c75a6c51adeceb8ac72103f78f516aa017eee3225fc338",
+      "debian": {
+        "archive": "hyprland_0.55.2+ds-1~bpo13+1.debian.tar.xz",
+        "url": "https://deb.debian.org/debian/pool/main/h/hyprland/hyprland_0.55.2+ds-1~bpo13+1.debian.tar.xz",
+        "sha256": "0353f25d0d5e7fc94603cbb0dc77bd0cf88ea1b93e8dc87153126cfd04796a4b"
+      }
+    },
+    "hyprwire": {
+      "version": "0.3.1",
+      "archive": "hyprwire_0.3.1.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprwire/hyprwire_0.3.1.orig.tar.gz",
+      "sha256": "47f6032d655aa0567f7d6be2625b1c404bf21c5dbe65f308ad6f3550bc810037"
+    },
+    "hyprcursor": {
+      "version": "0.1.13",
+      "archive": "hyprcursor_0.1.13.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/h/hyprcursor/hyprcursor_0.1.13.orig.tar.gz",
+      "sha256": "2732743915131415d462ca2d36420f03a1f7a575ce874878b9f64fb8616bf55b"
+    },
+    "glaze": {
+      "version": "8.4.0",
+      "archive": "glaze_8.4.0.orig.tar.gz",
+      "url": "https://deb.debian.org/debian/pool/main/g/glaze/glaze_8.4.0.orig.tar.gz",
+      "sha256": "11798c66c54adf169aa4b4d3da7eb8280755289bb2bbc39664a595a4da60caaf"
+    }
+  },
+  "plugins": {
+    "hyprgrass": {
+      "revision": "0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "url": "https://codeload.github.com/horriblename/hyprgrass/tar.gz/0e8e3c09b805e5f8f7cedde7546e58c504682c31",
+      "archive": "hyprgrass-0e8e3c09b805e5f8f7cedde7546e58c504682c31.tar.gz",
+      "sha256": "4ea3018cab0e6a4d3b6d265af52c58df7de98733eec2d2921785bf9500863bc3"
+    },
+    "wf-touch": {
+      "revision": "8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "url": "https://codeload.github.com/WayfireWM/wf-touch/tar.gz/8974eb0f6a65464b63dd03b842795cb441fb6403",
+      "archive": "wf-touch-8974eb0f6a65464b63dd03b842795cb441fb6403.tar.gz",
+      "sha256": "09061c8a4d3d964e8dcfd1a7b97f7dc43d0fc30743b0993585439c6923ce422f"
+    },
+    "hyprland_revision": "39d7e209c79d451efab1b21151d5938289da838d"
+  },
+  "patches": {
+    "aquamarine.patch": "da8f1577eb2a8d3907119b61b1c45104a6fe04f0297a82f2dec120071207df01",
+    "hyprland.patch": "29eba3a2da65ac2c7e8cd5686c5db0b414b7033289d28773199a4aaedef623c4",
+    "hyprgrass.patch": "b9c076e74a158c8cd05f5636e428297556e5b8d4d64a2068479729c2b277c8d6"
+  }
+}
