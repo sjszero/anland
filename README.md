@@ -78,10 +78,10 @@ Paths below are relative to `producers/<name>/`; directory names are case-sensit
 | [Gamescope](producers/gamescope/) | `anland_backend/` (C session wrapper, C++/Vulkan) | `SteamOS_v5` |
 | [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/` (GObject/Cogl/Clutter) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
 | [KDE / KWin](producers/kde/) | `anland_backend/` (Qt output/EGL/input) | `Arch_v5`, `Debian13_v5`, `Fedora43_v5`, `Fedora44_v5`, `SteamOS_v5`, `ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
 | [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
 | [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
-| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) contains an additional Xwayland recipe, not a WM backend. Building Mutter or KWin alone does not deliver the complete GNOME or Plasma session; native shells, portals, agents and session data remain necessary. Niri's X11 integration also requires checking xwayland-satellite and its startup relationship.
 
@@ -165,6 +165,19 @@ JOBS=2 ANLAND_INSTALL=0 bash producers/mango/Debian13_v5/build.sh
 JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
   bash producers/denial/Arch_v5/build.sh --noconfirm
 ```
+
+### Niri and Denial on Debian 13 ARM64
+
+Both provide `Debian13_v5/build.sh`. Build as an ordinary ARM64 user:
+
+```sh
+ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/niri/Debian13_v5/build.sh
+ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/denial/Debian13_v5/build.sh
+```
+
+Niri emits `niri-anland`, `xwayland-satellite` and `xwayland`; full Denial emits `denial-anland-engine`, `denial`, `denial-desktop` and `xwayland`. Only `.deb` installation packages go to the recipe's `artifacts/` (`ARTIFACTS_DIR` is configurable); caches and build evidence stay in `WORKDIR`. These recipes reuse the existing backend/patch baseline and an isolated pinned Rust toolchain, not Debian's older system Rust. Denial retains the shared engine/AOT build and defaults to the full desktop.
+
+Xwayland follows **[KDE's Debian 13 recipe](producers/kde/Debian13_v5/)**: enable Debian `deb-src`, install `apt-get build-dep`, obtain the locked Debian `2:24.1.6-1` source with `apt-get source`, reuse KDE's exact `xwayland.patch`, and run `dpkg-buildpackage` without changing the official changelog. Source checksums are verified before extraction; the current `.changes` checksums identify the runtime package. Ubuntu sources are not used. `ANLAND_STAGE=check|prepare|build` defaults to `build`; `prepare` resolves/patches sources and prepares the Rust toolchain (Niri also fetches Cargo dependencies), not the Denial Flutter engine/AOT build. No installation or graphical/service changes occur unless explicitly requested. Validation on Debian 13 ARM64: the Niri recipe produced all three .debs; their architecture, packaged linkage, RPATH, versions, checksums and package-only collection/download verification passed. Denial source/Rust/Xwayland preparation and the native compositor/app runner compiled successfully. Both public C bridges passed installed-layout linkage checks. The full Denial Flutter engine/AOT desktop and its complete .deb set were not built; GitHub cloud jobs and real graphical tests were not run.
 
 ### Ubuntu 26.04 ARM64 entries
 

@@ -78,10 +78,10 @@ Linux 合成器：原生窗口、renderer、frame clock、seat 与桌面
 | [Gamescope](producers/gamescope/) | `anland_backend/`（C session wrapper、C++/Vulkan） | `SteamOS_v5` |
 | [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/`（GObject/Cogl/Clutter） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
 | [KDE / KWin](producers/kde/) | `anland_backend/`（Qt output/EGL/input） | `Arch_v5`、`Debian13_v5`、`Fedora43_v5`、`Fedora44_v5`、`SteamOS_v5`、`ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
 | [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
 | [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
-| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) 是额外的 Xwayland 配方，不是独立 WM 后端。仅构建 Mutter/KWin 不等于交付完整 GNOME/Plasma，会话仍需 shell、portal、agent 和运行数据。Niri 的 X11 接入还需核对 xwayland-satellite 及其启动关系。
 
@@ -165,6 +165,19 @@ JOBS=2 ANLAND_INSTALL=0 bash producers/mango/Debian13_v5/build.sh
 JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
   bash producers/denial/Arch_v5/build.sh --noconfirm
 ```
+
+### Niri、Denial 的 Debian 13 ARM64 入口
+
+两者均提供 `Debian13_v5/build.sh`，使用普通 ARM64 用户构建：
+
+```sh
+ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/niri/Debian13_v5/build.sh
+ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/denial/Debian13_v5/build.sh
+```
+
+Niri 生成 `niri-anland`、`xwayland-satellite`、`xwayland`；完整 Denial 生成 `denial-anland-engine`、`denial`、`denial-desktop`、`xwayland`。入口的 `artifacts/` 只交付 `.deb` 安装包，可通过 `ARTIFACTS_DIR` 覆盖；源码缓存和验证记录保存在 `WORKDIR`。继续复用原有后端与补丁基线，在独立缓存中安装锁定 Rust 工具链，不使用 Debian 较旧的系统 Rust。Denial 保留共享 engine/AOT 构建，默认包含完整桌面。
+
+Xwayland 参考 **[KDE 的 Debian 13 配方](producers/kde/Debian13_v5/)**：启用 Debian `deb-src`，执行 `apt-get build-dep`，通过 `apt-get source` 获取锁定的 Debian `2:24.1.6-1` 源码，复用 KDE 原版 `xwayland.patch`，保留官方 changelog 后用 `dpkg-buildpackage` 产包。解包前校验源码哈希，按本次 `.changes` 的校验值收集运行包，不使用 Ubuntu 源。`ANLAND_STAGE=check|prepare|build` 默认 `build`；`prepare` 准备源码、补丁及 Rust 工具链（Niri 还预取 Cargo 依赖），不编译 Denial 的 Flutter engine/AOT。除非明确请求，不安装成品、不启动图形会话或变更桌面服务；Debian 13 ARM64 验证结果：Niri 完整生成三个 .deb，架构、包内链接、RPATH、版本、哈希及纯软件包收集／下载字节校验均通过；Denial 源码、Rust、Xwayland 准备和原生合成器／应用运行器编译通过，两套公共 C bridge 的安装布局链接检查通过。未编译完整 Denial Flutter engine/AOT 桌面及全套 .deb，未执行 GitHub 云任务或真实图形测试。
 
 ### Ubuntu 26.04 ARM64 入口
 

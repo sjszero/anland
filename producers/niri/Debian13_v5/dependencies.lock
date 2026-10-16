@@ -1,0 +1,28 @@
+{
+  "version": "26.4.0+anland5-1",
+  "niri": {
+    "directory": "niri-26.04",
+    "archive": "niri-26.04.zip",
+    "url": "https://codeload.github.com/niri-wm/niri/zip/refs/tags/v26.04",
+    "sha256": "065c06f624ba46af8e82fe358ecc74392a645688a73871532d193c5d45bca6d5"
+  },
+  "smithay": {
+    "directory": "smithay-ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef",
+    "archive": "smithay-ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef.tar.gz",
+    "url": "https://codeload.github.com/Smithay/smithay/tar.gz/ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef",
+    "sha256": "2df0f01fd83ee01dc2fcd5976ac0004334b03ef567f467b6c511f11fc1c8a7b9"
+  },
+  "satellite": {
+    "directory": "xwayland-satellite-0.8.3",
+    "archive": "xwayland-satellite-0.8.3.tar.gz",
+    "url": "https://codeload.github.com/Supreeeme/xwayland-satellite/tar.gz/refs/tags/v0.8.3",
+    "sha256": "8b32873d7d740143ce9efa3cfb43c17d0176b89d2e8ffaa497db709f154fc478",
+    "version": "0.8.3+anland5-1"
+  },
+  "patches": {
+    "niri.patch": "721efb6ccc0485fa9d147630f7fd11a0e3629b92a3f4a88214cefbff5253702e",
+    "smithay.patch": "d23e6ea89713aa98454fa8b63071b8abd2176bf7ede65c102c811590a33b6c63",
+    "xwayland.patch": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+  },
+  "rust_toolchain": "1.98.0"
+}

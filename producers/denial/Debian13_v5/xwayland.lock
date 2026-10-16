@@ -1,0 +1,10 @@
+{
+  "version": "2:24.1.6-1",
+  "source": "xwayland",
+  "files": {
+    "xwayland_24.1.6-1.dsc": "25f96591e3c3fe674ab830ef0557141658fb14cf91f56defb33ac3420435e368",
+    "xwayland_24.1.6.orig.tar.xz": "737e612ca36bbdf415a911644eb7592cf9389846847b47fa46dc705bd754d2d7",
+    "xwayland_24.1.6-1.debian.tar.xz": "fcfc0c634b7aaaa059c2e9337da2330c6b5c20b084009494d144c34bac9715ef"
+  },
+  "patch_sha256": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+}

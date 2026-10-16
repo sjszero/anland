@@ -333,7 +333,7 @@ main() {
     build_hyprgrass
     for name in "${PROJECTS[@]}"; do package_deb "$name"; done
     build_xwayland
-    (cd "$ARTIFACTS" && sha256sum "${packages[@]}") || die 'cannot hash packages'
+    (cd "$ARTIFACTS" && sha256sum "${packages[@]}" | tee SHA256SUMS) || die 'cannot write package checksums'
     if [ "${ANLAND_INSTALL:-0}" = 1 ]; then
         local -a debs=()
         for file in "${packages[@]}"; do debs+=("$ARTIFACTS/$file"); done

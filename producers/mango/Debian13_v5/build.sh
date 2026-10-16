@@ -266,7 +266,9 @@ main() {
     meson_build "$WORKDIR/src/mango" "$WORKDIR/build/mango" --sysconfdir="$PREFIX/etc" -Danland=enabled -Dxwayland=enabled
     package_deb
     build_xwayland
-    run sha256sum "$DEB" "${xwayland_debs[@]}"
+    local -a checksum_files=("${DEB##*/}")
+    for name in "${xwayland_debs[@]}"; do checksum_files+=("${name##*/}"); done
+    (cd "$PACKAGES" && sha256sum "${checksum_files[@]}" | tee SHA256SUMS) || die 'cannot write package checksums'
     if [ "${ANLAND_INSTALL:-0}" = 1 ]; then run $SUDO dpkg -i "$DEB" "${xwayland_debs[@]}"; fi
     log "Done. Packages: $PACKAGES (Mango + Xwayland)"
 }
