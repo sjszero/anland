@@ -1,0 +1,9 @@
+{
+  "name": "xorg-x11-server-Xwayland",
+  "version": "24.1.14",
+  "release": "1.fc44",
+  "archive": "xorg-x11-server-Xwayland-24.1.14-1.fc44.src.rpm",
+  "url": "https://kojipkgs.fedoraproject.org/packages/xorg-x11-server-Xwayland/24.1.14/1.fc44/src/xorg-x11-server-Xwayland-24.1.14-1.fc44.src.rpm",
+  "sha256": "6d9b19aca969d4ed1cf5440b199716c2b1bb86a1432b5d7b015fd6f0ccb3c157",
+  "patch_sha256": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+}

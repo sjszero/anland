@@ -76,12 +76,12 @@ Paths below are relative to `producers/<name>/`; directory names are case-sensit
 | Compositor | Backend | Distribution entries in this tree |
 |---|---|---|
 | [Gamescope](producers/gamescope/) | `anland_backend/` (C session wrapper, C++/Vulkan) | `SteamOS_v5` |
-| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/` (GObject/Cogl/Clutter) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
-| [KDE / KWin](producers/kde/) | `anland_backend/` (Qt output/EGL/input) | `Arch_v5`, `Debian13_v5`, `Fedora43_v5`, `SteamOS_v5`, `ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5`, `Ubuntu2604_v5` |
-| [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
-| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5` |
-| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5`, `Ubuntu2604_v5` |
+| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/` (GObject/Cogl/Clutter) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [KDE / KWin](producers/kde/) | `anland_backend/` (Qt output/EGL/input) | `Arch_v5`, `Debian13_v5`, `Fedora43_v5`, `Fedora44_v5`, `SteamOS_v5`, `ubuntu2604_v5` |
+| [Niri](producers/niri/) | `anland_backend/` (Rust/Smithay, C ABI bridge) | `Arch_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [Mango](producers/mango/) | `anland_backend/` (wlroots/SceneFX) | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`, `Debian13_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
+| [Denial](producers/denial/) | `anland_backend/` (Rust backend, C session bridge, Flutter desktop integration) | `Arch_v5`, `Ubuntu2604_v5`, `Fedora43_v5`, `Fedora44_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) contains an additional Xwayland recipe, not a WM backend. Building Mutter or KWin alone does not deliver the complete GNOME or Plasma session; native shells, portals, agents and session data remain necessary. Niri's X11 integration also requires checking xwayland-satellite and its startup relationship.
 
@@ -171,6 +171,14 @@ JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
 Denial, Hyprland, Mango and Niri have `Ubuntu2604_v5/build.sh`. Use `ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Ubuntu2604_v5/build.sh`; native `.deb` files go to that entry's `artifacts/` (override `ARTIFACTS_DIR`). These entries collect only native installation packages and print package SHA256 hashes in the build log; build manifests, signing keys and checksum files are not added to the delivery. The existing backend/patch source baseline is retained: Hyprland 0.55.2 uses its locked stack instead of Ubuntu's older Hyprland, Mango builds newer graphics dependencies privately, Denial reuses the inline no-GTK Flutter tool adaptation and locked Rust toolchain, and Niri includes pinned xwayland-satellite. Xwayland source locks/build steps and the same non-SteamOS patch stay within each WM recipe. Full cloud builds and graphical validation are still pending.
 
 Package collection follows native build outputs: `makepkg --packagelist` on Arch; the current `.changes` file for `dpkg-buildpackage`; explicit package paths and metadata for direct Debian packaging. Fresh-build checks prevent old cached packages from being reported as new results. Source locks and internal build records stay in the cache, and CI build logs are kept separate from downloadable installation packages.
+
+### Fedora 44 ARM64 entries
+
+Denial, GNOME, Hyprland, KDE, Mango and Niri provide `Fedora44_v5/`, alongside the unchanged Fedora 43 entries. Except for KDE, use `ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Fedora44_v5/build.sh`; `ANLAND_STAGE=check|prepare|build` selects preflight, source preparation or compilation. For KDE use `JOBS=4 BUILD_XWAYLAND=1 ANLAND_INSTALL=0 bash producers/kde/Fedora44_v5/build.sh`.
+
+Fedora 44 pins native SRPMs and SHA256 for Mutter **50.6 / ABI 18** (GNOME Shell 50), KWin **6.7.5** and Xwayland **24.1.14**. Hyprland retains the locked **0.55.2 / Lua 5.4** stack, private scanner 0.4.6 and protocols 0.7.1, `libuuid-devel`, and the Fedora Lua pkg-config fix. All entries use the existing shared backends and leave Mesa and DNF holds unchanged.
+
+Runtime RPMs go to the entry's `artifacts/` (KDE: `$WORKDIR/{kwin,xwayland}/`). Source verification, package lists and build records remain in `$WORKDIR`, not download artifacts. Cloud collection allows only complete `.rpm`, `.deb`, `.pkg.tar.zst/.xz/.gz` suffixes: no detached signatures, checksum sidecars, keys, lockfiles, manifests, logs or hidden build records. Release archives contain native packages only; internal verification remains enabled. Package-only collection covers build Artifacts and package archives. Separately generated rolling-release installer scripts, manifests and release-level `SHA256SUMS` remain outside these package deliverables because existing installers depend on them. Full cloud builds and graphical validation of these new entries have not been performed.
 
 ### Public-library linkage
 

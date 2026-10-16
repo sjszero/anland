@@ -76,12 +76,12 @@ Linux 合成器：原生窗口、renderer、frame clock、seat 与桌面
 | 合成器 | 后端 | 当前仓库的发行版入口 |
 |---|---|---|
 | [Gamescope](producers/gamescope/) | `anland_backend/`（C session wrapper、C++/Vulkan） | `SteamOS_v5` |
-| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/`（GObject/Cogl/Clutter） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
-| [KDE / KWin](producers/kde/) | `anland_backend/`（Qt output/EGL/input） | `Arch_v5`、`Debian13_v5`、`Fedora43_v5`、`SteamOS_v5`、`ubuntu2604_v5` |
-| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5`、`Ubuntu2604_v5` |
-| [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
-| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5` |
-| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5`、`Ubuntu2604_v5` |
+| [GNOME / Mutter](producers/gnome/) | `anland_backend/mutter/`（GObject/Cogl/Clutter） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [KDE / KWin](producers/kde/) | `anland_backend/`（Qt output/EGL/input） | `Arch_v5`、`Debian13_v5`、`Fedora43_v5`、`Fedora44_v5`、`SteamOS_v5`、`ubuntu2604_v5` |
+| [Niri](producers/niri/) | `anland_backend/`（Rust/Smithay、C ABI bridge） | `Arch_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [Mango](producers/mango/) | `anland_backend/`（wlroots/SceneFX） | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [Hyprland / Aquamarine](producers/hyprland/) | `anland_backend/{aquamarine,hyprland}/` | `Arch_v5`、`Debian13_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
+| [Denial](producers/denial/) | `anland_backend/`（Rust 后端、C session bridge、Flutter 桌面集成） | `Arch_v5`、`Ubuntu2604_v5`、`Fedora43_v5`、`Fedora44_v5` |
 
 [producers/xwayland/SteamOS_v5/](producers/xwayland/SteamOS_v5/) 是额外的 Xwayland 配方，不是独立 WM 后端。仅构建 Mutter/KWin 不等于交付完整 GNOME/Plasma，会话仍需 shell、portal、agent 和运行数据。Niri 的 X11 接入还需核对 xwayland-satellite 及其启动关系。
 
@@ -171,6 +171,14 @@ JOBS=2 ANLAND_WITH_DEPS=1 ANLAND_INSTALL=0 \
 Denial、Hyprland、Mango、Niri 均提供 `Ubuntu2604_v5/build.sh`。调用：`ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Ubuntu2604_v5/build.sh`；原生 `.deb` 位于该入口的 `artifacts/`，可用 `ARTIFACTS_DIR` 覆盖。这些入口只收集原生安装包，包的 SHA256 输出到构建日志；不把构建清单、签名密钥或校验文件加入交付内容。保留现有后端及补丁源码基线：Hyprland 0.55.2 使用锁定依赖栈，不强套 Ubuntu 较旧的 Hyprland；Mango 私有构建新版图形依赖；Denial 复用内联 no-GTK Flutter 工具并读取锁定 Rust 工具链；Niri 同时打包锁定版 xwayland-satellite。Xwayland 源锁、构建步骤和同一份非 SteamOS 补丁均留在各 WM 内。完整云编译和真实图形验证尚待执行。
 
 产物收集以原生打包结果为准：Arch 读取 `makepkg --packagelist`；`dpkg-buildpackage` 读取本次 `.changes`；直接生成 Debian 包时核对明确路径及包元数据。新鲜度检查避免将缓存旧包当成本次产物。源码锁和内部构建记录留在缓存，云编译日志与可下载的安装包分开保存。
+
+### Fedora 44 ARM64 入口
+
+Denial、GNOME、Hyprland、KDE、Mango、Niri 均新增 `Fedora44_v5/`，保留独立的 `Fedora43_v5/`。除 KDE 外，使用 `ANLAND_WITH_DEPS=1 JOBS=4 ANLAND_INSTALL=0 bash producers/<wm>/Fedora44_v5/build.sh`；`ANLAND_STAGE=check|prepare|build` 分别执行入口检查、源码准备和构建。KDE 使用 `JOBS=4 BUILD_XWAYLAND=1 ANLAND_INSTALL=0 bash producers/kde/Fedora44_v5/build.sh`。
+
+Fedora 44 锁定 Mutter **50.6 / ABI 18**（与 GNOME Shell 50 配套）、KWin **6.7.5** 和 Xwayland **24.1.14** 的 Fedora 44 SRPM 及 SHA256。Hyprland 保持已锁定的 **0.55.2 / Lua 5.4** 栈，保留私有 scanner 0.4.6、protocols 0.7.1、`libuuid-devel` 和 Fedora Lua pkg-config 修复；不复制第二套 backend，不改系统 Mesa 或 DNF holds。
+
+RPM 位于各入口 `artifacts/`（KDE 位于 `$WORKDIR/{kwin,xwayland}/`）；源码校验、包清单和构建记录留在 `$WORKDIR`，不作为下载内容。云编译按完整扩展名白名单收集 `.rpm`、`.deb`、`.pkg.tar.zst/.xz/.gz`，不收集 `.sig`、`SHA256SUMS`、密钥、锁文件、清单、日志及隐藏构建信息。发布压缩包也只含原生安装包，内部校验不因此取消。此规则覆盖构建 Artifact 与软件包归档；现有安装器依赖的滚动 Release 安装脚本、独立 manifest 和 Release 级 `SHA256SUMS` 仍保留在归档之外，不属于软件包收集内容。新增入口的完整云编译及真实图形验证尚未执行。
 
 ### 公共库链接
 

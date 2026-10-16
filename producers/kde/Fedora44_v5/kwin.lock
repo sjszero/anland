@@ -1,0 +1,9 @@
+{
+  "name": "kwin",
+  "version": "6.7.5",
+  "release": "1.fc44",
+  "archive": "kwin-6.7.5-1.fc44.src.rpm",
+  "url": "https://kojipkgs.fedoraproject.org/packages/kwin/6.7.5/1.fc44/src/kwin-6.7.5-1.fc44.src.rpm",
+  "sha256": "379ab0a2e92af1e17608e420d2b44dc0b67e9098286d0153692559e04be7f5cf",
+  "patch_sha256": "122099d659fcd7c5f67ccf40ee8f25d2bab70bed7ff86df6bd3ed16c99230304"
+}

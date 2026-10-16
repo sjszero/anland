@@ -3,6 +3,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <poll.h>
+#include <unistd.h>
 #include <cerrno>
 
 using namespace Aquamarine;

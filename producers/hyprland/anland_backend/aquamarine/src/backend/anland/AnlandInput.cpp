@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <time.h>
+#include <unistd.h>
 
 using namespace Aquamarine;
 using namespace Hyprutils::Math;

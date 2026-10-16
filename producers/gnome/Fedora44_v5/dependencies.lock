@@ -1,0 +1,9 @@
+{
+  "version": "50.6",
+  "release": "1.fc44",
+  "archive": "mutter-50.6-1.fc44.src.rpm",
+  "sha256": "2886108392c5980b30b8b603de989fb6cc7d4b768ff243abafcfbaea099505c5",
+  "url": "https://kojipkgs.fedoraproject.org/packages/mutter/50.6/1.fc44/src/mutter-50.6-1.fc44.src.rpm",
+  "patch_sha256": "6dd4973d46e82b8644576f9ecb9570364fb06c393ea085406e30c71181d8c5fa",
+  "mutter_api": 18
+}
