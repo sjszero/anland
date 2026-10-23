@@ -10,7 +10,8 @@ if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
     printf 'execute build.sh with bash; do not source it into an interactive shell\n' >&2
     return 1
 fi
-set -uo pipefail
+set -Euo pipefail
+trap 'failure_rc=$?; printf "denial-build: %s:%s: rc=%s: %s\n" "${BASH_SOURCE[0]}" "$LINENO" "$failure_rc" "$BASH_COMMAND" >&2; exit "$failure_rc"' ERR
 BUILD_SCRIPT=$(realpath -- "${BASH_SOURCE[0]}") || exit 1
 
 # Apply engine patches with fuzzy context and preserve unrelated source edits.
@@ -149,7 +150,15 @@ for argument in "$@"; do
         *) die "unknown argument: $argument (see --help)" ;;
     esac
 done
+# Ubuntu has its own executable entry; never source its main() here.
+if [[ ${ANLAND_DENIAL_DISTRO:-arch} == ubuntu2604 ]]; then
+    exec bash "$ROOT/producers/denial/Ubuntu2604_v5/build.sh" "$@"
+fi
 source "$SCRIPT_DIR/sources.conf" || die 'cannot read sources.conf'
+DENIAL_BRANCH=${DENIAL_BRANCH:-dev}
+# Keep the previous explicit-revision override working with the shared config.
+DENIAL_COMMIT=${DENIAL_COMMIT:-${DENIAL_REVISION:-}}
+[[ -z $DENIAL_COMMIT || $DENIAL_COMMIT =~ ^[0-9a-f]{40}$ ]] || die 'DENIAL_COMMIT must be a full Git commit'
 JOBS=${JOBS:-2}
 ANLAND_PKGREL=${ANLAND_PKGREL:-2}
 ANLAND_DE_PKGREL=${ANLAND_DE_PKGREL:-2}
@@ -168,7 +177,7 @@ for number in JOBS ANLAND_PKGREL ANLAND_DE_PKGREL; do
 done
 [[ $(id -u) != 0 && $(uname -m) == aarch64 ]] || die 'run as a normal aarch64 user'
 ANLAND_DENIAL_DISTRO=${ANLAND_DENIAL_DISTRO:-arch}
-case $ANLAND_DENIAL_DISTRO in arch|debian13|ubuntu2604|fedora43|fedora44) ;; *) die 'unsupported Denial distribution' ;; esac
+case $ANLAND_DENIAL_DISTRO in arch|debian13|fedora43|fedora44) ;; *) die 'unsupported Denial distribution' ;; esac
 WORKDIR=$(realpath -m -- "${WORKDIR:-${DENIAL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/denial-anland}}") || die 'invalid WORKDIR'
 ARTIFACTS_DIR=$(realpath -m -- "${ARTIFACTS_DIR:-$WORKDIR/packages}") || die 'invalid ARTIFACTS_DIR'
 [[ $WORKDIR != / && $WORKDIR != "$HOME" && $WORKDIR != "$ROOT" && $WORKDIR != "$ROOT/"* ]] || die 'WORKDIR must be a separate cache directory'
@@ -181,12 +190,12 @@ ENGINE=$(realpath -m -- "${DENIAL_ENGINE_DIR:-$WORKDIR/engine/build/out/denial_h
 [[ $ARTIFACTS_DIR != "$SOURCE" && $ARTIFACTS_DIR != "$SOURCE/"* ]] || die 'packages must be outside the source tree'
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat
 export CARGO_HOME="$WORKDIR/cargo-home" CARGO_TARGET_DIR="$WORKDIR/cargo-target"
-export PUB_CACHE="$WORKDIR/pub-cache" FLUTTER_ROOT="$FLUTTER" FLUTTER_GIT_URL="$FLUTTER_URL"
+export PUB_CACHE="$WORKDIR/pub-cache" FLUTTER_ROOT="$FLUTTER"
 export CI=true FLUTTER_SUPPRESS_ANALYTICS=true DART_SUPPRESS_ANALYTICS=true
 export ANLAND_DENIAL_LIB_DIR="$BUILD/native/usr/lib"
 export ANLAND_PKGREL ANLAND_DE_PKGREL
-# All native binaries report the release identity without changing upstream locks.
-export DENIAL_BUILD_VERSION="$DENIAL_VERSION"
+# Flutter's repository and the package version are exported by prepare_sources()
+# after reading SOURCE_LOCK.json and the selected Denial manifest.
 # Release policy belongs to the recipe, not upstream Cargo manifests.
 export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}"
 run mkdir -p "$WORKDIR" "$BUILD" "$ARTIFACTS_DIR"
@@ -212,35 +221,6 @@ checkout() {
     fi
     [[ $(git -C "$tree" rev-parse HEAD) == "$revision" ]] ||
         die "cached revision differs: $tree; move it aside before changing upstream version"
-}
-emit_adapter_patch() {
-    # One maintained adapter patch, two Git roots. Keep the selected blocks
-    # byte-for-byte intact so existing applied patches and engine receipts match.
-    python3 - "$SCRIPT_DIR/flutter-adapter.patch" "$1" <<'PY_ADAPTER_PATCH'
-from pathlib import Path
-import re
-import sys
-
-patch = Path(sys.argv[1]).read_bytes()
-target = sys.argv[2]
-if target not in ('denial', 'engine') or not patch.startswith(b'diff --git '):
-    raise SystemExit('invalid adapter patch or target')
-selected = []
-for block in re.split(rb'(?m)(?=^diff --git )', patch):
-    if not block:
-        continue
-    header = block.split(b'\n', 1)[0].split()
-    if len(header) != 4 or not header[2].startswith(b'a/') or not header[3].startswith(b'b/'):
-        raise SystemExit('unsupported adapter patch header')
-    engine = (header[2].startswith(b'a/engine/'), header[3].startswith(b'b/engine/'))
-    if engine[0] != engine[1]:
-        raise SystemExit('adapter patch crosses Denial and Flutter Git roots')
-    if engine[0] == (target == 'engine'):
-        selected.append(block)
-if not selected:
-    raise SystemExit('missing adapter patch section: ' + target)
-sys.stdout.buffer.write(b''.join(selected))
-PY_ADAPTER_PATCH
 }
 resolve_flutter_dependencies() {
     # Read only the selected DEPS expressions; never execute upstream DEPS code.
@@ -290,11 +270,15 @@ PY_FLUTTER_SOURCES
 prepare_sources() {
     log 'Prepare Denial and Anland sources'
     local latest_result latest_tree base_version flutter_tree
-    latest_result=$(anland_prepare_latest_git_source denial "$DENIAL_URL" "$WORKDIR/latest-sources" '' "$ANLAND_OFFLINE" '' shallow "$DENIAL_REVISION") ||
-        die 'cannot resolve the Denial revision supported by the backend patch'
+    local requested_ref=${DENIAL_COMMIT:-$DENIAL_BRANCH}
+    latest_result=$(anland_prepare_latest_git_source denial "$DENIAL_URL" "$WORKDIR/latest-sources" '' "$ANLAND_OFFLINE" '' shallow "$requested_ref") ||
+        die "cannot resolve Denial source: $requested_ref"
     IFS=$'\t' read -r latest_tree DENIAL_REV <<< "$latest_result"
     [[ -d $latest_tree && $DENIAL_REV =~ ^[0-9a-f]{40,64}$ ]] || die 'invalid latest Denial identity'
-    [[ $DENIAL_REV == "$DENIAL_REVISION" ]] || die 'cached Denial revision differs from sources.conf'
+    if [[ -n $DENIAL_COMMIT ]]; then
+        [[ $DENIAL_REV == "$DENIAL_COMMIT" ]] || die 'cached Denial revision differs from DENIAL_COMMIT'
+    fi
+    log "Denial source: $DENIAL_REV ($requested_ref)"
     SOURCE="$WORKDIR/src/denial-$DENIAL_REV"
     [[ $ARTIFACTS_DIR != "$SOURCE" && $ARTIFACTS_DIR != "$SOURCE/"* ]] || die 'packages must be outside the source tree'
     checkout "$SOURCE" "$DENIAL_URL" "$DENIAL_REV" "${DENIAL_SOURCE:-$latest_tree}"
@@ -341,12 +325,12 @@ PY
     DENIAL_VERSION="${base_version}-anland5"
     export DENIAL_BUILD_VERSION="$DENIAL_VERSION" FLUTTER_GIT_URL="$FLUTTER_URL" FLUTTER_ROOT="$FLUTTER"
     local patch="$WORKDIR/denial.pending.patch" previous="$WORKDIR/denial.applied.patch" file target
-    # Denial adapter first, then backend/performance hooks; Flutter engine hunks
-    # are extracted separately and applied only in the source-selected Flutter checkout.
-    emit_adapter_patch denial > "$patch" || die 'cannot extract Denial adapter patch'
+    # denial.patch already contains the adapter and backend hooks. Applying the
+    # old flutter-adapter.patch as well would apply the same Denial hunks twice.
     [[ -s $SCRIPT_DIR/denial.patch ]] || die 'missing component patch: denial.patch'
-    cat -- "$SCRIPT_DIR/denial.patch" >> "$patch" || die 'cannot read denial.patch'
-    emit_adapter_patch engine > "$ENGINE_PATCH" || die 'cannot extract Flutter engine patch'
+    run cp -- "$SCRIPT_DIR/denial.patch" "$patch"
+    [[ -s $SCRIPT_DIR/flutter-engine.patch ]] || die 'missing component patch: flutter-engine.patch'
+    run cp -- "$SCRIPT_DIR/flutter-engine.patch" "$ENGINE_PATCH"
     if ! cmp -s "$patch" "$previous"; then
         # Several blocks touch the same file. A dry run cannot see changes from
         # earlier blocks, so validate the complete sequence on a disposable copy.
@@ -1272,12 +1256,7 @@ build_deps+=(meson xorgproto xtrans libxkbfile xorg-font-util wayland-protocols 
 if [[ $ANLAND_WITH_DE == 1 ]]; then
     build_deps+=(xdg-utils zenity xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr)
 fi
-if [[ $ANLAND_DENIAL_DISTRO == ubuntu2604 ]]; then
-    # Ubuntu reuses this exact engine/AOT implementation and supplies only native packaging.
-    source "$SCRIPT_DIR/build.sh" || die 'cannot load Ubuntu package functions'
-    ubuntu_preflight
-    ubuntu_dependencies
-elif [[ $ANLAND_DENIAL_DISTRO == debian13 ]]; then
+if [[ $ANLAND_DENIAL_DISTRO == debian13 ]]; then
     # Same engine/AOT backend; Debian supplies only distro preflight and packaging.
     source "$SCRIPT_DIR/build.sh" || die 'cannot load Debian package functions'
     debian_preflight
@@ -1315,7 +1294,6 @@ if [[ $ANLAND_DENIAL_DISTRO == fedora4[34] && $ANLAND_STAGE == prepare ]]; then
 fi
 case $ANLAND_DENIAL_DISTRO in
     debian13) prepare_debian_rust ;;
-    ubuntu2604) prepare_ubuntu_rust ;;
     fedora43|fedora44) prepare_fedora_rust ;;
 esac
 prepare_engine

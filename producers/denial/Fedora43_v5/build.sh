@@ -164,6 +164,7 @@ fedora_denial_preflight() {
     ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd -P) || die 'repository root'
     source "$ROOT/producers/common/fedora-latest-srpm.sh"
     FEDORA_INPUT_ID=$(cat "$SCRIPT_DIR/sources.conf" "$SCRIPT_DIR/build.sh" \
+        "$SCRIPT_DIR/flutter-engine.patch" \
         "$SCRIPT_DIR/xwayland.patch" "$ROOT/producers/common/fedora-latest-srpm.sh" \
         "$ROOT/producers/denial/Arch_v5/build.sh" | sha256sum) || die 'Fedora input identity'
     FEDORA_INPUT_ID=${FEDORA_INPUT_ID%% *}

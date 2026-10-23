@@ -831,9 +831,15 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                             frontend.process_toplevel_screencopies(&mut graphics.renderer)?;
                         }
                     }
+                    // Work-area changes are interactive state; apply them
+                    // before periodic services can switch native presentation.
+                    super::super::flutter_settings_sync::synchronize_system_bar_configuration(
+                        &mut a.runtime,
+                        &mut events,
+                        launcher.as_mut(),
+                    );
                     flutter_desktop::synchronize_periodic_shell_services(
                         &mut a.runtime,
-                        launcher.as_mut().unwrap(),
                         &mut events,
                     )?;
                     if launcher
@@ -1253,6 +1259,7 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
                                         None,
                                         "anland",
                                         Some(graphics.fd()),
+                                        graphics.fd(),
                                         options.xwayland,
                                         options.work_area.clone(),
                                         options.scrolling_layout_axes.clone(),

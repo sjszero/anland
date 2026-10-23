@@ -198,7 +198,7 @@ package_all() {
         printf 'Source: %s\nSection: x11\nPriority: optional\nMaintainer: Anland <build@localhost>\n\nPackage: %s\nArchitecture: arm64\nDescription: Denial Anland Debian runtime\n' "$pkg" "$pkg" > "$pack/metadata/debian/control" || die 'cannot write dependency metadata'
         local -a shlibargs=()
         while IFS= read -r -d '' file; do
-            [[ $(head -c4 "$file") == $'\x7fELF' ]] || continue
+            [[ $(od -An -tx1 -N4 "$file" | tr -d ' \n') == 7f454c46 ]] || continue
             readelf -d "$file" | grep -q '(NEEDED)' || continue
             shlibargs+=("-e$file")
         done < <(find "$stage/usr" -type f -print0)

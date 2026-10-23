@@ -130,6 +130,7 @@ impl ImportedPool {
                 generation: self.identity.generation,
                 selected: None,
             },
+            transfers: self.buffers.iter().map(|_| None).collect(),
             dmabufs: self.buffers.iter().map(|buffer| (buffer, None)).collect(),
         }
     }
