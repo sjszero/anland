@@ -5,9 +5,10 @@ Includes Steam ARM64 focus/night-mode/white-point/P3 fixes (virtudude, JPyke3),
 realtime queue/gamepad cursor adaptation, bounded local IME and system script path.
 
 diff --git a/src/Script/Script.cpp b/src/Script/Script.cpp
+index 9833339..d3d0ec6 100644
 --- a/src/Script/Script.cpp
 +++ b/src/Script/Script.cpp
-@@ -126,7 +126,8 @@
+@@ -126,7 +126,8 @@ namespace gamescope
          }
          else
          {
@@ -18,9 +19,10 @@ diff --git a/src/Script/Script.cpp b/src/Script/Script.cpp
          }
  
 diff --git a/src/backend.h b/src/backend.h
+index a1546c1..87fbb2b 100644
 --- a/src/backend.h
 +++ b/src/backend.h
-@@ -363,6 +363,8 @@
+@@ -363,6 +363,8 @@ namespace gamescope
          virtual bool SupportsTearing() const = 0;
  
          virtual bool UsesVulkanSwapchain() const = 0;
@@ -30,9 +32,10 @@ diff --git a/src/backend.h b/src/backend.h
  
          virtual bool SupportsExplicitSync() const = 0;
 diff --git a/src/backends.h b/src/backends.h
+index 4e017bf..e64f845 100644
 --- a/src/backends.h
 +++ b/src/backends.h
-@@ -10,6 +10,7 @@
+@@ -10,6 +10,7 @@ namespace gamescope
          SDL,
          OpenVR,
          Headless,
@@ -40,7 +43,7 @@ diff --git a/src/backends.h b/src/backends.h
          Wayland,
      };
  
-@@ -18,5 +19,6 @@
+@@ -18,5 +19,6 @@ namespace gamescope
      class CDRMBackend;
      class COpenVRBackend;
      class CHeadlessBackend;
@@ -48,9 +51,10 @@ diff --git a/src/backends.h b/src/backends.h
      class CWaylandBackend;
  }
 diff --git a/src/color_helpers.cpp b/src/color_helpers.cpp
+index f59c219..04f48a9 100644
 --- a/src/color_helpers.cpp
 +++ b/src/color_helpers.cpp
-@@ -830,8 +830,8 @@
+@@ -839,8 +839,8 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
  
  bool BIsWideGamut( const displaycolorimetry_t & nativeDisplayOutput )
  {
@@ -62,6 +66,7 @@ diff --git a/src/color_helpers.cpp b/src/color_helpers.cpp
  
  void buildSDRColorimetry( displaycolorimetry_t * pColorimetry, colormapping_t *pMapping,
 diff --git a/src/ime.cpp b/src/ime.cpp
+index 518ac02..4552155 100644
 --- a/src/ime.cpp
 +++ b/src/ime.cpp
 @@ -1,6 +1,8 @@
@@ -81,7 +86,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
  
  #include <linux/input-event-codes.h>
  
-@@ -112,6 +115,8 @@
+@@ -112,6 +115,8 @@ struct wlserver_input_method {
  	struct wl_event_source *ime_reset_ime_keyboard_event_source;
  	struct wl_event_source *ime_release_ime_keypress_event_source;
  
@@ -90,7 +95,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
  	uint32_t uFakeTimestamp = 0;
  };
  
-@@ -583,11 +588,56 @@
+@@ -592,11 +597,57 @@ static void manager_handle_create_input_method(struct wl_client *client, struct
  	ime->ime_release_ime_keypress_event_source = wl_event_loop_add_timer(manager->server->event_loop, release_key_if_needed, ime);
  }
  
@@ -98,17 +103,18 @@ diff --git a/src/ime.cpp b/src/ime.cpp
 +{
 +    auto *ime = static_cast<wlserver_input_method *>(data);
 +    if (ime->local_text.empty()) return 0;
-+    // At most 32 code points per generated keymap (pool contains 47 slots).
-+    // Wait for the previous key release/keymap restore before reusing slots.
++    // Send one complete UTF-8 code point per timer tick.
 +    reset_ime_keyboard(ime);
-+    size_t end = 0;
-+    for (unsigned count = 0; count < 32 && end < ime->local_text.size(); ++count)
-+        end += utf8_size(ime->local_text.c_str() + end);
++    const size_t end = utf8_size(ime->local_text.c_str());
++    if (!end || end > ime->local_text.size()) {
++        ime->local_text.clear();
++        return 0;
++    }
 +    std::string batch = ime->local_text.substr(0, end);
 +    ime->local_text.erase(0, end);
 +    type_text(ime, batch.c_str());
 +    wl_event_source_timer_update(ime->manager->ime_reset_keyboard_event_source, 100);
-+    if (!ime->local_text.empty()) wl_event_source_timer_update(ime->local_text_timer, 120);
++    if (!ime->local_text.empty()) wl_event_source_timer_update(ime->local_text_timer, 150);
 +    return 0;
 +}
 +
@@ -134,7 +140,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
 +    bool idle = ime->local_text.empty();
 +    ime->local_text += text;
 +    // Do not restart an armed batch timer: a burst must not shorten keymap lifetime.
-+    if (idle && size) wl_event_source_timer_update(ime->local_text_timer, 120);
++    if (idle && size) wl_event_source_timer_update(ime->local_text_timer, 150);
 +    return true;
 +}
 +
@@ -147,7 +153,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
  	ime->serial = 1;
  	ime->next_keycode_index = 0;
  	ime->held_keycode = -1;
-@@ -601,6 +651,13 @@
+@@ -610,6 +661,13 @@ struct wlserver_input_method *create_local_ime()
  	ime->ime_reset_ime_keyboard_event_source = wl_event_loop_add_timer(global_manager->server->event_loop, reset_ime_keyboard, ime);
  	ime->ime_release_ime_keypress_event_source = wl_event_loop_add_timer(global_manager->server->event_loop, release_key_if_needed, ime);
  
@@ -161,7 +167,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
  	return ime;
  }
  
-@@ -644,3 +701,16 @@
+@@ -653,3 +711,16 @@ void create_ime_manager(struct wlserver_t *wlserver)
  
  	global_manager = manager;
  }
@@ -179,6 +185,7 @@ diff --git a/src/ime.cpp b/src/ime.cpp
 +    delete ime;
 +}
 diff --git a/src/ime.hpp b/src/ime.hpp
+index 0887083..8d76dbd 100644
 --- a/src/ime.hpp
 +++ b/src/ime.hpp
 @@ -2,7 +2,9 @@
@@ -191,7 +198,7 @@ diff --git a/src/ime.hpp b/src/ime.hpp
  #include "gamescope-input-method-protocol.h"
  
  void create_ime_manager(struct wlserver_t *wlserver);
-@@ -11,3 +13,8 @@
+@@ -11,3 +13,8 @@ struct wlserver_input_method *create_local_ime();
  void destroy_ime(struct wlserver_input_method * ime);
  void type_text(struct wlserver_input_method *ime, const char *text);
  void perform_action(struct wlserver_input_method *ime, enum gamescope_input_method_action action);
@@ -201,9 +208,10 @@ diff --git a/src/ime.hpp b/src/ime.hpp
 +// Bounded asynchronous input for backend-owned local IMEs. Returns false on overflow.
 +bool type_local_text(struct wlserver_input_method *ime, const char *text);
 diff --git a/src/main.cpp b/src/main.cpp
+index 6a0fdb1..448cfc3 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -193,6 +193,7 @@
+@@ -194,6 +194,7 @@ const char usage[] =
  #if HAVE_OPENVR
  	"                                     openvr => use OpenVR backend (outputs as a VR overlay)\n"
  #endif
@@ -211,7 +219,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  	"                                     headless => use headless backend (no window, no DRM output)\n"
  	"                                     wayland => use Wayland backend\n"
  	"  --cursor                       path to default cursor image\n"
-@@ -441,6 +442,8 @@
+@@ -432,6 +433,8 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
  	} else if (strcmp(str, "openvr") == 0) {
  		return gamescope::GamescopeBackend::OpenVR;
  #endif
@@ -220,7 +228,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  	} else if (strcmp(str, "headless") == 0) {
  		return gamescope::GamescopeBackend::Headless;
  	} else if (strcmp(str, "wayland") == 0) {
-@@ -453,6 +456,9 @@
+@@ -444,6 +447,9 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
  
  static enum gamescope::GamescopeBackend auto_select_backend()
  {
@@ -230,7 +238,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  	if ( getenv( "WAYLAND_DISPLAY" ) != NULL )
  		return gamescope::GamescopeBackend::Wayland;
  	else if ( getenv( "DISPLAY" ) != NULL )
-@@ -957,7 +963,7 @@
+@@ -953,7 +959,7 @@ int main(int argc, char **argv)
  		eCurrentBackend = auto_select_backend();
  	}
  
@@ -239,7 +247,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  	{
          if (CheckWaylandPresentationTime())
          {
-@@ -995,6 +1001,9 @@
+@@ -991,6 +997,9 @@ int main(int argc, char **argv)
  			gamescope::IBackend::Set<gamescope::COpenVRBackend>();
  			break;
  #endif
@@ -250,9 +258,10 @@ diff --git a/src/main.cpp b/src/main.cpp
  			gamescope::IBackend::Set<gamescope::CHeadlessBackend>();
  			break;
 diff --git a/src/meson.build b/src/meson.build
+index 498bca6..79a43bc 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -123,6 +123,8 @@
+@@ -128,6 +128,8 @@ src = [
    'LibInputHandler.cpp',
  ]
  
@@ -261,7 +270,7 @@ diff --git a/src/meson.build b/src/meson.build
  luajit_dep = dependency( 'luajit' )
  libinput_dep = dependency('libinput', required: true)
  
-@@ -176,6 +178,9 @@
+@@ -181,6 +183,9 @@ compiler_version = cc.version()
  
  vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
  vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
@@ -271,7 +280,7 @@ diff --git a/src/meson.build b/src/meson.build
  version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
  
  gamescope_version_conf = configuration_data()
-@@ -192,7 +197,7 @@
+@@ -197,7 +202,7 @@ gamescope_version = configure_file(
      src, reshade_src, gamescope_version,
      include_directories : [reshade_include, sol2_include],
      dependencies: [
@@ -281,9 +290,10 @@ diff --git a/src/meson.build b/src/meson.build
        xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
        vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
 diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 77134f2..51a1707 100644
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
-@@ -473,7 +473,7 @@
+@@ -480,7 +480,7 @@ bool CVulkanDevice::createDevice()
  		};
  		vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
  
@@ -292,7 +302,7 @@ diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
  			vk_log.errorf( "physical device has no primary node" );
  			return false;
  		}
-@@ -507,6 +507,23 @@
+@@ -514,6 +514,23 @@ bool CVulkanDevice::createDevice()
  #endif
  	}
  
@@ -316,7 +326,7 @@ diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
  	if ( m_bSupportsModifiers && !supportsForeignQueue ) {
  		vk_log.infof( "The vulkan driver does not support foreign queues,"
  		              " disabling modifier support.");
-@@ -527,6 +544,14 @@
+@@ -541,6 +558,14 @@ bool CVulkanDevice::createDevice()
  	}
  
  	float queuePriorities = 1.0f;
@@ -331,7 +341,7 @@ diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
  
  	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
  		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
-@@ -538,14 +563,14 @@
+@@ -552,14 +577,14 @@ bool CVulkanDevice::createDevice()
  	{
  		{
  			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -348,7 +358,7 @@ diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
  			.queueFamilyIndex = m_generalQueueFamily,
  			.queueCount = 1,
  			.pQueuePriorities = &queuePriorities
-@@ -671,14 +696,14 @@
+@@ -686,14 +711,14 @@ bool CVulkanDevice::createDevice()
  	};
  
  	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
@@ -366,9 +376,10 @@ diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
  			fprintf(stderr, "vkCreateDevice failed with a high-priority queue (compute). Falling back to regular priority (all).\n");
  			queueCreateInfos[0].pNext = nullptr;
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 8a0f763..605e0f6 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -1587,18 +1587,60 @@
+@@ -2018,18 +2018,60 @@ MouseCursor::MouseCursor(xwayland_ctx_t *ctx)
  
  void MouseCursor::UpdatePosition()
  {
@@ -417,11 +428,10 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
  		m_y = pConstraint->current.cursor_hint.y;
  	}
 -	else
--	{
++	else if ( root_x != m_x || root_y != m_y )
+ 	{
 -		m_x = wlserver.mouse_surface_cursorx;
 -		m_y = wlserver.mouse_surface_cursory;
-+	else if ( root_x != m_x || root_y != m_y )
-+	{
 +		m_x = root_x;
 +		m_y = root_y;
 +		if ( !m_imageEmpty )
@@ -433,7 +443,7 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
  	}
  	wlserver_unlock();
  }
-@@ -3793,6 +3835,23 @@
+@@ -4452,6 +4494,23 @@ pick_primary_focus_and_override(
  found:;
  	}
  
@@ -457,7 +467,7 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
  	if ( !focus && ( !globalFocus || !controlledFocus ) )
  	{
  		if ( !vecPossibleFocusWindows.empty() )
-@@ -6726,6 +6785,14 @@
+@@ -7571,6 +7630,14 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
  		{
  			g_ColorMgmt.pending.outputVirtualWhite.x = santitize_float( bit_cast<float>( user_vec[0] ) );
  			g_ColorMgmt.pending.outputVirtualWhite.y = santitize_float( bit_cast<float>( user_vec[1] ) );
@@ -472,11 +482,11 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
  		}
  		else
  		{
-@@ -6783,9 +6850,17 @@
+@@ -7628,9 +7695,17 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
  		}
  
  		nightmode_t nightmode;
-+		
++
 +		#if defined (__aarch64__)
 +		nightmode.amount = vec[0];
 +		nightmode.hue = 25.0f / 360.0f;
@@ -490,9 +500,12 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
  
  		if ( set_color_nightmode( nightmode ) )
  			hasRepaint = true;
-
 diff --git a/src/steamcompmgr.hpp b/src/steamcompmgr.hpp
+index c1d1ab0..f8398f6 100644
 --- a/src/steamcompmgr.hpp
 +++ b/src/steamcompmgr.hpp
-@@ -108,0 +109,1 @@
+@@ -201,3 +201,4 @@ MouseCursor *steamcompmgr_get_server_cursor(uint32_t serverId);
+ extern gamescope::ConVar<bool> cv_tearing_enabled;
+ 
+ extern void steamcompmgr_set_app_refresh_cycle_override( gamescope::GamescopeScreenType type, int override_fps, bool change_refresh, bool change_fps_cap );
 +	uint64_t m_ulLastPointerQuery = 0;
