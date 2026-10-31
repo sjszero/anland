@@ -28,6 +28,6 @@
   },
   "xwayland": {
     "recipe_sha256": "32665b898839e902dc5f9853a25fb15540720954359a2fbadd20872af8c6f2cd",
-    "patch_sha256": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+    "patch_sha256": "132bf7f65400f806a19c41f3f734695797ad3fd3d4dfea8abe39b30d0b67d1d0"
   }
 }

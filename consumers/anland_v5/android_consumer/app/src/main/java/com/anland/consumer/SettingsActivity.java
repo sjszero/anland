@@ -82,6 +82,9 @@ public class SettingsActivity extends Activity {
 
     // ===== 新增：触摸板 Key =====
     private static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
+    private static final String KEY_STYLUS_BUTTON_RIGHT_CLICK = "stylus_button_right_click";
+    private static final String KEY_STYLUS_HOVER_SCROLL = "stylus_hover_scroll";
+    private static final String KEY_STYLUS_HOVER_SCROLL_SPEED = "stylus_hover_scroll_speed";
     private static final String KEY_MOUSE_ACCEL = "mouse_speed";
     private static final String KEY_POINTER_CAPTURE = "pointer_capture";
     private static final String KEY_SCROLL_SPEED = "scroll_speed";
@@ -91,6 +94,9 @@ public class SettingsActivity extends Activity {
     private static final String KEY_GESTURE_SCALE = "touchpad_gesture_scale";
     private static final String KEY_DISABLE_MULTI_FINGER_GESTURES =
             "disable_multi_finger_gestures";
+    private static final String KEY_PAD_TAP = "pad_tap";
+    private static final String KEY_PAD_SCROLL_GUARD_MS = "pad_scroll_guard_ms";
+    private static final String KEY_PAD_DEBUG = "pad_debug";
 
     // Latency presets: target buffer in ms (0 = auto). The user-visible labels live
     // in the R.array.latency_labels string-array, parallel to this array.
@@ -1194,6 +1200,80 @@ public class SettingsActivity extends Activity {
         touchpadHint.setTextColor(Color.GRAY);
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
+
+        Switch tapSwitch = new Switch(this);
+        tapSwitch.setText(R.string.pad_tap);
+        tapSwitch.setTextSize(14);
+        tapSwitch.setPadding(0, dp(8), 0, 0);
+        tapSwitch.setChecked(prefs.getBoolean(KEY_PAD_TAP, true));
+        tapSwitch.setOnCheckedChangeListener((v, checked) ->
+                prefs.edit().putBoolean(KEY_PAD_TAP, checked).apply());
+        root.addView(tapSwitch);
+
+        TextView padHint = new TextView(this);
+        padHint.setText(R.string.pad_tip);
+        padHint.setTextSize(12);
+        padHint.setTextColor(Color.GRAY);
+        padHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(padHint);
+
+        TextView guardValue = new TextView(this);
+        int guard = Math.max(0, Math.min(1000,
+                prefs.getInt(KEY_PAD_SCROLL_GUARD_MS, 0)));
+        guardValue.setText(getString(R.string.pad_guard, guard));
+        guardValue.setTextSize(14);
+        guardValue.setTextColor(Color.BLUE);
+        root.addView(guardValue);
+        SeekBar guardSeek = new SeekBar(this);
+        guardSeek.setMax(20);
+        guardSeek.setProgress(Math.round(guard / 50f));
+        guardSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                guardValue.setText(getString(R.string.pad_guard, progress * 50));
+                if (fromUser) prefs.edit().putInt(KEY_PAD_SCROLL_GUARD_MS, progress * 50).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        root.addView(guardSeek);
+
+        Switch padDebug = new Switch(this);
+        padDebug.setText(R.string.pad_debug);
+        padDebug.setTextSize(14);
+        padDebug.setPadding(0, dp(8), 0, 0);
+        padDebug.setChecked(prefs.getBoolean(KEY_PAD_DEBUG, false));
+        padDebug.setOnCheckedChangeListener((v, checked) ->
+                prefs.edit().putBoolean(KEY_PAD_DEBUG, checked).apply());
+        root.addView(padDebug);
+
+        Switch stylusRightClickSwitch = new Switch(this);
+        stylusRightClickSwitch.setText(R.string.stylus_button_right_click_switch);
+        stylusRightClickSwitch.setTextSize(14);
+        stylusRightClickSwitch.setPadding(0, dp(8), 0, 0);
+        stylusRightClickSwitch.setChecked(prefs.getBoolean(KEY_STYLUS_BUTTON_RIGHT_CLICK, true));
+        stylusRightClickSwitch.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_STYLUS_BUTTON_RIGHT_CLICK, checked).apply());
+        root.addView(stylusRightClickSwitch);
+
+        Switch stylusHoverScrollSwitch = new Switch(this);
+        stylusHoverScrollSwitch.setText(R.string.stylus_hover_scroll_switch);
+        stylusHoverScrollSwitch.setTextSize(14);
+        stylusHoverScrollSwitch.setPadding(0, dp(8), 0, 0);
+        stylusHoverScrollSwitch.setChecked(prefs.getBoolean(KEY_STYLUS_HOVER_SCROLL, true));
+        stylusHoverScrollSwitch.setOnCheckedChangeListener((v, checked) ->
+                prefs.edit().putBoolean(KEY_STYLUS_HOVER_SCROLL, checked).apply());
+        root.addView(stylusHoverScrollSwitch);
+
+        TextView stylusHoverScrollHint = new TextView(this);
+        stylusHoverScrollHint.setText(R.string.stylus_hover_scroll_hint);
+        stylusHoverScrollHint.setTextSize(12);
+        stylusHoverScrollHint.setTextColor(Color.GRAY);
+        stylusHoverScrollHint.setPadding(0, dp(4), 0, dp(4));
+        root.addView(stylusHoverScrollHint);
+        addFloatSlider(root, R.string.stylus_hover_scroll_speed_label,
+                R.string.scroll_speed_value, null, KEY_STYLUS_HOVER_SCROLL_SPEED,
+                0.05f, 3.0f, 0.05f, 0.5f);
 
         // External mouse pointer capture.  This is opt-in because it changes
         // Android's mouse event mode from absolute coordinates to relative motion.

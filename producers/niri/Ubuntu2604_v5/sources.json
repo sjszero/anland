@@ -16,6 +16,6 @@
   "patches": {
     "niri.patch": "18b8a8deda908a227f11f7abcb82f48cea3de5195453fc7de071d0c8cbe4086f",
     "smithay.patch": "d23e6ea89713aa98454fa8b63071b8abd2176bf7ede65c102c811590a33b6c63",
-    "xwayland.patch": "9f500d4ac901af6d8286c988de013d213c05cb637fc9fe190a7426d0c0ef152b"
+    "xwayland.patch": "a71a000dbaa00ab122f7fa836e62c15c2bdf50d89803aa5d471210ed7515d41e"
   }
 }

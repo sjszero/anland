@@ -142,6 +142,9 @@ public class MainActivity extends Activity
 
     // ==================== 触摸板相关设置 ====================
     public static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
+    public static final String KEY_STYLUS_BUTTON_RIGHT_CLICK = "stylus_button_right_click";
+    public static final String KEY_STYLUS_HOVER_SCROLL = "stylus_hover_scroll";
+    public static final String KEY_STYLUS_HOVER_SCROLL_SPEED = "stylus_hover_scroll_speed";
     public static final String KEY_MOUSE_ACCEL = "mouse_speed"; // 名称仍为 speed，实际控制加速度强度
     // Two-finger scroll tuning, shared by the on-screen and captured touchpads.
     public static final String KEY_SCROLL_SPEED = "scroll_speed";
@@ -155,6 +158,11 @@ public class MainActivity extends Activity
     // are swallowed instead of being forwarded to the desktop as touch.
     public static final String KEY_DISABLE_MULTI_FINGER_GESTURES =
             "disable_multi_finger_gestures";
+    // Physical touchpad tap filtering. The scroll guard is measured from the
+    // last scrolling event until the next deliberate tap.
+    public static final String KEY_PAD_TAP = "pad_tap";
+    public static final String KEY_PAD_SCROLL_GUARD_MS = "pad_scroll_guard_ms";
+    public static final String KEY_PAD_DEBUG = "pad_debug";
     // Capture an external mouse/touchpad as a relative pointer so it cannot reach
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
@@ -301,6 +309,11 @@ public class MainActivity extends Activity
             Log.i(TAG, "window focus lost; delaying immersive stop");
             lifecycleHandler.removeCallbacks(delayedFocusStop);
             lifecycleHandler.postDelayed(delayedFocusStop, FOCUS_STOP_DELAY_MS);
+        }
+        if (!hasFocus) {
+            stylusTouching = false;
+            stylusHoverScroll.reset();
+            releaseAllMouseButtons();
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
@@ -880,6 +893,12 @@ public class MainActivity extends Activity
     private void applyTouchpadPrefs(SharedPreferences prefs, Touchpad pad) {
         if (pad == null)
             return;
+        // Physical pads retain taps by default. Only a stream committed to
+        // scrolling (or explicitly disabled taps) suppresses synthetic clicks.
+        if (pad != screenTouchpad)
+            pad.setTapFilter(prefs.getBoolean(KEY_PAD_TAP, true),
+                    prefs.getInt(KEY_PAD_SCROLL_GUARD_MS, 0),
+                    prefs.getBoolean(KEY_PAD_DEBUG, false));
         pad.setAccelStrength(Math.max(0.5f,
                 Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f))));
         pad.setScrollSpeed(prefs.getFloat(KEY_SCROLL_SPEED,
@@ -1656,6 +1675,7 @@ public class MainActivity extends Activity
         super.onPause();
         Log.i(TAG, "onPause: stopping native and immersive input");
         mResumed = false;
+        stylusHoverScroll.reset();
         lifecycleHandler.removeCallbacks(delayedFocusStop);
         lifecycleHandler.removeCallbacks(delayedSurfaceStop);
         // Socket-missing bounce: no pipeline exists, so skip teardown (mNative is
@@ -2288,6 +2308,12 @@ public class MainActivity extends Activity
                 requestPointerCaptureAfterClick();
             }
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
+                int tool = event.getToolType(event.getActionIndex());
+                if (tool == MotionEvent.TOOL_TYPE_STYLUS
+                        || tool == MotionEvent.TOOL_TYPE_ERASER) {
+                    updateStylusButtonState(event);
+                    updateStylusHoverScroll(event);
+                }
                 float nativeX, nativeY;
                 if (autoStretch) {
                     float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
@@ -2309,6 +2335,16 @@ public class MainActivity extends Activity
                                       event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
                 return true;
             }
+            if (action == MotionEvent.ACTION_HOVER_ENTER
+                    || action == MotionEvent.ACTION_HOVER_EXIT) {
+                int tool = event.getToolType(event.getActionIndex());
+                if (tool == MotionEvent.TOOL_TYPE_STYLUS
+                        || tool == MotionEvent.TOOL_TYPE_ERASER) {
+                    updateStylusButtonState(event);
+                    updateStylusHoverScroll(event);
+                    return true;
+                }
+            }
             if (action == MotionEvent.ACTION_SCROLL) {
                 float vScroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
                 float hScroll = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
@@ -2320,7 +2356,12 @@ public class MainActivity extends Activity
             }
             if (action == MotionEvent.ACTION_BUTTON_PRESS
                     || action == MotionEvent.ACTION_BUTTON_RELEASE) {
-                updateMouseButtonStateFromEvent(event);
+                int tool = event.getToolType(event.getActionIndex());
+                if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) {
+                    updateStylusHoverScroll(event);
+                    updateStylusButtonState(event);
+                } else
+                    updateMouseButtonStateFromEvent(event);
                 return true;
             }
         }
@@ -2512,6 +2553,8 @@ public class MainActivity extends Activity
     private static final int CLASSIFICATION_PINCH = 5;
 
     private int savedBS = 0;
+    private boolean stylusTouching = false;
+    private final StylusHoverScroll stylusHoverScroll = new StylusHoverScroll();
 
     private static final int[][] BUTTON_MAP = {
         {MotionEvent.BUTTON_PRIMARY,   0x110}, // BTN_LEFT
@@ -2580,6 +2623,56 @@ public class MainActivity extends Activity
         updateMouseButtonState(bs);
     }
 
+    private void updateStylusButtonState(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_CANCEL) {
+            stylusTouching = false;
+            releaseAllMouseButtons();
+            return;
+        }
+        int buttons = event.getButtonState();
+        if (action == MotionEvent.ACTION_DOWN)
+            stylusTouching = true;
+        else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_MOVE
+                || action == MotionEvent.ACTION_HOVER_EXIT)
+            stylusTouching = false;
+        else if (action == MotionEvent.ACTION_MOVE)
+            stylusTouching = event.getPressure() > 0f;
+        int desired = buttons & ~(MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY);
+        if (stylusTouching) {
+            boolean right = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(
+                    KEY_STYLUS_BUTTON_RIGHT_CLICK, true)
+                    && (buttons & (MotionEvent.BUTTON_STYLUS_PRIMARY
+                    | MotionEvent.BUTTON_STYLUS_SECONDARY)) != 0;
+            desired |= right ? MotionEvent.BUTTON_SECONDARY : MotionEvent.BUTTON_PRIMARY;
+        }
+        updateMouseButtonState(desired);
+    }
+
+    private void updateStylusHoverScroll(MotionEvent event) {
+        int action = event.getActionMasked();
+        boolean hovering = (action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_MOVE)
+                && event.getPressure() <= 0f;
+        int buttons = event.getButtonState();
+        int actionButton = event.getActionButton();
+        int stylusButtonMask = MotionEvent.BUTTON_STYLUS_PRIMARY
+                | MotionEvent.BUTTON_STYLUS_SECONDARY;
+        if (action == MotionEvent.ACTION_BUTTON_PRESS)
+            buttons |= actionButton & stylusButtonMask;
+        else if (action == MotionEvent.ACTION_BUTTON_RELEASE)
+            buttons &= ~(actionButton & stylusButtonMask);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean enabled = prefs.getBoolean(KEY_STYLUS_HOVER_SCROLL, true);
+        float speed = prefs.getFloat(KEY_STYLUS_HOVER_SCROLL_SPEED, 0.5f);
+        float scroll = stylusHoverScroll.update(hovering && enabled,
+                (buttons & stylusButtonMask) != 0, event.getX(), event.getY(), speed);
+        if (scroll != 0f && mNative != null)
+            mNative.sendMouseScroll(0, scroll);
+    }
+
     private void releaseAllMouseButtons() {
         if (savedBS == 0)
             return;
@@ -2605,11 +2698,19 @@ public class MainActivity extends Activity
 
     private boolean isMouseEvent(MotionEvent event) {
         int source = event.getSource();
+        int toolType = event.getToolType(event.getActionIndex());
+        // A stylus can be reported either as SOURCE_STYLUS or as a tool on the
+        // touchscreen source (common for S Pens). Route both pen and eraser
+        // hover/motion through the pointer path instead of forwarding them as
+        // touchscreen contacts.
+        if (toolType == MotionEvent.TOOL_TYPE_STYLUS
+                || toolType == MotionEvent.TOOL_TYPE_ERASER)
+            return (source & InputDevice.SOURCE_CLASS_POINTER)
+                    == InputDevice.SOURCE_CLASS_POINTER;
         if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
             return false;
         if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
             return false;
-        int toolType = event.getToolType(event.getActionIndex());
         return toolType == MotionEvent.TOOL_TYPE_MOUSE
             || toolType == MotionEvent.TOOL_TYPE_FINGER;
     }
@@ -2652,7 +2753,12 @@ public class MainActivity extends Activity
         }
         mNative.sendMouseMotion(nativeX, nativeY, dx, dy);
 
-        updateMouseButtonStateFromEvent(event);
+        if (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_STYLUS
+                || event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_ERASER) {
+            updateStylusHoverScroll(event);
+            updateStylusButtonState(event);
+        } else
+            updateMouseButtonStateFromEvent(event);
         return true;
     }
 

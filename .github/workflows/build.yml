@@ -53,6 +53,13 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug, O=Android, C=US" -noprompt
 
+      - name: Run Android unit tests
+        if: matrix.task == 'assemblePlainRelease'
+        working-directory: consumers/anland_v5/android_consumer
+        run: |
+          chmod +x gradlew
+          ./gradlew testPlainDebugUnitTest
+
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
         run: |
