@@ -184,11 +184,16 @@ s=(cache/'recipe/terra-gamescope.spec').read_text()
 # for the native rpmbuild used by this offline Armada build.
 s=s.replace('= %{evr}', '= %{?epoch:%{epoch}:}%{version}-%{release}')
 patches=sorted((armada/'packages/gamescope/patches').glob('[0-9][0-9][0-9][0-9]-*.patch'))
-assert len(patches)==31, f'Unexpected Armada patch count: {len(patches)}'
 # Armada's set is pinned by count on purpose: a different number means the
 # submodule/recipe assumptions in this script changed. Anland's own changes are
 # not declared as Patch entries at all; they live inside %{SOURCE1000} and are
 # applied by %prep after %autopatch, so this file needs no edit to carry them.
+#
+# 31 at armada d5c23cd, which is the commit ArmadaOS.Dockerfile pins. Armada
+# removed 0027-steamcompmgr-elapsed-time-fps-limiter in 4d6ea8b ("drop
+# elapsed-time fps limiter patch"), taking the series from 32 to 31; the image
+# pins a commit after that, so the count here follows upstream down.
+assert len(patches)==31, f'Unexpected Armada patch count: {len(patches)}'
 pos=s.index('BuildRequires:')
 s=s[:pos]+''.join(f'Patch: {p.name}\n' for p in patches)+'Source999: gamescope-source.tar\n'+s[pos:]
 s=s.replace('Release:        1%{?dist}', 'Release:        1%{?dist}.armada')
